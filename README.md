@@ -1,8 +1,6 @@
-# Infrastructure Monitoring Stack v3
+# Infrastructure Monitoring Stack v3 (NOC TV Display Ready)
 
-Sistem monitoring infrastruktur enterprise berbasis Docker yang memantau kondisi server, jaringan, dan website secara **real-time** dengan pengujian alert ultra-responsif (**v3.0**).
-
-Melanjutkan kesuksesan versi v2, **Infrastructure Monitoring Stack v3** menghadirkan pembaruan besar pada tingkat keandalan enterprise, manajemen insiden yang cerdas melalui **Alert Correlation (Dependency Mapping)**, **Maintenance Windows Mode**, serta **Advanced Fleet Availability & SLA Engine**.
+Sistem monitoring ketersediaan website, server, dan jaringan real-time berbasis Docker yang berfokus pada **Blackbox Probe (Status UP/DOWN, Response Time, & HTTP Code)** untuk kemudahan visualisasi pada **TV Monitoring NOC (Network Operation Center)**.
 
 ---
 
@@ -14,78 +12,66 @@ Melanjutkan kesuksesan versi v2, **Infrastructure Monitoring Stack v3** menghadi
 
 ---
 
-## 🔄 Transisi & Pembaruan Utama (v2 ke v3)
+## 🎯 Perbedaan Utama: Transisi v2 ke v3
 
-Pembaruan dari **v2** ke **v3** fokus pada efisiensi operasional dan eliminasi false positive saat insiden besar atau perawatan rutin:
+Mengapa versi 3 menyederhanakan arsitektur dari versi sebelumnya?
 
-1. **🛠️ Maintenance Windows Engine**:
-   - **v2**: Saat server sedang diperbaiki, alarm dan alert tetap membunyikan sirine dan memenuhi log insiden.
-   - **v3**: Fitur penentuan jadwal maintenance per-target. Saat target berada dalam window maintenance, status ditandai secara visual di console, dan audio alarm ditahan otomatis tanpa mengganggu monitoring target lain.
-
-2. **🌳 Alert Correlation & Dependency Mapping (Parent-Child Tree)**:
-   - **v2**: Jika perangkat jaringan utama (misal: Gateway/Switch) mati, seluruh server di bawahnya akan menembakkan puluhan alert secara simultan (*alert storm*).
-   - **v3**: Dukungan hirarki dependensi. Jika host *Parent* mengalami down, alert pada host *Child* otomatis di-suppress dan ditandai sebagai dampak korrelasi (*dependency cascade*).
-
-3. **📊 Enterprise Fleet Availability & SLA Engine**:
-   - **v2**: Kalkulasi ketersediaan sederhana berbasis rata-rata persentase.
-   - **v3**: Kalkulasi 4 metrik availability terpisah:
-     - `per_server`: Availability individual tiap server/website.
-     - `fleet_average`: Rata-rata unweighted seluruh armada.
-     - `fleet_aggregate`: Weighted SLA availability berdasarkan durasi total monitoring.
-     - `health_ratio`: Persentase server yang 100% pernah bebas dari insiden (zero downtime).
-
-4. **⚡ Multi-Endpoint Failover & High Performance Payload**:
-   - **v2**: Terikat pada satu URL Prometheus statis.
-   - **v3**: Penggunaan kandidat endpoint Prometheus otomatis (failover/failback), proteksi *thread-lock* webhook (`_WEBHOOK_LOCK`), kompresi GZIP untuk transmisi ribuan target, serta busting cache aset statis otomatis (`?v=<mtime>`).
+| Aspek | Versi 2 (v2) | Versi 3 (v3) - Current |
+| --- | --- | --- |
+| **Fokus Monitoring** | Dual-Monitoring (Node Exporter internal hardware + Blackbox Probe) | **Focused Blackbox Availability (Status UP/DOWN, Ping, HTTP Code, Latency)** |
+| **Penyebab Perubahan** | Menampilkan metrik internal (CPU/RAM/Disk) membuat dashboard rumit & berat untuk pemantauan cepat | Dioptimalkan agar **lebih simpel, cepat, dan sangat aksesibel** untuk ditayangkan di **TV Monitor NOC** |
+| **Penggunaan Ideal** | Analisis detail metrik internal server oleh Admin SysAdmin | **Display TV Dashboard 24/7 di Ruang IT / NOC (Network Operation Center)** |
+| **Tampilan Visual** | Banyak grafik metrik teknis | **Beacon visual status (Hijau/Merah), Sirine Audio, & Indikator Responsif** |
+| **Manajemen Perawatan** | Alert tetap membunyikan sirine saat server diperbaiki | **Maintenance Windows Mode** (Sirine ditahan khusus target yang sedang diperbaiki) |
+| **Manajemen Badai Alert** | Menampilkan seluruh alert turunan saat gateway mati | **Alert Correlation & Dependency Tree** (Menekan alert turunan saat parent node down) |
 
 ---
 
-## 🛠️ Alur Kerja Sistem
+## 💡 Mengapa v3 Berfokus pada Blackbox Rule UP / DOWN?
+
+1. **Aksesibel & Optimal untuk TV Display NOC**:
+   Tampilan dashboard dirancang agar dapat dibaca dengan jelas dari jarak jauh pada layar TV wall / monitor ruangan tanpa *clutter* grafik CPU/RAM yang membingungkan tim operasional non-sysadmin.
+2. **Deteksi Insiden Tercepat (Live Probe)**:
+   Fokus pada kondisi nyata layanan dari perspektif pengguna (*Is the service accessible?*). Jika website/ping down, sistem langsung menyalakan sirine dan beacon merah dalam kurun waktu 5–10 detik.
+3. **Ringan & Hemat Resource**:
+   Dengan mengeliminasi akumulasi metrik internal Node Exporter yang kompleks, `v3` berjalan sangat efisien dan responsif bahkan saat memantau ratusan hingga ribuan target layanan sekaligus.
+
+---
+
+## 🛠️ Alur Kerja Sistem v3
 
 ```text
-Server & Website Target (Host / HTTP / ICMP)
+Server / Network / Website Targets
        ↓
-Pengumpul Data (Node Exporter + Blackbox Exporter)
+Blackbox Exporter Probe (HTTP/HTTPS, ICMP Ping, DNS)
        ↓
-Prometheus Engine (Scrape 2s / Rule Evaluation 5s)
+Prometheus Engine (Evaluasi Rule Status UP/DOWN 5s)
        ↓
-Alertmanager (Routing, Grouping, & Global Inhibition)
+Alertmanager (Webhook Dispatcher & Inhibition)
        ↓
-InfraWatch Console v3 (Web Dashboard) ↔ Grafana
-(Maintenance Control, Dependency Suppression, SLA Engine, Audio Siren)
+InfraWatch Console v3 (Web Dashboard - TV Display Ready)
+├── Live Visual Beacon (Hijau = Normal, Merah = Down)
+├── Auto Audio Siren / Alarm MP3
+├── Maintenance Window Toggle (Mute Alarm Per-Target)
+├── Dependency Correlation Tree (Suppress Cascade Alerts)
+└── Advanced SLA & Fleet Availability Calculator
 ```
 
 ---
 
-# Fitur Utama (v3 Enterprise Edition)
+# Fitur Utama (v3 TV-Display Enterprise Edition)
 
-- **⚡ Ultra-Responsive Alerting**: Evaluasi rule interval 5 detik. Deteksi gangguan terjadi dalam **10–30 detik**.
-- **🚨 Multi-Tier Severity (Warning vs Critical)**:
-  - **CPU**: `CPUUsageWarning` (>80%), `HighCPU` (>95%), `CPUSaturationLoadHigh`.
-  - **RAM**: `MemoryUsageWarning` (>80%), `HighMemoryUsage` (>92%), `SwapUsageHigh` (>80%).
-  - **Disk**: `DiskSpaceWarning` (<15%), `DiskSpaceLow` (<5%), `DiskFillPredictive24h` (prediktif disk habis 24j).
-  - **Network & Target**: `NodeExporterDown` (15s), `PrometheusTargetDown` (15s), `NetworkErrors`.
-- **🛠️ Maintenance Mode**: Menangguhkan audio alarm dan log insiden untuk host yang sedang dalam jadwal perbaikan.
-- **🌳 Dependency Tree correlation**: Menekan notifikasi beruntun (*alert fatigue*) saat node upstream mati.
-- **📈 Comprehensive SLA & Fleet Analytics**: Menyajikan data ketersediaan aktual untuk laporan manajemen dan SLA audit.
-- **🖥️ InfraWatch Web Console v3 (`http://localhost:5000`)**: Dashboard interaktif berbasis Flask untuk monitoring live status, target CRUD, maintenance window management, dependency setup, dan ekspor CSV/JSON.
-
----
-
-# Daftar Isi
-
-- [Tech Stack](#tech-stack)
-- [Persyaratan System](#persyaratan-system)
-- [Instalasi Docker di Ubuntu Server](#instalasi-docker-di-ubuntu-server)
-- [Clone Repository](#clone-repository)
-- [Menjalankan Project](#menjalankan-project)
-- [Akses Layanan](#akses-layanan)
-- [Login Default](#login-default)
-- [Import Dashboard Grafana](#import-dashboard-grafana)
-- [Pengujian Monitoring](#pengujian-monitoring)
-- [Maintenance & Operasional](#maintenance--operasional)
-- [Changelog v3](#changelog-v3)
-- [Troubleshooting](#troubleshooting)
+- **🖥️ TV Monitoring Display Ready**: Interface ultra-clean khusus untuk ditayangkan 24/7 di TV Wall ruang IT / NOC.
+- **⚡ Ultra-Responsive Probe Evaluation**: Deteksi perubahan status UP/DOWN dalam **5–10 detik**.
+- **🔊 Auto Visual & Audio Siren Alarm**: Mengaktifkan sirine suara MP3 otomatis saat ada target yang mengalami down.
+- **🛠️ Maintenance Window Mode**: Fitur per-target untuk menahan sirine audio & menyembunyikan status DOWN saat jadwal perawatan rutin.
+- **🌳 Alert Correlation & Dependency Mapping**: Otomatis menekan alert turunan (*Child*) apabila node utama (*Parent/Gateway*) sedang down.
+- **📈 Advanced SLA & Fleet Availability Engine**: Mengkalkulasi 4 jenis metrik ketersediaan:
+  - `per_server`: Percent Uptime masing-masing target.
+  - `fleet_average`: Rata-rata Uptime unweighted.
+  - `fleet_aggregate`: Weighted SLA availability berdasarkan total waktu monitoring.
+  - `health_ratio`: Persentase target yang 100% bebas dari insiden (zero downtime).
+- **🌐 Dynamic Target Management**: Tambah dan hapus target website/server secara langsung dari UI Web Console (`http://localhost:5000`).
 
 ---
 
@@ -94,243 +80,101 @@ InfraWatch Console v3 (Web Dashboard) ↔ Grafana
 | Komponen | Versi | Deskripsi |
 | --- | --- | --- |
 | Docker Compose | v2.x | Orchestration container |
-| InfraWatch Console | v3.0 | Dashboard monitoring, SLA engine, maintenance & correlation receiver (Python/Flask) |
-| Prometheus | v2.54.1 | Time-series metrics collection & rule engine (5s evaluation) |
-| Alertmanager | v0.27.0 | Routing, grouping & alert inhibition engine |
-| Grafana | v11.1.0 | Dashboard visualisasi grafik infrastruktur |
-| Node Exporter | v1.8.2 | Host hardware metric collector |
+| InfraWatch Console | v3.0 | TV Display Dashboard, SLA Engine, Maintenance & Correlation Manager (Python/Flask) |
+| Prometheus | v2.54.1 | Metrics collection & rule evaluation engine (5s evaluation) |
+| Alertmanager | v0.27.0 | Routing & webhook notification engine |
 | Blackbox Exporter | v0.25.0 | Dynamic HTTP/HTTPS & ICMP availability probe |
-| Nginx | Stable | Web server contoh yang dimonitor |
 
 ---
 
 # Persyaratan System
 
-Sistem operasi yang didukung (Linux Server / Local Environment):
+Sistem operasi yang didukung (Ubuntu Server / Debian / Linux):
 
-- **Ubuntu Server 22.04 LTS / 24.04 LTS** (Direkomendasikan)
+- **Ubuntu Server 22.04 LTS / 24.04 LTS** (Sangat Direkomendasikan)
 - Debian 12+
 - WSL2 (Ubuntu)
-- RHEL / AlmaLinux / Rocky Linux 9+
+- Linux Server Apapun (Docker Ready)
 
 Spesifikasi Perangkat Minimal:
-
-- CPU: 2 Core
-- RAM: 2 GB (Rekomendasi 4 GB untuk data historis panjang)
-- Disk: 10 GB SSD
-- Software: Git, Docker Engine, Docker Compose v2, Koneksi Internet
+- CPU: 1-2 Core
+- RAM: 1-2 GB
+- Disk: 5 GB SSD
+- Software: Git, Docker Engine, Docker Compose v2
 
 ---
 
-# Instalasi Docker di Ubuntu Server
+# Cara Menjalankan di Ubuntu Server
 
-### 1. Update Package Index
+### 1. Install Docker (Jika Belum Terpasang)
 
 ```bash
 sudo apt update && sudo apt upgrade -y
-```
-
----
-
-### 2. Install Docker Engine
-
-Gunakan script instalasi resmi dari Docker:
-
-```bash
 curl -fsSL https://get.docker.com | sh
-```
-
----
-
-### 3. Konfigurasi User Permission
-
-Agar perintah Docker dapat dijalankan tanpa `sudo`:
-
-```bash
 sudo usermod -aG docker $USER
 newgrp docker
 ```
 
-Verifikasi instalasi Docker:
-
-```bash
-docker --version
-docker compose version
-```
-
 ---
 
-# Clone Repository
-
-Clone repository versi v3 ke Ubuntu Server Anda:
+### 2. Clone Repository & Jalankan Container
 
 ```bash
 git clone https://github.com/malvin1205/infra-monitoring-stack-v3.git
-```
-
-Masuk ke direktori project:
-
-```bash
 cd infra-monitoring-stack-v3
-```
-
----
-
-# Menjalankan Project
-
-Jalankan seluruh stack service secara *detached* (`-d`):
-
-```bash
 docker compose up -d
 ```
 
-Periksa status container:
+---
 
-```bash
-docker compose ps
-```
+### 3. Akses Layanan
 
-Status normal akan menampilkan container berjalan (`Up`):
-
-- `alarm` (InfraWatch Console v3)
-- `grafana` (opsional jika dikombinasikan dengan stack monitoring eksternal/internal)
-
-> **Catatan:** Container `alarm` dapat dikonfigurasikan untuk terhubung ke instance Prometheus yang sudah berjalan di server infrastruktur Anda melalui environment variable `PROMETHEUS_URL`.
+- **InfraWatch TV Web Console**: `http://<IP-SERVER-UBUNTU>:5000`
+- **Prometheus Metric Endpoint**: `http://<IP-SERVER-UBUNTU>:9090`
 
 ---
 
-# Akses Layanan
+# Operasional & Penggunaan TV Display NOC
 
-| Layanan | URL / Port Default | Deskripsi |
-| --- | --- | --- |
-| **InfraWatch Web Console v3** | `http://<IP-SERVER-UBUNTU>:5000` | Dashboard utama, SLA calculation, target CRUD, maintenance & alarm control |
-| **Grafana** | `http://<IP-SERVER-UBUNTU>:3000` | Dashboard visualisasi grafik metrics & tren historis |
-| **Prometheus** | `http://<IP-SERVER-UBUNTU>:9090` | Query Prometheus & status firing alert rules |
-| **Alertmanager** | `http://<IP-SERVER-UBUNTU>:9093` | Routing & inhibition status |
-| **Node Exporter** | `http://<IP-SERVER-UBUNTU>:9100/metrics` | Endpoint metrik hardware host |
-| **Blackbox Exporter** | `http://<IP-SERVER-UBUNTU>:9115` | Endpoint HTTP/ICMP availability probe |
+### 1. Menampilkan di TV Monitoring NOC
+1. Buka browser di TV / Smart TV / PC Display NOC.
+2. Akses `http://<IP-SERVER-UBUNTU>:5000`.
+3. Klik tombol **Enable Audio / Unmute** pada browser agar alarm sirine suara dapat berbunyi otomatis saat ada insiden.
 
----
-
-# Login Default
-
-| Layanan | Username | Password |
-| --- | --- | --- |
-| **Grafana** | `admin` | `admin` |
-| **InfraWatch Console** | *(Tidak ada autentikasi default / Tanpa Login)* |
-
-> **Security Tip:** Untuk penggunaan di lingkungan produksi, disarankan memasang Reverse Proxy (Nginx/Traefik) dengan Basic Auth atau OAuth2 Proxy di depan port 5000 dan 3000.
-
----
-
-# Import Dashboard Grafana
-
-Akses Grafana (`http://<IP-SERVER-UBUNTU>:3000`), lalu navigasi ke:
-
-```
-Dashboards → Import
-```
-
-Masukkan ID Dashboard komunitas berikut:
-
-| Nama Dashboard | ID | Kegunaan |
-| --- | --- | --- |
-| **Node Exporter Full** | `1860` | Monitoring detail CPU, RAM, Disk, & Network Host |
-| **Blackbox Exporter** | `7587` | Monitoring status uptime & latensi HTTP/Ping |
-
----
-
-# Pengujian Monitoring
-
-### 1. Pengujian Maintenance Mode (v3 Feature)
-1. Buka InfraWatch Console di `http://<IP-SERVER-UBUNTU>:5000`.
-2. Aktifkan **Maintenance Mode** pada salah satu target server/website.
-3. Matikan target tersebut (misal: matikan service Nginx).
-4. **Hasil**: Target ditandai sedang dalam perawatan, log insiden dicatat khusus, dan sirine audio **tidak berbunyi**.
-
----
-
-### 2. Simulasi Website Down (Respon ~10 Detik)
-Hentikan container web yang dimonitor:
-
-```bash
-docker stop nginx
-```
-
-Dalam kurun waktu ~10 detik, alert **WebsiteDown** akan aktif di Alertmanager dan InfraWatch Web Console akan menyalakan sirine audio serta indikator visual merah.
-
-Untuk mengembalikan kondisi normal:
-
-```bash
-docker start nginx
-```
-
----
-
-### 3. Simulasi Load CPU Tinggi
-Install `stress-ng` pada Ubuntu Server:
-
-```bash
-sudo apt install stress-ng -y
-stress-ng --cpu 4 --timeout 60
-```
-
-Dalam 15–30 detik, alert **CPUUsageWarning** (>80%) atau **HighCPU** (>95%) akan terdeteksi di dashboard.
-
----
-
-# Maintenance & Operasional
-
-### Perintah Penting Docker Compose:
-
-- **Cek Status Container**:
-  ```bash
-  docker compose ps
-  ```
-- **Melihat Log Real-time**:
-  ```bash
-  docker compose logs -f
-  ```
-- **Restart Seluruh Service**:
-  ```bash
-  docker compose restart
-  ```
-- **Menghentikan Service**:
-  ```bash
-  docker compose down
-  ```
+### 2. Memasang Maintenance Window Saat Perawatan
+Saat server/website akan di-restart atau diperbaiki:
+1. Buka InfraWatch Console (`http://<IP-SERVER-UBUNTU>:5000`).
+2. Aktifkan **Maintenance** pada target yang bersangkutan.
+3. Sirine suara tidak akan membingungkan tim di ruang NOC selama proses perbaikan berlangsung.
 
 ---
 
 # Changelog v3
 
-### v3.0 Major Enterprise Release
-- 🛠️ **Maintenance Window Management**: Dukungan penangguhan alarm & penandaan visual jadwal perawatan rutin per-target.
-- 🌳 **Alert Correlation Engine (Dependency Tree)**: Penekanan notifikasi berantai (*alert cascade suppression*) berbasis pemetaan Parent-Child host.
-- 📊 **4-Metric Fleet Availability (SLA Engine)**: Menghitung ketersediaan `per_server`, `fleet_average`, `fleet_aggregate` (weighted SLA), dan `health_ratio`.
-- ⚡ **Multi-Prometheus Failover**: Auto-detection & failover secara dinamis jika endpoint Prometheus utama tidak merespons.
-- 🔒 **Webhook Race-Condition Protection**: Implementasi `_WEBHOOK_LOCK` untuk penanganan data webhook Alertmanager secara thread-safe.
-- 🚀 **Performance Optimization**: Kompresi respon GZIP untuk fleet skala besar dan dynamic asset cache-busting (`?v=<mtime>`).
+### v3.0 Major Focus Shift Release
+- 🎯 **Focused Blackbox Architecture**: Penghapusan ketergantungan pada Node Exporter agar dashboard berfokus 100% pada ketersediaan layanan (UP/DOWN) & latensi respons, dioptimalkan khusus untuk ditayangkan di **TV Monitoring NOC**.
+- 🛠️ **Maintenance Mode**: Penangguhan alarm suara per-target saat perawatan berkala.
+- 🌳 **Dependency Correlation Engine**: Penekanan alert turunan saat node upstream/gateway mengalami insiden.
+- 📊 **Comprehensive SLA Analytics**: Perhitungan otomatis 4 variabel availability (`per_server`, `fleet_average`, `fleet_aggregate`, `health_ratio`).
+- ⚡ **Multi-Prometheus Failover & GZIP Payload**: Auto-failover endpoint Prometheus dan kompresi data untuk performa visual tanpa lag.
 
 ---
 
 # Troubleshooting
 
-## InfraWatch Console tidak dapat terhubung ke Prometheus
-Pastikan environment variable `PROMETHEUS_URL` pada `docker-compose.yml` mengarah ke IP / hostname Prometheus yang benar. Jika Prometheus berjalan di host yang sama di luar Docker, gunakan IP interface (misal `http://172.17.0.1:9090` atau IP lokal server).
+## Suara alarm tidak berbunyi di browser TV
+Kebanyakan browser modern memblokir autoplay audio secara default. Cukup klik sekali di area dashboard atau klik tombol **Enable Sound** pada UI InfraWatch Console.
 
-## File Rule Prometheus Permission Denied
+## Mengubah URL Prometheus Sumber
+Jika Prometheus berjalan terpisah di jaringan Anda, ubah environment variable pada `docker-compose.yml`:
 
-```bash
-sudo find . -type f \( -name "*.yml" -o -name "*.yaml" -o -name "*.conf" \) -exec chmod 644 {} \;
-sudo find . -type d -exec chmod 755 {} \;
-sudo chown -R $USER:$USER .
-docker compose restart
+```yaml
+environment:
+  - PROMETHEUS_URL=http://<IP-PROMETHEUS-ANDA>:9090
 ```
 
-## Docker Permission Denied pada Ubuntu Server
+Kemudian restart container:
 
 ```bash
-sudo usermod -aG docker $USER
-newgrp docker
+docker compose restart
 ```
