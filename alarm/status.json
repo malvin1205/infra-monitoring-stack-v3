@@ -1,0 +1,30 @@
+{
+  "status": "CRITICAL",
+  "alerts": [
+    {
+      "key": "PostRestartCheck|pr:9100",
+      "name": "PostRestartCheck",
+      "severity": "warning",
+      "instance": "pr:9100",
+      "summary": "x",
+      "time": 1785542400.0
+    },
+    {
+      "key": "TargetDown|91.239.100.100",
+      "name": "TargetDown",
+      "severity": "critical",
+      "instance": "91.239.100.100",
+      "summary": "91.239.100.100 is unreachable (probe_success=0)",
+      "time": 1785575280.788316
+    },
+    {
+      "key": "TargetDown|156.154.71.1",
+      "name": "TargetDown",
+      "severity": "critical",
+      "instance": "156.154.71.1",
+      "summary": "156.154.71.1 is unreachable (probe_success=0)",
+      "time": 1785581778.3314981
+    }
+  ],
+  "updated": 1785581778.3752387
+}

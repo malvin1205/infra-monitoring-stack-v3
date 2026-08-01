@@ -1,0 +1,793 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="InfraWatch — Internal network ping monitoring NOC dashboard">
+  <title>InfraWatch · Internal Network Monitor</title>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,300;0,14..32,400;0,14..32,500;0,14..32,600;0,14..32,700;1,14..32,400&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/noc.css') }}?v={{ asset_version('css/noc.css') }}">
+</head>
+<body>
+
+  <!-- ── Audio Consent & Welcome Splash Screen ────────────── -->
+  <div id="splashOverlay" class="splash-overlay">
+    <div class="splash-card">
+      <div class="splash-brand-icon">
+        <svg width="40" height="40" viewBox="0 0 22 22" fill="none">
+          <rect x="2" y="2" width="7" height="7" rx="2" fill="var(--accent)"/>
+          <rect x="13" y="2" width="7" height="7" rx="2" fill="var(--accent)" opacity="0.5"/>
+          <rect x="2" y="13" width="7" height="7" rx="2" fill="var(--accent)" opacity="0.5"/>
+          <rect x="13" y="13" width="7" height="7" rx="2" fill="var(--accent)" opacity="0.7"/>
+        </svg>
+      </div>
+      <h1 class="splash-title">InfraWatch NOC Dashboard</h1>
+      <p class="splash-desc">
+        Klik tombol di bawah untuk masuk ke dashboard monitoring network dan mengaktifkan <strong>izin audio alarm MP3</strong>.
+      </p>
+
+      <div class="splash-audio-badge">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+          <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"/>
+        </svg>
+        <span>Audio Alarm Auto-Play Permission Required</span>
+      </div>
+
+      <button id="enterDashboardBtn" class="splash-btn" type="button">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <polygon points="5 3 19 12 5 21 5 3"/>
+        </svg>
+        <span>Masuk & Aktifkan Audio Alarm</span>
+      </button>
+
+      <span class="splash-subnote">Browser memerlukan 1x klik pengguna agar bunyi alarm .MP3 dapat terputar otomatis saat terjadi status Critical.</span>
+    </div>
+  </div>
+
+  <!-- ── Toast Notification ─────────────────────────────── -->
+  <div id="eventAlertBanner" class="toast hidden" role="status" aria-live="polite">
+    <span class="toast-dot"></span>
+    <span id="eventBannerText">Host status changed</span>
+    <button id="closeEventBanner" class="toast-close" aria-label="Dismiss">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+    </button>
+  </div>
+
+  <!-- ── Top Navigation ─────────────────────────────────── -->
+  <nav class="topnav" role="navigation" aria-label="Main navigation">
+    <div class="topnav-brand">
+      <!-- Logo mark -->
+      <div class="brand-mark" aria-hidden="true">
+        <svg width="22" height="22" viewBox="0 0 22 22" fill="none">
+          <rect x="2" y="2" width="7" height="7" rx="2" fill="var(--accent)"/>
+          <rect x="13" y="2" width="7" height="7" rx="2" fill="var(--accent)" opacity="0.5"/>
+          <rect x="2" y="13" width="7" height="7" rx="2" fill="var(--accent)" opacity="0.5"/>
+          <rect x="13" y="13" width="7" height="7" rx="2" fill="var(--accent)" opacity="0.7"/>
+        </svg>
+      </div>
+      <span class="brand-name">InfraWatch</span>
+      <span class="brand-divider" aria-hidden="true">/</span>
+      <span class="brand-sub">Internal Network</span>
+    </div>
+
+    <div class="topnav-center">
+      <div class="live-pill">
+        <span class="live-dot" id="liveDot" aria-label="Live data"></span>
+        <span class="live-label">Live</span>
+      </div>
+    </div>
+
+    <div class="topnav-actions">
+      <div id="globalHealthBadge" class="status-pill pill-healthy">
+        <span class="pill-dot"></span>
+        <span class="pill-label">Healthy</span>
+      </div>
+
+      <!-- Acknowledge Alarm Button (Only visible when target is down/warning) -->
+      <button id="ackAlarmBtn" class="ack-alarm-btn hidden" type="button" title="Acknowledge and silence current alarm">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="20 6 9 17 4 12"/>
+        </svg>
+        <span id="ackBtnLabel">Acknowledge Alarm</span>
+      </button>
+
+      <!-- Alert Logs / Incident History -->
+      <button class="icon-action" id="openLogsModalBtn" type="button" title="Alert Logs & Incident History" aria-label="Alert Logs & Incident History" aria-haspopup="dialog" aria-controls="logsModal" style="position: relative;">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 22V6a2 2 0 012-2h12a2 2 0 012 2v16"/>
+          <path d="M2 22h20M8 10h8M8 14h5"/>
+        </svg>
+        <span id="logsBadge" class="nav-badge hidden"></span>
+      </button>
+
+
+      <span class="last-updated-text" id="statusMeta">Checking…</span>
+      <span class="last-probe-text" id="lastProbeTime" style="display:none"></span>
+
+      <!-- Endpoint Selector Dropdown & Manage Button -->
+      <div class="filter-select-wrap">
+        <select id="endpointSelect" class="filter-select" title="Pilih Endpoint Prometheus Active" aria-label="Prometheus Endpoint">
+          <option value="http://192.168.9.16:9090">Prometheus: 192.168.9.16:9090</option>
+        </select>
+      </div>
+
+      <button class="icon-action" id="openEndpointModalBtn" title="Kelola / Tambah Endpoint Prometheus" aria-label="Kelola Endpoint">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="3"/>
+          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+        </svg>
+      </button>
+
+      <select id="scrapeIntervalSelect" class="interval-select" aria-label="Refresh interval">
+        <option value="2000">2s (Fast)</option>
+        <option value="5000" selected>5s (Default)</option>
+        <option value="10000">10s</option>
+        <option value="30000">30s</option>
+      </select>
+
+      <button class="icon-action" id="refreshInstances" title="Refresh now" aria-label="Refresh data">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 12a9 9 0 11-6.219-8.56"/>
+        </svg>
+      </button>
+
+      <button class="icon-action" id="soundToggleBtn" title="Toggle sound alarm" aria-label="Toggle sound alarm">
+        <svg id="soundIconOn" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+          <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"/>
+        </svg>
+        <svg id="soundIconOff" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none">
+          <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+          <line x1="23" y1="9" x2="17" y2="15"/>
+          <line x1="17" y1="9" x2="23" y2="15"/>
+        </svg>
+      </button>
+
+      <!-- Self-Monitoring (Phase 13) — reuses /health -->
+      <button class="icon-action" id="selfHealthBtn" title="Checking InfraWatch self-status…" aria-label="InfraWatch self-status" style="position: relative;">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M22 12h-4l-3 9L9 3l-3 9H2"/>
+        </svg>
+        <span id="selfHealthDot" style="position:absolute; top:5px; right:5px; width:7px; height:7px; border-radius:50%; background: var(--success);"></span>
+      </button>
+
+      <button class="icon-action" id="themeToggleBtn" aria-label="Toggle theme">
+        <svg id="themeIconDark" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+          <path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/>
+        </svg>
+        <svg id="themeIconLight" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none">
+          <circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/>
+          <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/>
+          <line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/>
+          <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
+        </svg>
+      </button>
+    </div>
+  </nav>
+
+  <!-- ── Main Wrapper ───────────────────────────────────── -->
+  <main class="main-wrap" id="dashboard">
+
+    <!-- ── Summary Cards ────────────────────────────────── -->
+    <section class="summary-row" aria-label="Summary metrics">
+      <div class="summary-card">
+        <div class="sc-icon-box">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="2" y="2" width="20" height="8" rx="2" ry="2"/>
+            <rect x="2" y="14" width="20" height="8" rx="2" ry="2"/>
+            <line x1="6" y1="6" x2="6.01" y2="6"/>
+            <line x1="6" y1="18" x2="6.01" y2="18"/>
+          </svg>
+        </div>
+        <div class="sc-content">
+          <span class="sc-value" id="instTotal">—</span>
+          <span class="sc-label">Total Hosts</span>
+        </div>
+      </div>
+      <div class="summary-card">
+        <div class="sc-icon-box">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M5 12.55a11 11 0 0 1 14.08 0"/>
+            <path d="M1.42 9a16 16 0 0 1 21.16 0"/>
+            <path d="M8.53 16.11a6 6 0 0 1 6.95 0"/>
+            <line x1="12" y1="20" x2="12.01" y2="20"/>
+          </svg>
+        </div>
+        <div class="sc-content">
+          <span class="sc-value color-success" id="instUp">—</span>
+          <span class="sc-label">Online</span>
+        </div>
+      </div>
+      <div class="summary-card">
+        <div class="sc-icon-box">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+            <line x1="12" y1="9" x2="12" y2="13"/>
+            <line x1="12" y1="17" x2="12.01" y2="17"/>
+          </svg>
+        </div>
+        <div class="sc-content">
+          <span class="sc-value color-warning" id="instSlow">—</span>
+          <span class="sc-label">Warning</span>
+        </div>
+      </div>
+      <div class="summary-card">
+        <div class="sc-icon-box">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="10"/>
+            <line x1="8" y1="12" x2="16" y2="12"/>
+          </svg>
+        </div>
+        <div class="sc-content">
+          <span class="sc-value color-critical" id="instDown">—</span>
+          <span class="sc-label">Offline</span>
+        </div>
+      </div>
+      <div class="summary-card sc-availability">
+        <button id="availabilityDetailBtn" class="sc-detail-btn" type="button" title="Lihat breakdown metrik availability" aria-haspopup="dialog" aria-controls="availabilityBreakdownModal">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+          <span>Detail</span>
+        </button>
+        <div class="sc-icon-box">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
+          </svg>
+        </div>
+        <div class="sc-content">
+          <span class="sc-value color-accent" id="instOverallUptime">—</span>
+          <span class="sc-label" id="availabilityLabel">Availability (24h)</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── Host Grid Section ─────────────────────────────── -->
+    <section class="hosts-section">
+
+      <!-- Toolbar -->
+      <div class="hosts-toolbar">
+        <h2 class="section-title">Internal Hosts</h2>
+        <div class="toolbar-right">
+          <!-- Period / range selector (drives summary card metrics) -->
+          <div class="range-select-wrap">
+            <div class="filter-chips range-chips" id="rangeFilterChips" role="group" aria-label="Filter by time range">
+              <button class="chip" data-range="realtime" id="rangePresetRealtime">Realtime</button>
+              <button class="chip chip-active" data-range="24h" id="rangePreset24h">24h</button>
+              <button class="chip" data-range="7d" id="rangePreset7d">7d</button>
+              <button class="chip" data-range="30d" id="rangePreset30d">30d</button>
+              <button class="chip" data-range="custom" id="rangePresetCustom">Custom Range</button>
+            </div>
+
+            <!-- Custom range popover -->
+            <div class="custom-range-popover hidden" id="customRangePopover" role="dialog" aria-label="Custom time range">
+              <div class="crp-row">
+                <label class="crp-label" for="customRangeFrom">Dari</label>
+                <input type="datetime-local" id="customRangeFrom" class="crp-input">
+              </div>
+              <div class="crp-row">
+                <label class="crp-label" for="customRangeTo">Sampai</label>
+                <input type="datetime-local" id="customRangeTo" class="crp-input">
+              </div>
+              <div id="customRangeError" class="crp-error hidden"></div>
+              <div class="crp-actions">
+                <button type="button" class="btn btn-secondary btn-sm" id="customRangeCancelBtn">Batal</button>
+                <button type="button" class="btn btn-primary btn-sm" id="customRangeApplyBtn">Terapkan</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Sort Filter -->
+          <div class="filter-select-wrap">
+            <select id="sortSelect" class="filter-select" aria-label="Urutkan target">
+              <option value="default">Urutan: Prioritas (Down Pertama)</option>
+              <option value="name_asc">Urutan: Nama Host (A-Z)</option>
+              <option value="name_desc">Urutan: Nama Host (Z-A)</option>
+              <option value="job_asc">Urutan: Job (A-Z)</option>
+              <option value="job_desc">Urutan: Job (Z-A)</option>
+              <option value="latency_desc">Urutan: Latency (Lambat ke Cepat)</option>
+              <option value="latency_asc">Urutan: Latency (Cepat ke Lambat)</option>
+            </select>
+          </div>
+
+          <!-- Job Filter -->
+          <div class="filter-select-wrap">
+            <select id="jobSelect" class="filter-select" aria-label="Filter berdasarkan Job">
+              <option value="all">Semua Job</option>
+            </select>
+          </div>
+
+          <!-- Search -->
+          <div class="search-wrap">
+            <svg class="search-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
+            <input type="text" id="instanceSearch" class="search-input" placeholder="Cari IP / Host / Job…" autocomplete="off" aria-label="Search hosts">
+            <button id="clearSearchBtn" class="search-clear-btn hidden" type="button" aria-label="Clear search">&times;</button>
+          </div>
+
+          <!-- Filter chips -->
+          <div class="filter-chips" id="statusFilterChips" role="group" aria-label="Filter by status">
+            <button class="chip chip-active" data-status="all" id="filterAll">Semua</button>
+            <button class="chip" data-status="up" id="filterOnline">Online</button>
+            <button class="chip" data-status="down" id="filterOffline">Offline</button>
+            <button class="chip" data-status="slow" id="filterSlow">Slow (>500ms)</button>
+          </div>
+
+          <button id="openAddTargetModalBtn" class="add-target-btn" type="button">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+            <span>Tambah Target</span>
+          </button>
+
+          <span class="host-count-badge" id="instanceCount">—</span>
+        </div>
+      </div>
+
+      <!-- Grid -->
+      <div class="host-grid" id="instancesBody" role="list" aria-label="Host list">
+        <!-- Skeleton -->
+        <div class="host-skeleton" aria-hidden="true"></div>
+        <div class="host-skeleton" aria-hidden="true"></div>
+        <div class="host-skeleton" aria-hidden="true"></div>
+        <div class="host-skeleton" aria-hidden="true"></div>
+        <div class="host-skeleton" aria-hidden="true"></div>
+        <div class="host-skeleton" aria-hidden="true"></div>
+        <div class="host-skeleton" aria-hidden="true"></div>
+        <div class="host-skeleton" aria-hidden="true"></div>
+      </div>
+
+      <!-- Error state -->
+      <div class="error-state hidden" id="instancesError" role="alert">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+        <span id="instancesErrorMsg">Cannot reach Prometheus scrape engine</span>
+      </div>
+
+    </section>
+  </main>
+
+  <!-- ── Side Drawer ────────────────────────────────────── -->
+  <div class="drawer-backdrop hidden" id="sideDrawerOverlay" aria-hidden="true"></div>
+  <aside class="side-drawer" id="sideDrawer" role="dialog" aria-modal="true" aria-label="Host details">
+
+    <div class="drawer-header">
+      <div class="drawer-host-info">
+        <span class="drawer-dot" id="drawerStatusDot"></span>
+        <div>
+          <h3 class="drawer-ip" id="drawerTargetTitle">—</h3>
+          <span class="drawer-job-text" id="drawerJobBadge">blackbox-ping-internal</span>
+        </div>
+      </div>
+      <div class="drawer-actions-top">
+        <button class="drawer-close" id="closeDrawerBtn" aria-label="Close details">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+        </button>
+      </div>
+    </div>
+
+    <div class="drawer-body">
+
+      <!-- Status row -->
+      <div class="drawer-status-row">
+        <span class="drawer-status-pill" id="drawerStatusPill">—</span>
+        <span class="drawer-last-check">Last probe: <span id="drawerLastCheck">—</span></span>
+      </div>
+      <div class="drawer-error-row hidden" id="drawerErrorRow"></div>
+
+      <!-- Metrics grid -->
+      <div class="drawer-metrics">
+        <div class="dm-card">
+          <span class="dm-label">Latency</span>
+          <span class="dm-value" id="drawerLatency">—</span>
+        </div>
+        <div class="dm-card">
+          <span class="dm-label">Probe</span>
+          <span class="dm-value" id="drawerHttpCode">—</span>
+        </div>
+        <div class="dm-card">
+          <span class="dm-label" id="drawerUptimeLabel">Uptime (24h)</span>
+          <span class="dm-value" id="drawerUptimeVal">—</span>
+        </div>
+        <div class="dm-card">
+          <span class="dm-label">Packet Loss</span>
+          <span class="dm-value" id="drawerPacketLoss">—</span>
+        </div>
+      </div>
+
+      <!-- Sparkline -->
+      <div class="drawer-section">
+        <div class="drawer-section-title">Response Time Trend</div>
+        <div class="sparkline-wrap" id="drawerSparkline">
+          <svg class="sparkline" viewBox="0 0 300 50" preserveAspectRatio="none">
+            <defs>
+              <linearGradient id="sg" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stop-color="var(--accent)" stop-opacity="0.3"/>
+                <stop offset="100%" stop-color="var(--accent)" stop-opacity="0"/>
+              </linearGradient>
+            </defs>
+            <path class="spark-area" d="M0,35 Q30,25 60,30 T120,20 T180,25 T240,15 T300,20 L300,50 L0,50Z" fill="url(#sg)"/>
+            <path class="spark-line" d="M0,35 Q30,25 60,30 T120,20 T180,25 T240,15 T300,20" fill="none" stroke="var(--accent)" stroke-width="1.5" stroke-linecap="round"/>
+          </svg>
+        </div>
+      </div>
+
+      <!-- Network info -->
+      <div class="drawer-section">
+        <div class="drawer-section-title">Target Info</div>
+        <div class="drawer-info-list">
+          <div class="dil-row">
+            <span class="dil-label">Scrape URL</span>
+            <a id="drawerTargetUrlLink" href="#" target="_blank" rel="noopener" class="dil-link">—</a>
+          </div>
+          <div class="dil-row">
+            <span class="dil-label">Job</span>
+            <span class="dil-value" id="drawerInfoJob">blackbox-ping-internal</span>
+          </div>
+          <div class="dil-row">
+            <span class="dil-label">Protocol</span>
+            <span class="dil-value">ICMP Ping</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Uptime & Downtime Log -->
+      <div class="drawer-section">
+        <div class="drawer-section-title" style="display: flex; justify-content: space-between; align-items: center;">
+          <span>Uptime & Downtime Log</span>
+        </div>
+        <div class="drawer-events" id="drawerLogsList">
+          <div class="de-empty">Memuat histori log event...</div>
+        </div>
+      </div>
+
+      <!-- Maintenance Mode (Phase 9) -->
+      <div class="drawer-section" id="drawerMaintenanceSection">
+        <div class="drawer-section-title">Maintenance Mode</div>
+
+        <div id="drawerMaintenanceActive" class="hidden" style="display:flex; flex-direction:column; gap:8px; background: var(--bg); border:1px solid var(--border-strong); border-radius: var(--r-md); padding: 12px 14px;">
+          <div style="display:flex; justify-content:space-between; align-items:center; gap:8px;">
+            <span style="font-size:12px; font-weight:600; color: var(--text-secondary);">Ends in <span id="drawerMaintCountdown" style="font-family: var(--font-mono); color: var(--text-primary);">—</span></span>
+            <button id="drawerMaintEndBtn" class="btn btn-sm btn-secondary" type="button">End Early</button>
+          </div>
+          <div id="drawerMaintReason" style="font-size:12px; color: var(--text-muted);"></div>
+        </div>
+
+        <form id="drawerMaintenanceForm" style="display:flex; flex-direction:column; gap:10px;">
+          <div class="form-group">
+            <label class="form-label" for="drawerMaintDuration">Duration</label>
+            <select id="drawerMaintDuration" class="form-select">
+              <option value="30">30 minutes</option>
+              <option value="60" selected>1 hour</option>
+              <option value="120">2 hours</option>
+              <option value="240">4 hours</option>
+              <option value="480">8 hours</option>
+              <option value="1440">24 hours</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="drawerMaintReasonInput">Reason (optional)</label>
+            <input type="text" id="drawerMaintReasonInput" class="form-input" placeholder="Scheduled reboot, firmware update, ...">
+          </div>
+          <button id="drawerMaintStartBtn" type="submit" class="btn btn-primary btn-sm" style="width:100%; justify-content:center;">Start Maintenance</button>
+        </form>
+      </div>
+
+      <!-- Alert Correlation / Dependency (Phase 12) -->
+      <div class="drawer-section" id="drawerDependencySection">
+        <div class="drawer-section-title">Depends On <em style="font-weight:400; text-transform:none; letter-spacing:normal;">(alert correlation)</em></div>
+
+        <div id="drawerDependencyActive" class="hidden" style="display:flex; justify-content:space-between; align-items:center; gap:8px; background: var(--bg); border:1px solid var(--border-strong); border-radius: var(--r-md); padding: 10px 14px; font-size:12px;">
+          <span>Depends on <strong id="drawerDependencyParent" style="font-family: var(--font-mono); color: var(--text-primary);">—</strong></span>
+          <button id="drawerDependencyRemoveBtn" class="btn btn-sm btn-secondary" type="button">Remove</button>
+        </div>
+
+        <form id="drawerDependencyForm" style="display:flex; gap:8px;">
+          <select id="drawerDependencyParentSelect" class="form-select" style="flex:1;">
+            <option value="">Select parent host…</option>
+          </select>
+          <button type="submit" class="btn btn-primary btn-sm">Link</button>
+        </form>
+        <span class="form-help" style="margin-top:6px; display:block;">When both this host and its parent are down, this host is de-emphasized instead of pulsing — its alert still fires and is logged normally.</span>
+      </div>
+
+      <!-- Target Management Actions -->
+      <div class="drawer-section drawer-danger-section" style="margin-top: 1.5rem; padding-top: 1rem; border-top: 1px solid var(--border);">
+        <button id="drawerDeleteBtn" class="drawer-del-btn" style="width: 100%; justify-content: center; padding: 10px; background: rgba(239, 68, 68, 0.1); color: #EF4444; border: 1px solid rgba(239, 68, 68, 0.3); border-radius: var(--r-sm); font-size: 13px; font-weight: 500; cursor: pointer; display: flex; align-items: center; gap: 6px;" title="Hapus target ini dari monitoring">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
+          <span>Hapus Target dari Monitoring</span>
+        </button>
+      </div>
+
+    </div>
+  </aside>
+
+  <!-- Audio alert -->
+  <audio id="alarmAudio" src="{{ url_for('static', filename='alarm.mp3') }}" preload="auto"></audio>
+
+  <!-- Add Target Modal -->
+  <div id="addTargetModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3 class="modal-title" id="modalTitle">Tambah Target Monitoring</h3>
+        <button id="closeAddTargetModal" class="modal-close" type="button" aria-label="Close modal">&times;</button>
+      </div>
+      <form id="addTargetForm" class="modal-form">
+        <div class="form-group">
+          <label for="targetUrlSelect" class="form-label">Pilih Target dari Prometheus (blackbox-ping-internal)</label>
+          <select id="targetUrlSelect" class="form-select" required>
+            <option value="" disabled selected>Memuat daftar target Prometheus...</option>
+          </select>
+          <span class="form-help">Pilih alamat IP dari daftar target Prometheus <code>blackbox-ping-internal</code> untuk diaktifkan ke monitoring.</span>
+        </div>
+        <div id="addTargetError" class="form-error hidden"></div>
+        <div class="modal-actions">
+          <button type="button" id="cancelAddTargetBtn" class="btn btn-secondary">Batal</button>
+          <button type="submit" id="submitAddTargetBtn" class="btn btn-primary">
+            <span>Simpan Target</span>
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Availability Breakdown Modal -->
+  <div id="availabilityBreakdownModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="availabilityBreakdownTitle">
+    <div class="modal-card modal-card-wide">
+      <div class="modal-header">
+        <h3 class="modal-title" id="availabilityBreakdownTitle">Availability Breakdown <span id="availabilityBreakdownRange" class="modal-title-sub">(24h)</span></h3>
+        <button id="closeAvailabilityBreakdown" class="modal-close" type="button" aria-label="Close modal">&times;</button>
+      </div>
+
+      <div class="modal-body">
+        <!-- 4 metrics, kept explicitly separate — not blended into one number -->
+        <div class="avail-metric-grid">
+          <div class="avail-metric-card avail-metric-primary">
+            <span class="avail-metric-label">Fleet Aggregate <em>(weighted by time — SLA)</em></span>
+            <span class="avail-metric-value" id="metricFleetAggregate">—</span>
+          </div>
+          <div class="avail-metric-card">
+            <span class="avail-metric-label">Fleet Average <em>(unweighted)</em></span>
+            <span class="avail-metric-value" id="metricFleetAverage">—</span>
+          </div>
+          <div class="avail-metric-card">
+            <span class="avail-metric-label">Health Ratio <em>(never-down servers)</em></span>
+            <span class="avail-metric-value" id="metricHealthRatio">—</span>
+          </div>
+          <div class="avail-metric-card">
+            <span class="avail-metric-label">Mean Outage Duration</span>
+            <span class="avail-metric-value" id="metricMeanOutage">—</span>
+          </div>
+        </div>
+
+        <div class="avail-breakdown-section">
+          <div class="avail-breakdown-title">Top 5 Unstable Hosts <em>(by incident count)</em></div>
+          <div class="avail-lowest-table" id="mostUnstableTable">
+            <div class="de-empty">No incidents recorded</div>
+          </div>
+        </div>
+
+        <div class="avail-breakdown-section" style="margin-top: 1.25rem;">
+          <div class="avail-breakdown-title">Lowest Availability — Per Server</div>
+          <div class="avail-lowest-table" id="availabilityLowestTable">
+            <div class="de-empty">No data</div>
+          </div>
+        </div>
+
+        <div class="avail-breakdown-section" style="margin-top: 1.25rem;">
+          <div class="avail-breakdown-title">Downtime & Incident Log — Per Server</div>
+          <div class="avail-lowest-table" id="availabilityIncidentLogTable">
+            <div class="de-empty">No downtime incidents recorded</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Alert Logs / Incident History Modal -->
+  <div id="logsModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="logsModalTitle">
+    <div class="modal-card modal-card-wide">
+      <div class="modal-header">
+        <h3 class="modal-title" id="logsModalTitle">Alert Logs & Incident History</h3>
+        <button id="closeLogsModal" class="modal-close" type="button" aria-label="Close modal">&times;</button>
+      </div>
+
+      <div class="modal-body">
+        <div class="logs-tabs" role="tablist" aria-label="Logs view">
+          <button class="chip chip-active" id="logsTabBtn" data-logs-tab="logs" type="button" role="tab" aria-selected="true">Live Alert Log</button>
+          <button class="chip" id="historyTabBtn" data-logs-tab="history" type="button" role="tab" aria-selected="false">Incident History <span id="historyNavBadge" class="nav-badge nav-badge-inline hidden"></span></button>
+          <button class="chip" id="maintenanceTabBtn" data-logs-tab="maintenance" type="button" role="tab" aria-selected="false">Maintenance <span id="maintenanceNavBadge" class="nav-badge nav-badge-inline hidden"></span></button>
+        </div>
+
+        <!-- Live Alert Log panel -->
+        <div id="logsTabPanel" class="logs-tab-panel">
+          <div class="logs-toolbar">
+            <input type="text" id="logSearch" class="search-input" placeholder="Cari alert / host…" autocomplete="off" aria-label="Search alert logs">
+            <div class="logs-filter-group">
+              <button class="chip chip-active" data-log-filter="all" type="button">All</button>
+              <button class="chip" data-log-filter="firing" type="button">Firing</button>
+              <button class="chip" data-log-filter="resolved" type="button">Resolved</button>
+            </div>
+            <label class="logs-live-toggle">
+              <input type="checkbox" id="logLiveToggle" checked>
+              <span>Live</span>
+            </label>
+            <button id="clearLogs" class="btn btn-secondary btn-sm" type="button">Clear</button>
+          </div>
+          <div class="log-stream" id="logStream"></div>
+        </div>
+
+        <!-- Incident History panel -->
+        <div id="historyTabPanel" class="logs-tab-panel hidden">
+          <div class="avail-metric-grid">
+            <div class="avail-metric-card">
+              <span class="avail-metric-label">Total Incidents</span>
+              <span class="avail-metric-value" id="histTotal">—</span>
+            </div>
+            <div class="avail-metric-card">
+              <span class="avail-metric-label">This Month</span>
+              <span class="avail-metric-value" id="histThisMonth">—</span>
+            </div>
+            <div class="avail-metric-card">
+              <span class="avail-metric-label">Critical</span>
+              <span class="avail-metric-value" id="histCritical">—</span>
+            </div>
+            <div class="avail-metric-card">
+              <span class="avail-metric-label">Warning</span>
+              <span class="avail-metric-value" id="histWarning">—</span>
+            </div>
+          </div>
+
+          <div class="logs-toolbar" style="margin-top: 12px;">
+            <input type="text" id="historySearch" class="search-input" placeholder="Cari alert / host…" autocomplete="off" aria-label="Search incident history">
+            <div class="logs-filter-group">
+              <button class="chip chip-active" data-hist-filter="all" type="button">All</button>
+              <button class="chip" data-hist-filter="critical" type="button">Critical</button>
+              <button class="chip" data-hist-filter="warning" type="button">Warning</button>
+            </div>
+            <button id="exportHistory" class="btn btn-secondary btn-sm" type="button">Export CSV</button>
+          </div>
+          <div class="history-meta-row">
+            <span id="historyMeta">0 incidents total</span>
+            <span id="historyBadge" class="host-count-badge">0</span>
+          </div>
+          <div class="history-full-table" id="historyFullTable"></div>
+        </div>
+
+        <!-- Maintenance Manager panel (Phase 9 Revise 1) -->
+        <div id="maintenanceTabPanel" class="logs-tab-panel hidden">
+          <div class="history-meta-row">
+            <span id="maintManagerMeta">0 active, 0 upcoming</span>
+          </div>
+          <div class="history-full-table" id="maintManagerTable"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Endpoint Management Modal -->
+  <div id="endpointModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="endpointModalTitle">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3 class="modal-title" id="endpointModalTitle">Kelola Endpoint Prometheus</h3>
+        <button id="closeEndpointModalBtn" class="modal-close" type="button" aria-label="Close modal">&times;</button>
+      </div>
+
+      <div class="modal-body">
+        <form id="addEndpointForm" style="margin-bottom: 20px;">
+          <div class="form-group" style="margin-bottom: 12px;">
+            <label for="endpointUrlInput" class="form-label" style="display: block; margin-bottom: 6px; font-size: 12px; font-weight: 500; color: var(--text-secondary);">URL Endpoint Prometheus Baru</label>
+            <div style="display: flex; gap: 8px;">
+              <input type="text" id="endpointUrlInput" class="search-input" style="flex: 1; border-radius: var(--r-sm);" placeholder="http://192.168.10.5:9090" required>
+              <button type="submit" class="add-target-btn" style="padding: 0 14px; flex-shrink: 0;">
+                <span>+ Tambah</span>
+              </button>
+            </div>
+            <div id="addEndpointError" class="form-error hidden" style="margin-top: 6px; font-size: 11px; color: var(--critical);"></div>
+          </div>
+        </form>
+
+        <div style="border-top: 1px solid var(--border); padding-top: 14px;">
+          <div style="font-size: 12px; font-weight: 600; color: var(--text-primary); margin-bottom: 10px;">Daftar Endpoint Terdaftar:</div>
+          <div id="endpointListContainer" style="display: flex; flex-direction: column; gap: 8px; max-height: 200px; overflow-y: auto;">
+            <!-- Populated via JS -->
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modern Confirmation Dialog Modal -->
+  <div id="confirmModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="confirmModalTitle">
+    <div class="modal-card" style="max-width: 420px; border: 1px solid var(--critical-border, rgba(239, 68, 68, 0.3));">
+      <div class="modal-header" style="padding-bottom: 8px;">
+        <div style="display: flex; align-items: center; gap: 10px;">
+          <div style="width: 36px; height: 36px; border-radius: 50%; background: rgba(239, 68, 68, 0.15); display: flex; align-items: center; justify-content: center; color: #EF4444; flex-shrink: 0;">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+              <line x1="12" y1="9" x2="12" y2="13"/>
+              <line x1="12" y1="17" x2="12.01" y2="17"/>
+            </svg>
+          </div>
+          <h3 class="modal-title" id="confirmModalTitle" style="font-size: 15px; font-weight: 600; color: var(--text-primary);">Hapus Target</h3>
+        </div>
+        <button id="closeConfirmModalBtn" class="modal-close" type="button" aria-label="Close modal">&times;</button>
+      </div>
+
+      <div class="modal-body" style="padding-top: 6px;">
+        <p id="confirmModalMessage" style="font-size: 13px; color: var(--text-secondary); line-height: 1.5; margin-bottom: 20px;">
+          Apakah Anda yakin ingin menghapus target ini?
+        </p>
+
+        <div style="display: flex; justify-content: flex-end; gap: 10px;">
+          <button id="confirmCancelBtn" class="btn btn-secondary" type="button" style="padding: 8px 16px;">Batal</button>
+          <button id="confirmActionBtn" class="btn btn-danger" type="button" style="background: #EF4444; color: white; border: none; padding: 8px 16px; border-radius: var(--r-sm); font-weight: 500; cursor: pointer;">
+            Ya, Hapus
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Self-Monitoring Detail Modal (Phase 13 Revise) — reuses /health only -->
+  <div id="selfHealthModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="selfHealthModalTitle">
+    <div class="modal-card" style="max-width: 380px;">
+      <div class="modal-header">
+        <h3 class="modal-title" id="selfHealthModalTitle">InfraWatch Self-Status</h3>
+        <button id="closeSelfHealthModal" class="modal-close" type="button" aria-label="Close modal">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="drawer-info-list" id="selfHealthList">
+          <!-- Populated via JS from /health -->
+        </div>
+        <div class="form-help" id="selfHealthUpdated" style="margin-top: 10px;">—</div>
+      </div>
+    </div>
+  </div>
+
+  <script src="{{ url_for('static', filename='js/alarm.js') }}?v={{ asset_version('js/alarm.js') }}"></script>
+  <script>
+    /* ── Inline theme + splash enter init ─── */
+    (function () {
+      const saved = localStorage.getItem('iw-theme') || 'dark';
+      document.documentElement.setAttribute('data-theme', saved);
+      const darkIcon = document.getElementById('themeIconDark');
+      const lightIcon = document.getElementById('themeIconLight');
+      if (saved === 'light') {
+        if (darkIcon) darkIcon.style.display = 'none';
+        if (lightIcon) lightIcon.style.display = '';
+      }
+
+      const themeBtn = document.getElementById('themeToggleBtn');
+      if (themeBtn) {
+        themeBtn.addEventListener('click', () => {
+          const current = document.documentElement.getAttribute('data-theme');
+          const next = current === 'dark' ? 'light' : 'dark';
+          document.documentElement.setAttribute('data-theme', next);
+          localStorage.setItem('iw-theme', next);
+          if (next === 'dark') {
+            if (darkIcon) darkIcon.style.display = '';
+            if (lightIcon) lightIcon.style.display = 'none';
+          } else {
+            if (darkIcon) darkIcon.style.display = 'none';
+            if (lightIcon) lightIcon.style.display = '';
+          }
+        });
+      }
+
+      // Direct Splash Enter & Audio Unlock Listener
+      document.addEventListener('DOMContentLoaded', function () {
+        const enterBtn = document.getElementById('enterDashboardBtn');
+        const splashOverlay = document.getElementById('splashOverlay');
+        if (enterBtn && splashOverlay) {
+          enterBtn.addEventListener('click', function () {
+            if (window.monitor && typeof window.monitor.unlockAudio === 'function') {
+              window.monitor.unlockAudio();
+            }
+            splashOverlay.classList.add('splash-hidden');
+          });
+        }
+      });
+    })();
+  </script>
+</body>
+</html>

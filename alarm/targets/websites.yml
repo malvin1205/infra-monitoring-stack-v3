@@ -1,0 +1,4 @@
+- targets:
+    - "http://nginx"
+  labels:
+    job: "blackbox_http"
