@@ -2129,12 +2129,12 @@ class LogsPage {
       return `
         <div class="log-entry log-entry-${ev}" style="animation-delay:${Math.min(i, 20) * 0.02}s">
           <span class="log-time">${this._fmt(r.time)}</span>
-          <span class="log-event log-event-${ev}">${ev}</span>
+          <span class="log-col-status"><span class="status-dot status-dot-${ev}"></span><span class="log-event log-event-${ev}">${ev}</span></span>
           <span class="log-name">${this._esc(r.name || '—')}</span>
-          <span class="log-inst" title="${this._esc(r.job || '')}">${this._esc(r.instance || '—')}${r.job ? ` <small class="log-job">(${this._esc(r.job)})</small>` : ''}</span>
+          <span class="log-inst" title="${this._esc(r.job || '')}">${this._esc(r.instance || '—')}${r.job ? ` <small class="log-job">${this._esc(r.job)}</small>` : ''}</span>
           <span class="log-sev log-sev-${sev}">${sev}</span>
           <span class="log-meta" title="${ev === 'resolved' ? 'Duration' : 'Latency'}">${this._esc(meta)}</span>
-          <span class="log-msg">${this._esc(r.summary || '—')}</span>
+          <span class="log-msg" title="${this._esc(r.summary || '')}">${this._esc(r.summary || '—')}</span>
         </div>`;
     }).join('');
   }
@@ -2167,13 +2167,13 @@ class HistoryPage {
     this.data = [];
     this.filter = 'all';
     this.searchQ = '';
+    this.clearedBefore = parseFloat(localStorage.getItem('historyClearedBefore') || '0');
     this._loaded = false;
     this._loadAbortController = null;
 
     this.tableEl = document.getElementById('historyFullTable');
     this.badge = document.getElementById('historyBadge');
     this.metaEl = document.getElementById('historyMeta');
-    this.navBadge = document.getElementById('historyNavBadge');
     this.searchEl = document.getElementById('historySearch');
 
     this.statTotal = document.getElementById('histTotal');
@@ -2201,6 +2201,13 @@ class HistoryPage {
     });
 
     document.getElementById('exportHistory').addEventListener('click', () => this._exportCSV());
+
+    document.getElementById('clearHistory').addEventListener('click', () => {
+      this.clearedBefore = Date.now() / 1000;
+      localStorage.setItem('historyClearedBefore', this.clearedBefore);
+      this._updateStats();
+      this._render();
+    });
 
     // Click a row to expand its recovery-sequence detail (fired/resolved/
     // duration/receiver) — reuses the already-loaded incident data, no
@@ -2233,14 +2240,6 @@ class HistoryPage {
       this._loaded = true;
       this._updateStats();
       this._render();
-      this.metaEl.textContent = `${data.length} incident${data.length !== 1 ? 's' : ''} total`;
-      // Nav badge
-      if (data.length > 0) {
-        this.navBadge.textContent = data.length;
-        this.navBadge.classList.remove('hidden');
-      } else {
-        this.navBadge.classList.add('hidden');
-      }
     } catch (e) {
       if (e.name === 'AbortError') return;
       console.error('[History] load failed:', e);
@@ -2264,24 +2263,34 @@ class HistoryPage {
       </div>`;
   }
 
+  // Incidents still in view after "Clear" — the stat cards, meta caption
+  // and table all reset together off this same cut-off, so nothing shows
+  // a stale total once the list has been cleared.
+  _visibleData() {
+    return this.clearedBefore ? this.data.filter(r => (r.time || 0) > this.clearedBefore) : this.data;
+  }
+
   _updateStats() {
+    const base = this._visibleData();
     const now = new Date();
-    const month = this.data.filter(i => {
+    const month = base.filter(i => {
       const d = new Date(i.time * 1000);
       return d.getMonth() === now.getMonth() && d.getFullYear() === now.getFullYear();
     }).length;
-    const crit = this.data.filter(i => (i.severity || '').toLowerCase() === 'critical').length;
-    const warn = this.data.filter(i => (i.severity || '').toLowerCase() === 'warning').length;
+    const crit = base.filter(i => (i.severity || '').toLowerCase() === 'critical').length;
+    const warn = base.filter(i => (i.severity || '').toLowerCase() === 'warning').length;
 
-    this.statTotal.textContent = this.data.length;
+    this.statTotal.textContent = base.length;
     this.statMonth.textContent = month;
     this.statCritical.textContent = crit;
     this.statWarning.textContent = warn;
   }
 
   _render() {
-    let rows = this.data;
+    const base = this._visibleData();
+    this.metaEl.textContent = `${base.length} incident${base.length !== 1 ? 's' : ''} total`;
 
+    let rows = base;
     if (this.filter !== 'all') {
       rows = rows.filter(r => (r.severity || '').toLowerCase() === this.filter);
     }
@@ -2296,7 +2305,21 @@ class HistoryPage {
     this.badge.textContent = rows.length;
 
     if (rows.length === 0) {
-      this.tableEl.innerHTML = `
+      // Distinguish "cleared" (a real, undoable state) from "no match"
+      // (adjust your filter/search) — same empty table otherwise reads as broken.
+      const clearedAll = this.clearedBefore > 0 && this.data.length > 0 &&
+        this.data.every(r => (r.time || 0) <= this.clearedBefore);
+      this.tableEl.innerHTML = clearedAll ? `
+        <div class="empty-state">
+          <div class="es-icon" aria-hidden="true">
+            <svg width="28" height="28" viewBox="0 0 28 28" fill="none">
+              <path d="M6 22V8a2 2 0 012-2h12a2 2 0 012 2v14" stroke="currentColor" stroke-width="1.5"/>
+              <path d="M3 22h22M10 11h8M10 15h5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+            </svg>
+          </div>
+          <div class="es-text">History cleared — new incidents will appear here</div>
+          <button class="btn btn-secondary btn-sm" id="undoHistoryClear" type="button">Show cleared incidents</button>
+        </div>` : `
         <div class="empty-state">
           <div class="es-icon" aria-hidden="true">
             <svg width="28" height="28" viewBox="0 0 28 28" fill="none">
@@ -2306,20 +2329,31 @@ class HistoryPage {
           </div>
           <div class="es-text">No incidents match your filter</div>
         </div>`;
+      if (clearedAll) {
+        document.getElementById('undoHistoryClear').addEventListener('click', () => {
+          this.clearedBefore = 0;
+          localStorage.removeItem('historyClearedBefore');
+          this._updateStats();
+          this._render();
+        });
+      }
       return;
     }
 
     this.tableEl.innerHTML = rows.map((inc, i) => {
       const sev = (inc.severity || 'critical').toLowerCase();
       const st = (inc.status || 'firing').toLowerCase();
-      const stLabel = st === 'resolved' ? `resolved · ${this._fmtDuration(inc)}` : 'open';
+      const stLabel = st === 'resolved' ? 'Resolved' : 'Open';
+      const alt = i % 2 === 1 ? ' history-row-alt' : '';
       return `
-        <div class="history-row history-row-full" style="animation-delay:${Math.min(i, 30) * 0.025}s">
+        <div class="history-row history-row-full${alt}" style="animation-delay:${Math.min(i, 30) * 0.025}s">
           <div class="history-time">${this._fmt(inc.time)}</div>
+          <div class="history-col-status"><span class="status-dot status-dot-${st}"></span><span class="history-status history-status-${st}">${stLabel}</span></div>
           <div class="history-name">${this._esc(inc.name || 'Unknown')}</div>
-          <div class="history-instance" title="${this._esc(inc.job || '')}">${this._esc(inc.instance || '—')}${inc.job ? ` <small class="log-job">(${this._esc(inc.job)})</small>` : ''}</div>
-          <div><span class="history-sev ${sev}">${sev}</span><br><small class="history-status history-status-${st}">${stLabel}</small></div>
-          <div class="history-col-summary">${this._esc(inc.summary || '—')}</div>
+          <div class="history-instance" title="${this._esc(inc.job || '')}">${this._esc(inc.instance || '—')}${inc.job ? ` <small class="log-job">${this._esc(inc.job)}</small>` : ''}</div>
+          <div><span class="history-sev ${sev}">${sev}</span></div>
+          <div class="history-col-duration">${this._fmtDuration(inc)}</div>
+          <div class="history-col-msg" title="${this._esc(inc.summary || '')}">${this._esc(inc.summary || '—')}</div>
         </div>
         <div class="history-row-detail hidden">
           <div class="hrd-sequence">

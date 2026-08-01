@@ -585,7 +585,7 @@
 
   <!-- Alert Logs / Incident History Modal -->
   <div id="logsModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="logsModalTitle">
-    <div class="modal-card modal-card-wide">
+    <div class="modal-card logs-modal-card">
       <div class="modal-header">
         <h3 class="modal-title" id="logsModalTitle">Alert Logs & Incident History</h3>
         <button id="closeLogsModal" class="modal-close" type="button" aria-label="Close modal">&times;</button>
@@ -594,7 +594,7 @@
       <div class="modal-body">
         <div class="logs-tabs" role="tablist" aria-label="Logs view">
           <button class="chip chip-active" id="logsTabBtn" data-logs-tab="logs" type="button" role="tab" aria-selected="true">Live Alert Log</button>
-          <button class="chip" id="historyTabBtn" data-logs-tab="history" type="button" role="tab" aria-selected="false">Incident History <span id="historyNavBadge" class="nav-badge nav-badge-inline hidden"></span></button>
+          <button class="chip" id="historyTabBtn" data-logs-tab="history" type="button" role="tab" aria-selected="false">Incident History</button>
           <button class="chip" id="maintenanceTabBtn" data-logs-tab="maintenance" type="button" role="tab" aria-selected="false">Maintenance <span id="maintenanceNavBadge" class="nav-badge nav-badge-inline hidden"></span></button>
         </div>
 
@@ -613,31 +613,36 @@
             </label>
             <button id="clearLogs" class="btn btn-secondary btn-sm" type="button">Clear</button>
           </div>
-          <div class="log-stream" id="logStream"></div>
+          <div class="data-table">
+            <div class="data-table-head log-grid" aria-hidden="true">
+              <span>Time</span><span>Status</span><span>Alert</span><span>Target</span><span>Severity</span><span>Duration</span><span>Message</span>
+            </div>
+            <div class="log-stream" id="logStream"></div>
+          </div>
         </div>
 
         <!-- Incident History panel -->
         <div id="historyTabPanel" class="logs-tab-panel hidden">
-          <div class="avail-metric-grid">
-            <div class="avail-metric-card">
-              <span class="avail-metric-label">Total Incidents</span>
-              <span class="avail-metric-value" id="histTotal">—</span>
+          <div class="hist-stat-row">
+            <div class="hist-stat-card">
+              <span class="hist-stat-value" id="histTotal">—</span>
+              <span class="hist-stat-label">Total Incidents</span>
             </div>
-            <div class="avail-metric-card">
-              <span class="avail-metric-label">This Month</span>
-              <span class="avail-metric-value" id="histThisMonth">—</span>
+            <div class="hist-stat-card">
+              <span class="hist-stat-value" id="histThisMonth">—</span>
+              <span class="hist-stat-label">This Month</span>
             </div>
-            <div class="avail-metric-card">
-              <span class="avail-metric-label">Critical</span>
-              <span class="avail-metric-value" id="histCritical">—</span>
+            <div class="hist-stat-card hist-stat-critical">
+              <span class="hist-stat-value" id="histCritical">—</span>
+              <span class="hist-stat-label">Critical</span>
             </div>
-            <div class="avail-metric-card">
-              <span class="avail-metric-label">Warning</span>
-              <span class="avail-metric-value" id="histWarning">—</span>
+            <div class="hist-stat-card hist-stat-warning">
+              <span class="hist-stat-value" id="histWarning">—</span>
+              <span class="hist-stat-label">Warning</span>
             </div>
           </div>
 
-          <div class="logs-toolbar" style="margin-top: 12px;">
+          <div class="logs-toolbar">
             <input type="text" id="historySearch" class="search-input" placeholder="Cari alert / host…" autocomplete="off" aria-label="Search incident history">
             <div class="logs-filter-group">
               <button class="chip chip-active" data-hist-filter="all" type="button">All</button>
@@ -645,12 +650,18 @@
               <button class="chip" data-hist-filter="warning" type="button">Warning</button>
             </div>
             <button id="exportHistory" class="btn btn-secondary btn-sm" type="button">Export CSV</button>
+            <button id="clearHistory" class="btn btn-secondary btn-sm" type="button">Clear</button>
           </div>
           <div class="history-meta-row">
             <span id="historyMeta">0 incidents total</span>
             <span id="historyBadge" class="host-count-badge">0</span>
           </div>
-          <div class="history-full-table" id="historyFullTable"></div>
+          <div class="data-table">
+            <div class="data-table-head hist-grid" aria-hidden="true">
+              <span>Time</span><span>Status</span><span>Alert</span><span>Target</span><span>Severity</span><span>Duration</span><span>Message</span>
+            </div>
+            <div class="history-full-table" id="historyFullTable"></div>
+          </div>
         </div>
 
         <!-- Maintenance Manager panel (Phase 9 Revise 1) -->
@@ -658,7 +669,12 @@
           <div class="history-meta-row">
             <span id="maintManagerMeta">0 active, 0 upcoming</span>
           </div>
-          <div class="history-full-table" id="maintManagerTable"></div>
+          <div class="data-table">
+            <div class="data-table-head maint-grid" aria-hidden="true">
+              <span>Target</span><span>Reason</span><span>Window</span><span>Action</span>
+            </div>
+            <div class="history-full-table" id="maintManagerTable"></div>
+          </div>
         </div>
       </div>
     </div>

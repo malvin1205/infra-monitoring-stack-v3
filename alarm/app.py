@@ -90,7 +90,7 @@ MAINTENANCE_FILE = os.path.join(os.path.dirname(__file__), "maintenance.json")
 # on which" — a purely operator-editable, independently-changing piece of
 # state — decoupled from target add/remove lifecycle.
 DEPENDENCIES_FILE = os.path.join(os.path.dirname(__file__), "dependencies.json")
-MAX_HISTORY  = 100
+MAX_HISTORY  = 1000
 MAX_LOGS     = 200
 
 def parse_alert_timestamp(value, fallback):

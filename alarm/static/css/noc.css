@@ -2075,10 +2075,12 @@ html, body {
     font-size: 13px;
   }
 
-  /* Incident History / Maintenance Manager modals (Phase 10 + 9 revisions) */
-  .history-row {
+  /* Alert Logs / Incident History / Maintenance Manager modal */
+  .log-entry,
+  .history-row,
+  .maint-row {
+    height: 60px;
     font-size: 14px;
-    padding: 12px 14px;
   }
 
   .hrd-point-time,
@@ -2090,8 +2092,8 @@ html, body {
     font-size: 18px;
   }
 
-  .maint-row {
-    font-size: 14px;
+  .hist-stat-value {
+    font-size: 30px;
   }
 }
 
@@ -2336,7 +2338,13 @@ html, body {
   padding: 10px;
 }
 
-/* ── Alert Logs / Incident History modal (Phase 3 UX fix) ─────────── */
+/* ── Alert Logs / Incident History modal ───────────────────────────
+   Dense NOC-style layout: fixed header/tabs/toolbar, single scrolling
+   list per tab, aligned table columns shared between a static header
+   row (.data-table-head) and the JS-rendered rows. Scoped under
+   .logs-modal-card so it never leaks into other modals that reuse
+   .modal-header/.modal-body/.chip/.search-input/.btn-sm. ──────────── */
+
 .nav-badge {
   position: absolute;
   top: -4px;
@@ -2357,36 +2365,98 @@ html, body {
   position: static;
   display: inline-block;
   margin-left: 6px;
+  min-width: 15px;
+  height: 15px;
+  line-height: 15px;
+  font-size: 9.5px;
 }
 
-.logs-tabs {
+/* Modal shell */
+.logs-modal-card {
+  max-width: 1500px;
+  width: calc(100vw - 40px);
+  height: 90vh;
+  max-height: 90vh;
   display: flex;
-  gap: 4px;
+  flex-direction: column;
+  border-radius: 10px;
+}
+
+.logs-modal-card .modal-header {
+  height: 56px;
+  padding: 0 20px;
+  flex-shrink: 0;
+}
+
+.logs-modal-card .modal-body {
+  flex: 1;
+  min-height: 0;
+  max-height: none;
+  padding: 16px 20px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow: hidden;
+}
+
+/* Tabs — underline + tint on active, no raised chip background */
+.logs-modal-card .logs-tabs {
+  display: flex;
+  flex-shrink: 0;
+  gap: 2px;
   border-bottom: 1px solid var(--border);
-  margin-bottom: 14px;
+  margin-bottom: 0;
+}
+
+.logs-modal-card .logs-tabs .chip {
+  padding: 8px 14px 9px;
+  border-radius: 8px 8px 0 0;
+  font-weight: 500;
+}
+
+.logs-modal-card .logs-tabs .chip-active,
+.logs-modal-card .logs-tabs .chip-active:hover {
+  background: var(--accent-bg);
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+  font-weight: 600;
+  box-shadow: none;
+}
+
+.logs-tab-panel {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  gap: 12px;
 }
 
 .logs-tab-panel.hidden {
   display: none;
 }
 
-.logs-toolbar {
+/* Filter bar — one row, no wrap, actions pushed right by the search input's flex:1 */
+.logs-modal-card .logs-toolbar {
   display: flex;
   align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-  margin-bottom: 10px;
+  flex-shrink: 0;
+  height: 40px;
+  gap: 12px;
+  flex-wrap: nowrap;
+  margin-bottom: 0;
 }
 
 .logs-toolbar .search-input {
   flex: 1;
   min-width: 160px;
+  height: 30px;
   border-radius: var(--r-sm);
 }
 
 .logs-filter-group {
   display: flex;
   gap: 4px;
+  flex-shrink: 0;
 }
 
 .logs-live-toggle {
@@ -2396,6 +2466,12 @@ html, body {
   font-size: 12px;
   color: var(--text-secondary);
   cursor: pointer;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.logs-toolbar .btn-sm {
+  flex-shrink: 0;
 }
 
 .chip.filter-btn-active,
@@ -2407,98 +2483,282 @@ html, body {
   box-shadow: var(--shadow-sm);
 }
 
+/* Incident stat cards — compact, equal width, no glow */
+.hist-stat-row {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 12px;
+  flex-shrink: 0;
+}
+
+.hist-stat-card {
+  height: 90px;
+  padding: 12px 16px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 4px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.hist-stat-value {
+  font-size: 26px;
+  font-weight: 700;
+  color: var(--text-primary);
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+}
+
+.hist-stat-label {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
+.hist-stat-critical .hist-stat-value { color: var(--critical); }
+.hist-stat-warning .hist-stat-value { color: #F59E0B; }
+
+.history-meta-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 12px;
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+
+/* Table shell — header stays put, only the body scrolls (single scrollbar) */
+.data-table {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.data-table-head {
+  display: grid;
+  gap: 12px;
+  align-items: center;
+  padding: 0 16px;
+  height: 32px;
+  flex-shrink: 0;
+  background: var(--bg-elevated);
+  border-bottom: 1px solid var(--border);
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.data-table-head.log-grid,
+.log-entry {
+  grid-template-columns: 84px 92px minmax(120px, 1fr) minmax(120px, 1fr) 84px 72px minmax(160px, 2fr);
+}
+
+.data-table-head.hist-grid,
+.history-row {
+  grid-template-columns: 84px 104px minmax(120px, 1fr) minmax(120px, 1fr) 84px 72px minmax(160px, 2fr);
+}
+
+.data-table-head.maint-grid,
+.maint-row {
+  grid-template-columns: 1fr 1.4fr 140px 90px;
+}
+
+/* List body — thin custom scrollbar, dense flat rows (no per-row card/border) */
 .log-stream,
 .history-full-table {
-  max-height: 360px;
+  flex: 1;
+  min-height: 0;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
 }
 
-.log-entry {
+.log-stream::-webkit-scrollbar,
+.history-full-table::-webkit-scrollbar {
+  width: 6px;
+}
+
+.log-stream::-webkit-scrollbar-track,
+.history-full-table::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.log-stream::-webkit-scrollbar-thumb,
+.history-full-table::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 999px;
+}
+
+.log-stream::-webkit-scrollbar-thumb:hover,
+.history-full-table::-webkit-scrollbar-thumb:hover {
+  background: var(--text-muted);
+}
+
+.log-entry,
+.history-row,
+.maint-row {
   display: grid;
-  grid-template-columns: 64px 70px 1fr 1fr 70px 64px 2fr;
-  gap: 8px;
+  gap: 12px;
   align-items: center;
-  padding: 6px 8px;
-  border-radius: var(--r-sm);
-  font-size: 12px;
-  background: var(--surface);
-  border: 1px solid var(--border);
+  padding: 0 16px;
+  height: 54px;
+  font-size: 13px;
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--border-subtle);
+  transition: background var(--t-fast);
 }
 
-.log-time,
-.history-time {
-  color: var(--text-secondary);
-  font-variant-numeric: tabular-nums;
+.log-entry:nth-child(even) {
+  background: var(--bg-elevated);
 }
 
-.log-job {
-  color: var(--text-secondary);
-  font-weight: 400;
-}
-
-.log-meta {
-  color: var(--text-secondary);
-  font-variant-numeric: tabular-nums;
-  text-align: right;
-}
-
-.history-status {
-  color: var(--text-secondary);
-  font-weight: 400;
-}
-
-.history-status-firing {
-  color: var(--warning, #f59e0b);
-}
-
-.log-event-firing,
-.history-sev.critical {
-  color: var(--critical);
-  font-weight: 600;
-}
-
-.log-event-resolved {
-  color: var(--success, #22c55e);
-  font-weight: 600;
-}
-
-.log-sev-warning,
-.history-sev.warning {
-  color: var(--warning, #f59e0b);
-}
-
-.history-row {
-  display: grid;
-  grid-template-columns: 90px 1fr 1fr 80px 2fr;
-  gap: 10px;
-  align-items: center;
-  padding: 9px 10px;
-  border-radius: var(--r-sm);
-  font-size: 12px;
-  background: var(--surface);
-  border: 1px solid var(--border);
+.history-row.history-row-alt {
+  background: var(--bg-elevated);
 }
 
 .history-row-full {
   cursor: pointer;
 }
 
-.history-row-full:hover {
-  border-color: var(--border-strong);
+.log-entry:hover,
+.history-row-full:hover,
+.maint-row:hover {
+  background: var(--surface-hover);
+}
+
+.log-time,
+.history-time {
+  color: var(--text-secondary);
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.log-name,
+.history-name {
+  font-weight: 600;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.log-inst,
+.history-instance {
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.log-job {
+  display: inline-block;
+  margin-left: 4px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--surface-hover);
+  color: var(--text-muted);
+  font-size: 10.5px;
+  font-weight: 500;
+  vertical-align: middle;
+}
+
+.log-col-status,
+.history-col-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.status-dot-firing { background: var(--critical); }
+.status-dot-resolved { background: var(--success); }
+
+.history-status,
+.log-event {
+  font-size: 12px;
+  text-transform: capitalize;
+}
+
+.history-status-resolved,
+.log-event-resolved {
+  color: var(--success, #22c55e);
+  font-weight: 600;
+}
+
+.history-status-firing,
+.log-event-firing {
+  color: var(--critical);
+  font-weight: 600;
+}
+
+.history-sev,
+.log-sev {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 9px;
+  border-radius: 999px;
+  background: var(--surface-hover);
+  color: var(--text-secondary);
+  font-size: 10.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.history-sev.critical,
+.log-sev-critical {
+  background: var(--critical-bg);
+  color: var(--critical);
+}
+
+.history-sev.warning,
+.log-sev-warning {
+  background: var(--warning-bg);
+  color: #F59E0B;
+}
+
+.log-meta,
+.history-col-duration {
+  color: var(--text-secondary);
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.log-msg,
+.history-col-msg {
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* Recovery-sequence detail — expands under a clicked incident row */
 .history-row-detail {
-  padding: 12px 14px;
-  margin-top: -4px;
-  margin-bottom: 6px;
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-top: none;
-  border-radius: 0 0 var(--r-sm) var(--r-sm);
+  padding: 14px 16px;
+  background: var(--bg-elevated);
+  border-bottom: 1px solid var(--border-subtle);
   font-size: 12px;
 }
 
@@ -2575,16 +2835,7 @@ html, body {
   color: var(--text-muted);
 }
 
-.history-meta-row {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  font-size: 12px;
-  color: var(--text-secondary);
-  margin-bottom: 8px;
-}
-
-/* ── Maintenance Manager (Phase 9 Revise 1) ───────────── */
+/* ── Maintenance Manager ────────────────────────────────────────── */
 .maint-group-label {
   font-size: 11px;
   font-weight: 700;
@@ -2596,19 +2847,6 @@ html, body {
 
 .maint-group-label:first-child {
   margin-top: 0;
-}
-
-.maint-row {
-  display: grid;
-  grid-template-columns: 1fr 1.4fr 140px 90px;
-  gap: 10px;
-  align-items: center;
-  padding: 8px 10px;
-  border-radius: var(--r-sm);
-  font-size: 12px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  margin-bottom: 4px;
 }
 
 .maint-target {
@@ -2635,6 +2873,15 @@ html, body {
 
 .maint-window-active {
   color: var(--accent);
+}
+
+/* Responsive — 1366px is the narrowest supported width; drop the wide
+   modal to viewport width and let columns compress via minmax() rather
+   than wrapping the toolbar. */
+@media (max-width: 1400px) {
+  .logs-modal-card {
+    width: calc(100vw - 24px);
+  }
 }
 
 
