@@ -1,22 +1,5 @@
 {
-  "status": "CRITICAL",
-  "alerts": [
-    {
-      "key": "TargetDown|156.154.71.1",
-      "name": "TargetDown",
-      "severity": "critical",
-      "instance": "156.154.71.1",
-      "summary": "156.154.71.1 is unreachable (probe_success=0)",
-      "time": 1785588529.4140604
-    },
-    {
-      "key": "TargetDown|182.254.116.116",
-      "name": "TargetDown",
-      "severity": "critical",
-      "instance": "182.254.116.116",
-      "summary": "182.254.116.116 is unreachable (probe_success=0)",
-      "time": 1785588546.092732
-    }
-  ],
-  "updated": 1785588546.1723323
+  "status": "NORMAL",
+  "alerts": [],
+  "updated": 0
 }
