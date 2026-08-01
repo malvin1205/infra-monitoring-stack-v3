@@ -1,11 +1,1 @@
-[
-  {
-    "id": "mw_1785587590933",
-    "scope": "instance",
-    "target": "114.114.114.114",
-    "reason": "Scheduled reboot",
-    "start": 1785587590,
-    "end": 1785591190,
-    "created_at": 1785587590
-  }
-]
+[]

@@ -2,45 +2,21 @@
   "status": "CRITICAL",
   "alerts": [
     {
-      "key": "PostRestartCheck|pr:9100",
-      "name": "PostRestartCheck",
-      "severity": "warning",
-      "instance": "pr:9100",
-      "summary": "x",
-      "time": 1785542400.0
-    },
-    {
-      "key": "TargetDown|91.239.100.100",
+      "key": "TargetDown|156.154.71.1",
       "name": "TargetDown",
       "severity": "critical",
-      "instance": "91.239.100.100",
-      "summary": "91.239.100.100 is unreachable (probe_success=0)",
-      "time": 1785584992.488058
+      "instance": "156.154.71.1",
+      "summary": "156.154.71.1 is unreachable (probe_success=0)",
+      "time": 1785588529.4140604
     },
     {
-      "key": "TargetDown|64.6.65.6",
+      "key": "TargetDown|182.254.116.116",
       "name": "TargetDown",
       "severity": "critical",
-      "instance": "64.6.65.6",
-      "summary": "64.6.65.6 is unreachable (probe_success=0)",
-      "time": 1785587835.1492348
-    },
-    {
-      "key": "TargetDown|64.6.64.6",
-      "name": "TargetDown",
-      "severity": "critical",
-      "instance": "64.6.64.6",
-      "summary": "64.6.64.6 is unreachable (probe_success=0)",
-      "time": 1785587835.1492348
-    },
-    {
-      "key": "TargetDown|198.153.192.1",
-      "name": "TargetDown",
-      "severity": "critical",
-      "instance": "198.153.192.1",
-      "summary": "198.153.192.1 is unreachable (probe_success=0)",
-      "time": 1785587851.0571363
+      "instance": "182.254.116.116",
+      "summary": "182.254.116.116 is unreachable (probe_success=0)",
+      "time": 1785588546.092732
     }
   ],
-  "updated": 1785587851.0876322
+  "updated": 1785588546.1723323
 }
