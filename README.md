@@ -4,17 +4,12 @@ Sistem monitoring ketersediaan infrastruktur enterprise berbasis Docker yang mem
 
 ---
 
-<img width="1917" height="902" alt="image" src="https://github.com/user-attachments/assets/5964b70d-3f60-426e-b583-1b4514878889" />
-<img width="1917" height="896" alt="image" src="https://github.com/user-attachments/assets/8ac6f617-a9cf-4b19-8d34-b248685a4c5f" />
-<img width="1917" height="892" alt="image" src="https://github.com/user-attachments/assets/eb3f91b8-c381-461e-83f4-39d78e533a9e" />
-<img width="1917" height="897" alt="image" src="https://github.com/user-attachments/assets/266e6b4c-dcc2-4ef8-84b5-8f394ed8fcb6" />
-<img width="1917" height="900" alt="image" src="https://github.com/user-attachments/assets/845c7df4-3088-4d96-b0bf-db35596b034d" />
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/a79a7f51-4dbe-4b02-b68e-5b2a04212d24" />
+
 
 ---
 
-## 🔬 Hasil Analisis Arsitektur & Transisi v2 ke v3
-
-Berdasarkan analisis mendalam terhadap arsitektur sistem pada versi 3 (v3), berikut adalah filosofi perubahan arsitektur utama yang diterapkan:
+## Transisi v2 ke v3
 
 ### 1. Perubahan Fokus Monitoring (Node Exporter vs. Blackbox Probe)
 * **Pada v2**: Sistem menggabungkan pemantauan metrik internal hardware host (*Node Exporter*: CPU, RAM, Swap, Disk Space, Disk I/O, Network Traffic) dan ketersediaan publik (*Blackbox Exporter*).
