@@ -293,11 +293,46 @@
             </select>
           </div>
 
-          <!-- Job Filter -->
-          <div class="filter-select-wrap">
-            <select id="jobSelect" class="filter-select" aria-label="Filter berdasarkan Job">
+          <!-- Job Filter — custom dropdown. #jobSelect stays in the DOM as the
+               hidden state holder so every existing load()/loadAvailability()/
+               localStorage code path (which reads jobSelect.value/.options and
+               dispatches 'change' on it) keeps working unmodified. -->
+          <div class="filter-select-wrap job-select-wrap" id="jobSelectWrap">
+            <select id="jobSelect" class="job-select-native" aria-hidden="true" tabindex="-1">
               <option value="all">Semua Job</option>
             </select>
+
+            <div class="job-dd" id="jobDd">
+              <button type="button" class="job-dd-trigger" id="jobDdTrigger" aria-haspopup="listbox" aria-expanded="false" aria-controls="jobDdMenu" aria-label="Filter berdasarkan Job">
+                <span class="job-dd-label" id="jobDdLabel">Semua Job</span>
+                <span class="job-default-badge hidden" id="jobDefaultBadge" title="This is your default Job">Default</span>
+                <svg class="job-dd-caret" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+              </button>
+
+              <button class="icon-action job-settings-btn" id="jobDefaultSettingsBtn" type="button" title="Default Job settings" aria-label="Default Job settings" aria-haspopup="dialog" aria-controls="jobDefaultPopover" aria-expanded="false">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="12" cy="12" r="3"/>
+                  <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+                </svg>
+              </button>
+
+              <ul class="job-dd-menu hidden" id="jobDdMenu" role="listbox" tabindex="-1" aria-label="Filter berdasarkan Job">
+                <li role="option" data-value="all" class="job-dd-option" aria-selected="true">Semua Job</li>
+              </ul>
+
+              <div class="job-default-popover hidden" id="jobDefaultPopover" role="dialog" aria-label="Default Job settings">
+                <div class="jdp-title">Default Job</div>
+                <label class="crp-row crp-row-checkbox" id="jdpSetRow">
+                  <input type="checkbox" id="jdpSetCheckbox">
+                  <span>Set current Job as Default</span>
+                </label>
+                <button type="button" class="jdp-reset-btn" id="jdpResetBtn">
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 11-6.219-8.56"/></svg>
+                  <span>Reset to "Semua Job"</span>
+                </button>
+                <div class="jdp-help">This preference is stored only in this browser.</div>
+              </div>
+            </div>
           </div>
 
           <!-- Search -->
@@ -335,6 +370,17 @@
         <div class="host-skeleton" aria-hidden="true"></div>
         <div class="host-skeleton" aria-hidden="true"></div>
         <div class="host-skeleton" aria-hidden="true"></div>
+      </div>
+
+      <!-- Pagination (TV wallboard — max 80 cards/page) -->
+      <div class="host-pagination hidden" id="hostPagination">
+        <span class="hp-info" id="hpInfo">Showing 0 of 0 hosts</span>
+        <div class="hp-controls">
+          <button class="hp-autorotate" id="hpAutoRotateBtn" type="button" aria-pressed="false">Auto Rotate: OFF</button>
+          <button class="hp-nav" id="hpPrevBtn" type="button" aria-label="Previous page">◀ Prev</button>
+          <div class="hp-pages" id="hpPages"></div>
+          <button class="hp-nav" id="hpNextBtn" type="button" aria-label="Next page">Next ▶</button>
+        </div>
       </div>
 
       <!-- Error state -->
@@ -502,7 +548,7 @@
   </aside>
 
   <!-- Audio alert -->
-  <audio id="alarmAudio" src="{{ url_for('static', filename='alarm.mp3') }}" preload="auto"></audio>
+  <audio id="alarmAudio" src="{{ url_for('static', filename='alarm.mp3') }}?v={{ asset_version('alarm.mp3') }}" preload="auto"></audio>
 
   <!-- Add Target Modal -->
   <div id="addTargetModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
@@ -560,7 +606,7 @@
         </div>
 
         <div class="avail-breakdown-section">
-          <div class="avail-breakdown-title">Top 5 Unstable Hosts <em>(by incident count)</em></div>
+          <div class="avail-breakdown-title">Unstable Hosts <em>(by incident count)</em></div>
           <div class="avail-lowest-table" id="mostUnstableTable">
             <div class="de-empty">No incidents recorded</div>
           </div>

@@ -1,1 +1,9 @@
-[]
+[
+  "129391283912",
+  "http://google.com",
+  "192.168.9.101",
+  "192.168.9.50",
+  "node_exporter:9100",
+  "http://doesnotexist.example",
+  "http://smoketest.local"
+]

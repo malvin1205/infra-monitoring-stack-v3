@@ -983,6 +983,185 @@ html, body {
   margin-top: 2px;
 }
 
+/* Job Filter — custom dropdown (replaces native <select>) + Default Job
+   gear/popover. #jobSelect is kept in the DOM only as a hidden state holder
+   for existing JS (jobSelect.value/.options/dispatchEvent) — not rendered. */
+.job-select-wrap {
+  position: relative;
+  gap: 4px;
+}
+
+.job-select-native {
+  display: none;
+}
+
+.job-dd {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.job-dd-trigger {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 26px;
+  padding: 0 8px;
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-sm);
+  color: var(--text-primary);
+  font-family: var(--font, 'Inter', sans-serif);
+  font-size: 11px;
+  font-weight: 500;
+  outline: none;
+  cursor: pointer;
+  transition: border-color var(--t-fast);
+  max-width: 190px;
+}
+
+.job-dd-trigger:hover,
+.job-dd-trigger:focus-visible {
+  border-color: var(--accent);
+}
+
+.job-dd-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.job-dd-caret {
+  flex-shrink: 0;
+  margin-left: auto;
+  color: var(--text-muted);
+}
+
+.job-dd-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 70;
+  min-width: 190px;
+  max-height: 260px;
+  overflow-y: auto;
+  margin: 0;
+  padding: 6px;
+  list-style: none;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-sm);
+  box-shadow: var(--shadow-lg);
+}
+
+.job-dd-menu.hidden {
+  display: none !important;
+}
+
+.job-dd-option {
+  padding: 6px 10px;
+  border-radius: var(--r-sm);
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-primary);
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.job-dd-option:hover,
+.job-dd-option.job-dd-option-active {
+  background: var(--surface-hover);
+}
+
+.job-dd-option[aria-selected="true"] {
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.job-default-badge {
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  line-height: 1;
+  padding: 2px 5px;
+  border-radius: 999px;
+  color: var(--accent);
+  background: rgba(56, 189, 248, 0.14);
+  flex-shrink: 0;
+  pointer-events: none;
+}
+
+.job-default-badge.hidden {
+  display: none;
+}
+
+.job-settings-btn {
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  flex-shrink: 0;
+}
+
+.job-default-popover {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 70;
+  width: 230px;
+  background: rgba(20, 22, 28, 0.72);
+  backdrop-filter: blur(14px) saturate(140%);
+  -webkit-backdrop-filter: blur(14px) saturate(140%);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-lg);
+  padding: 12px 14px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+[data-theme="light"] .job-default-popover {
+  background: rgba(255, 255, 255, 0.78);
+}
+
+.job-default-popover.hidden {
+  display: none !important;
+}
+
+.jdp-title {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+}
+
+.jdp-reset-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: transparent;
+  border: none;
+  color: var(--text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+  padding: 4px 0;
+}
+
+.jdp-reset-btn:hover {
+  color: var(--text-primary);
+}
+
+.jdp-help {
+  font-size: 10px;
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+
 /* Add Target Button */
 .add-target-btn {
   display: inline-flex;
@@ -1075,6 +1254,92 @@ html, body {
   background: var(--bg);
   width: 100%;
   overflow: hidden;
+  opacity: 1;
+  transition: opacity 0.22s ease;
+}
+
+.host-grid.hg-fade-out {
+  opacity: 0;
+}
+
+/* ── Pagination bar (bottom-right, TV wallboard) ─────── */
+.host-pagination {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 14px;
+  padding: 6px 12px;
+  border-top: 1px solid var(--border);
+  min-height: 34px;
+}
+
+.hp-info {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  margin-right: auto;
+}
+
+.hp-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.hp-pages {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.hp-nav,
+.hp-page-btn,
+.hp-autorotate {
+  height: 26px;
+  padding: 0 10px;
+  border-radius: var(--r-sm, 6px);
+  border: 1px solid var(--border-strong);
+  background: var(--bg);
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background var(--t-fast), color var(--t-fast);
+}
+
+.hp-page-btn {
+  min-width: 26px;
+  padding: 0 6px;
+}
+
+.hp-nav:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.hp-nav:not(:disabled):hover,
+.hp-page-btn:hover,
+.hp-autorotate:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.hp-page-active {
+  background: var(--accent, #2563eb);
+  border-color: var(--accent, #2563eb);
+  color: #fff;
+}
+
+.hp-ellipsis {
+  color: var(--text-muted);
+  font-size: 11px;
+  padding: 0 2px;
+}
+
+.hp-autorotate-on {
+  background: var(--accent, #2563eb);
+  border-color: var(--accent, #2563eb);
+  color: #fff;
 }
 
 /* ── Host Card (Grafana Filled Rectangles) ───────────── */

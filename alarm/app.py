@@ -181,6 +181,22 @@ def save_endpoints(data):
 
 DEFAULT_JOB_FILTER = os.environ.get("JOB_FILTER", "all")
 
+# Minimal shape check for the Add Target form — not full RFC validation, just
+# enough to reject obvious garbage (e.g. a bare number) before it's written to
+# websites.yml. Bare Docker/internal hostnames without a dot (e.g. "nginx")
+# are intentionally allowed — that's a real, valid target shape here.
+TARGET_HOST_RE = re.compile(r'^[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?)*$')
+
+def is_valid_target(url):
+    candidate = re.sub(r'^https?://', '', url.strip()).split('/')[0].split(':')[0]
+    if not candidate:
+        return False
+    if re.match(r'^\d{1,3}(\.\d{1,3}){3}$', candidate):
+        return True
+    if candidate.isdigit():
+        return False  # e.g. "129391283912" — not an IPv4, not a sane hostname
+    return bool(TARGET_HOST_RE.match(candidate))
+
 def matches_job_filter(job, scrape_pool, filter_val):
     if not filter_val or filter_val.lower() in ('all', '*'):
         return True
@@ -733,7 +749,9 @@ def add_target_api():
     url = data.get('url', '').strip()
     if not url:
         return jsonify({"ok": False, "error": "IP / Target host is required"}), 400
-    
+    if not is_valid_target(url):
+        return jsonify({"ok": False, "error": "Target tidak valid — gunakan hostname, IP, atau URL yang valid"}), 400
+
     # Remove from deleted_targets if previously deleted
     deleted = load_deleted_targets()
     if url in deleted:
@@ -919,6 +937,55 @@ def fetch_down_since_prom_map():
 
     return last_up_map
 
+# ── Scrape failure classification ────────────────────────────────────────────
+# Single source of truth for turning raw Prometheus/blackbox_exporter data into
+# an operator-readable category. Called from /instances, the poller's alert
+# summary, and the custom-target branch — nowhere else re-derives this. Never
+# replaces lastError/httpStatusCode/probe_success; only adds to them.
+#
+# Categories are intentionally short (fit a TV wallboard card) but unambiguous:
+# "DNS", "Refused", "Timeout", "No Route", "TLS", "HTTP <code>", "Unknown".
+#
+# ponytail: substring matching on Go's net/http error text, not a structured
+# errno — good enough for the current error strings observed live; if
+# Prometheus/Go ever changes its wording this silently falls through to
+# "Unknown" rather than mis-categorizing, so it degrades safely.
+def classify_scrape_failure(health, last_error, http_status):
+    if health == 'up':
+        return {"category": None, "detail": None}
+    if health == 'unknown':
+        return {"category": "Unknown", "detail": "No probe data yet"}
+
+    err = (last_error or '').lower()
+    if err:
+        if 'no such host' in err:
+            return {"category": "DNS", "detail": last_error}
+        if 'no route to host' in err:
+            return {"category": "No Route", "detail": last_error}
+        if 'connection refused' in err:
+            return {"category": "Refused", "detail": last_error}
+        if 'context deadline exceeded' in err or 'i/o timeout' in err:
+            return {"category": "Timeout", "detail": last_error}
+        if 'x509' in err or 'certificate' in err or 'tls' in err:
+            return {"category": "TLS", "detail": last_error}
+
+    # No direct-scrape error text (typical for blackbox/probe jobs — Prometheus
+    # only dials blackbox_exporter, which always answers 200; the real failure
+    # reason lives in probe_* metrics instead). Fall back to the HTTP status
+    # code when one was actually returned by the probed target.
+    if http_status:
+        try:
+            code = int(float(http_status))
+            if code > 0:
+                return {"category": f"HTTP {code}", "detail": f"HTTP {code}"}
+        except (TypeError, ValueError):
+            pass
+
+    if last_error:
+        return {"category": "Unknown", "detail": last_error}
+
+    return {"category": "Unknown", "detail": "No error detail available (probe_success=0)"}
+
 def fetch_all_probe_metrics():
     from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=3) as executor:
@@ -1011,15 +1078,21 @@ def instances():
                     else:
                         response_time_ms = 0
 
-                # Determine HTTP status code / ping status
+                # Determine HTTP status code / ping status — only a value
+                # Prometheus actually reported; no more fabricated 200/0
+                # placeholders when there's simply no probe_http_status_code
+                # series for this instance (see AUDIT.md).
                 p_code = probe_status_code_map.get(inst_name) or probe_status_code_map.get(scrape_url)
                 if p_code is not None:
                     try:
                         http_code = int(float(p_code))
                     except ValueError:
-                        http_code = 200 if health == 'up' else 0
+                        http_code = None
                 else:
-                    http_code = 200 if health == 'up' else 0
+                    http_code = None
+
+                last_error = t.get('lastError', '')
+                classification = classify_scrape_failure(health, last_error, http_code)
 
                 result.append({
                     "instance":        inst_name,
@@ -1029,7 +1102,9 @@ def instances():
                     "httpStatusCode":  http_code,
                     "lastScrape":      t.get('lastScrape', ''),
                     "scrapeUrl":       scrape_url,
-                    "lastError":       t.get('lastError', ''),
+                    "lastError":       last_error,
+                    "failureCategory": classification["category"],
+                    "failureDetail":   classification["detail"],
                     "labels":          labels,
                     "isWeb":           False,
                     "downSince":       down_since_val
@@ -1042,7 +1117,11 @@ def instances():
             if p_success is not None:
                 health = 'up' if str(p_success) in ('1', '1.0') else 'down'
             else:
-                health = 'up'
+                # No probe_success series for this target at all yet (brand new
+                # custom target, or never picked up by Prometheus) — 'unknown',
+                # not a fabricated 'up'. A NOC alarm board should fail toward
+                # "we don't know" rather than silently reading as healthy.
+                health = 'unknown'
 
             if health != 'up':
                 last_up = down_since_prom_map.get(target_url)
@@ -1056,11 +1135,14 @@ def instances():
             except ValueError:
                 response_time_ms = 0.8
 
+            # No fabricated 200/0 placeholder — only a real reported code.
             p_code = probe_status_code_map.get(target_url)
             try:
-                http_code = int(float(p_code)) if p_code else (200 if health == 'up' else 0)
+                http_code = int(float(p_code)) if p_code else None
             except ValueError:
-                http_code = 0
+                http_code = None
+
+            classification = classify_scrape_failure(health, '', http_code)
 
             result.append({
                 "instance":        target_url,
@@ -1071,6 +1153,8 @@ def instances():
                 "lastScrape":      "—",
                 "scrapeUrl":       target_url,
                 "lastError":       "",
+                "failureCategory": classification["category"],
+                "failureDetail":   classification["detail"],
                 "labels":          {"job": "custom", "instance": target_url},
                 "isWeb":           False,
                 "downSince":       down_since_val
@@ -1124,7 +1208,8 @@ def get_monitored_instances(job_filter=None):
                 instances.add(inst_name)
 
     for target_url in config_web_targets:
-        instances.add(target_url)
+        if matches_job_filter("custom", "custom", job_filter):
+            instances.add(target_url)
 
     return instances - deleted_targets
 
@@ -1256,10 +1341,15 @@ def api_availability():
 
     summary = summarize_entries(entries, minutes)
 
+    # Full filtered dataset, lowest availability first — no Top-N cap; the
+    # Detail modal renders every host belonging to the active Job filter that
+    # isn't at perfect (100.00%) availability. A server exactly at 100% has
+    # nothing "lowest" to report, so it's excluded from this list only (it
+    # still counts normally everywhere else — counts/fleet_aggregate/etc).
     lowest_availability = sorted(
-        [e for e in summary['per_server']['values'] if e['availability_pct'] is not None],
+        [e for e in summary['per_server']['values'] if e['availability_pct'] is not None and e['availability_pct'] < 100.0],
         key=lambda e: e['availability_pct']
-    )[:5]
+    )
 
     # Fleet analytics (Phase 11) — pure aggregation over `entries`, already
     # computed above from the same Prometheus queries this endpoint already
@@ -1267,7 +1357,10 @@ def api_availability():
     total_incidents = sum(e['incidents'] for e in entries)
     total_downtime_minutes = sum(e['downtime_minutes'] for e in entries)
     mean_outage_minutes = round(total_downtime_minutes / total_incidents, 1) if total_incidents else None
-    most_unstable = sorted(entries, key=lambda e: (-e['incidents'], -e['downtime_minutes']))[:5]
+    # Full filtered dataset, highest incident count first — no Top-N cap;
+    # the Detail modal renders every host with an incident belonging to the
+    # active Job filter.
+    most_unstable = sorted(entries, key=lambda e: (-e['incidents'], -e['downtime_minutes']))
     most_unstable = [e for e in most_unstable if e['incidents'] > 0]
 
     return jsonify({
@@ -1515,6 +1608,33 @@ def _seed_poller_state():
         if inst:
             _poller_state[inst] = 'down'
 
+def _reconcile_orphaned_alerts(monitored_instances):
+    """Auto-resolves TargetDown alerts whose instance no longer exists in the
+    monitored set at all — e.g. removed from Prometheus's scrape config
+    entirely, not merely down. Without this, such an alert can never be
+    observed recovering (compute_state_transitions only looks at instances
+    still present in success_map/instances) and stays firing forever,
+    permanently pinning status.json to CRITICAL. See AUDIT.md.
+    Only touches poller-owned TargetDown alerts, and only runs when `instances`
+    is non-empty (i.e. Prometheus itself is reachable) — see call site."""
+    status_data = load_json(STATUS_FILE, {"alerts": []})
+    orphaned = [
+        a for a in status_data.get('alerts', [])
+        if a.get('name') == ALERTNAME_TARGET_DOWN and a.get('instance') not in monitored_instances
+    ]
+    for a in orphaned:
+        record_alert_event(
+            name=a.get('name'),
+            severity=a.get('severity', 'critical'),
+            instance=a.get('instance'),
+            summary=f"{a.get('instance')} auto-resolved (no longer monitored)",
+            job='',
+            event_time=time.time(),
+            is_now_firing=False,
+            receiver="prometheus-poller-reconcile",
+            key=a.get('key') or f"{a.get('name')}|{a.get('instance')}",
+        )
+
 def _poll_targets_once():
     _LAST_POLLER_TICK[0] = time.time()
 
@@ -1525,7 +1645,9 @@ def _poll_targets_once():
     if not instances:
         return
 
-    success_map, duration_map, _code_map = fetch_all_probe_metrics()
+    _reconcile_orphaned_alerts(instances)
+
+    success_map, duration_map, status_code_map = fetch_all_probe_metrics()
     if not success_map:
         return  # Prometheus unreachable this tick — never fabricate a transition from no data
 
@@ -1556,11 +1678,21 @@ def _poll_targets_once():
         except (TypeError, ValueError):
             latency_ms = None
 
+        if is_up:
+            summary = f"{inst} recovered"
+        else:
+            # Same classifier as /instances — poller has no per-instance
+            # lastError (that lives on /api/v1/targets, which this loop
+            # doesn't fetch), so this degrades to HTTP-code-based
+            # classification or "Unknown", same as any other probe-only target.
+            classification = classify_scrape_failure('down', '', status_code_map.get(inst))
+            summary = f"{inst} is unreachable ({classification['category']})"
+
         record_alert_event(
             name=ALERTNAME_TARGET_DOWN,
             severity="critical",
             instance=inst,
-            summary=f"{inst} recovered" if is_up else f"{inst} is unreachable (probe_success=0)",
+            summary=summary,
             job="blackbox",
             event_time=now,
             is_now_firing=(not is_up),

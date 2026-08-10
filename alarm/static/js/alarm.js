@@ -11,6 +11,8 @@
  *   POST /webhook    → (Alertmanager payload)
  */
 
+const JOB_DEFAULT_LS_KEY = 'infrawatch.defaultJob';
+
 /* ════════════════════════════════════════════════════════════════════════════
    ROUTER
    ════════════════════════════════════════════════════════════════════════════ */
@@ -75,6 +77,7 @@ class InstancesPage {
     this.activeStatus = 'all';   // 'all' | 'up' | 'down' | 'slow'
     this.activeSort = 'default';  // 'default' | 'name_asc' | 'name_desc' | 'job_asc' | 'job_desc' | 'latency_desc' | 'latency_asc'
     this.selectedJob = 'all';     // 'all' or specific job string
+    this._defaultJobRestored = false; // guards one-time startup restore of infrawatch.defaultJob
     this.searchQ = '';
     this.selectedTarget = null;
     this.isAcknowledged = false;
@@ -82,6 +85,21 @@ class InstancesPage {
 
     this.table = document.getElementById('instancesBody');
     this.countBadge = document.getElementById('instanceCount');
+
+    // Pagination (TV wallboard — max 80 cards/page, see _render()/_renderCards())
+    this.pageSize = 80;
+    this.currentPage = 1;
+    this._totalPages = 1;
+    this._sortedRows = [];
+    this.autoRotate = false;
+    this._autoRotateTimer = null;
+    this._autoRotateResumeTimer = null;
+    this.paginationBar = document.getElementById('hostPagination');
+    this.pageInfoEl = document.getElementById('hpInfo');
+    this.prevPageBtn = document.getElementById('hpPrevBtn');
+    this.nextPageBtn = document.getElementById('hpNextBtn');
+    this.pagesEl = document.getElementById('hpPages');
+    this.autoRotateBtn = document.getElementById('hpAutoRotateBtn');
     this.errorEl = document.getElementById('instancesError');
     this.errorMsg = document.getElementById('instancesErrorMsg');
     this.searchEl = document.getElementById('instanceSearch');
@@ -328,8 +346,14 @@ class InstancesPage {
         this._lastDataSignature = null;
         this.load();
         this.loadAvailability();
+        this._updateJobDefaultUI();
       });
     }
+
+    // Job custom dropdown + Default Job gear/popover (UI layer only; reuses
+    // the jobSelect 'change' listener above for any actual filter change,
+    // no separate filter logic).
+    this._initJobFilterUI();
 
     // Period / time-range chips (24h / 7d / 30d / Custom Range)
     if (this.rangeChipsGroup) {
@@ -434,7 +458,30 @@ class InstancesPage {
       this.table.addEventListener('keydown', e => this._onHostGridKeydown(e));
     }
 
-
+    // Pagination controls
+    if (this.prevPageBtn) {
+      this.prevPageBtn.addEventListener('click', () => this._goToPage(this.currentPage - 1, true));
+    }
+    if (this.nextPageBtn) {
+      this.nextPageBtn.addEventListener('click', () => this._goToPage(this.currentPage + 1, true));
+    }
+    if (this.pagesEl) {
+      this.pagesEl.addEventListener('click', e => {
+        const btn = e.target.closest('[data-page]');
+        if (!btn) return;
+        this._goToPage(parseInt(btn.dataset.page, 10), true);
+      });
+    }
+    if (this.autoRotateBtn) {
+      this.autoRotateBtn.addEventListener('click', () => {
+        this.autoRotate = !this.autoRotate;
+        this.autoRotateBtn.textContent = `Auto Rotate: ${this.autoRotate ? 'ON' : 'OFF'}`;
+        this.autoRotateBtn.classList.toggle('hp-autorotate-on', this.autoRotate);
+        this.autoRotateBtn.setAttribute('aria-pressed', String(this.autoRotate));
+        if (this.autoRotate) this._startAutoRotate();
+        else this._stopAutoRotate();
+      });
+    }
   }
 
   onActivate() {
@@ -443,12 +490,98 @@ class InstancesPage {
     this.startPolling(this.currentInterval);
     this.startAvailabilityPolling();
     this.startDownCounterTicker();
+    if (this.autoRotate) this._startAutoRotate();
   }
 
   onDeactivate() {
     this.stopPolling();
     this.stopAvailabilityPolling();
     this.stopDownCounterTicker();
+    this._stopAutoRotate();
+  }
+
+  /* ── Pagination (TV wallboard: max 80 cards/page) ── */
+  _goToPage(page, manual) {
+    const target = Math.max(1, Math.min(this._totalPages, page));
+    if (manual) this._registerPageInteraction();
+    if (target === this.currentPage) return;
+    this.currentPage = target;
+    this._renderPageWithTransition();
+  }
+
+  _renderPageWithTransition() {
+    const rows = this._sortedRows || [];
+    const startIdx = (this.currentPage - 1) * this.pageSize;
+    const pageRows = rows.slice(startIdx, startIdx + this.pageSize);
+    this._updatePaginationUI(rows.length, startIdx, pageRows.length);
+    if (!this.table) return;
+    // Fade transition (200-300ms) between pages — full DOM rebuild is expected
+    // here since the card set genuinely changes, unlike the poll-time diff in _renderCards().
+    this.table.classList.add('hg-fade-out');
+    setTimeout(() => {
+      this._renderCards(pageRows);
+      this.table.classList.remove('hg-fade-out');
+    }, 220);
+  }
+
+  _updatePaginationUI(total, startIdx, pageCount) {
+    if (this.pageInfoEl) {
+      this.pageInfoEl.textContent = total === 0
+        ? 'Showing 0 of 0 hosts'
+        : `Showing ${startIdx + 1}–${startIdx + pageCount} of ${total} hosts`;
+    }
+    if (this.paginationBar) this.paginationBar.classList.toggle('hidden', this._totalPages <= 1);
+    if (this.prevPageBtn) this.prevPageBtn.disabled = this.currentPage <= 1;
+    if (this.nextPageBtn) this.nextPageBtn.disabled = this.currentPage >= this._totalPages;
+    if (this.pagesEl) {
+      this.pagesEl.innerHTML = this._buildPageList(this._totalPages, this.currentPage).map(p =>
+        p === '…'
+          ? `<span class="hp-ellipsis">…</span>`
+          : `<button class="hp-page-btn${p === this.currentPage ? ' hp-page-active' : ''}" data-page="${p}" type="button">${p}</button>`
+      ).join('');
+    }
+  }
+
+  _buildPageList(total, current) {
+    const keep = new Set([1, total, current, current - 1, current + 1].filter(p => p >= 1 && p <= total));
+    const sorted = Array.from(keep).sort((a, b) => a - b);
+    const pages = [];
+    let prev = 0;
+    sorted.forEach(p => {
+      if (prev && p - prev > 1) pages.push('…');
+      pages.push(p);
+      prev = p;
+    });
+    return pages;
+  }
+
+  /* ── Auto Rotate (TV mode) ── */
+  _startAutoRotate() {
+    this._clearAutoRotateTimers();
+    this._autoRotateTimer = setInterval(() => {
+      this.currentPage = this.currentPage >= this._totalPages ? 1 : this.currentPage + 1;
+      this._renderPageWithTransition();
+    }, 8000);
+  }
+
+  _stopAutoRotate() {
+    this._clearAutoRotateTimers();
+  }
+
+  _clearAutoRotateTimers() {
+    if (this._autoRotateTimer) { clearInterval(this._autoRotateTimer); this._autoRotateTimer = null; }
+    if (this._autoRotateResumeTimer) { clearTimeout(this._autoRotateResumeTimer); this._autoRotateResumeTimer = null; }
+  }
+
+  // Manual page change pauses rotation, resumes after 30s of no interaction.
+  _registerPageInteraction() {
+    if (!this.autoRotate) return;
+    if (this._autoRotateTimer) { clearInterval(this._autoRotateTimer); this._autoRotateTimer = null; }
+    if (this._autoRotateResumeTimer) clearTimeout(this._autoRotateResumeTimer);
+    this._autoRotateResumeTimer = setTimeout(() => {
+      this._autoRotateResumeTimer = null;
+      if (this.autoRotate) this._startAutoRotate();
+    }, 30000);
   }
 
   startDownCounterTicker() {
@@ -484,7 +617,7 @@ class InstancesPage {
 
         const latEl = card.querySelector('.hc-latency');
         if (latEl) {
-          latEl.textContent = `Down ${this._fmtDownAging(downMs)}`;
+          latEl.textContent = this._downLabel(target, this._fmtDownAging(downMs));
         }
       });
 
@@ -766,8 +899,8 @@ class InstancesPage {
       meanOutageEl.textContent = (typeof m === 'number') ? (m < 60 ? `${m.toFixed(1)}m` : `${(m / 60).toFixed(1)}h`) : '—';
     }
 
-    // Top 5 Unstable Hosts (Phase 11 Revise) — analytics.most_unstable is
-    // already capped at 5 server-side; just render what's given, no
+    // Unstable Hosts (Phase 11 Revise) — analytics.most_unstable is the full
+    // filtered dataset (no Top-N cap); just render what's given, no
     // additional fetch/aggregation here.
     const unstableTableEl = document.getElementById('mostUnstableTable');
     if (unstableTableEl) {
@@ -794,7 +927,7 @@ class InstancesPage {
 
     const lowest = (data && Array.isArray(data.lowest_availability)) ? data.lowest_availability : [];
     if (lowest.length === 0) {
-      tableEl.innerHTML = '<div class="de-empty">No data</div>';
+      tableEl.innerHTML = '<div class="de-empty">All monitored servers currently have 100% availability.</div>';
       return;
     }
 
@@ -914,7 +1047,7 @@ class InstancesPage {
     let sig = `${this.activeSort || 'default'}|${this.selectedJob || 'all'}|${this.activeStatus || 'all'}|${this.searchQ || ''};`;
     for (let i = 0; i < targets.length; i++) {
       const t = targets[i];
-      sig += t.instance + '|' + t.job + '|' + t.health + '|' + t.responseTimeMs + '|' + t.downSince + '|' + t.maintenance + '|' + t.suppressedBy + ';';
+      sig += t.instance + '|' + t.job + '|' + t.health + '|' + t.responseTimeMs + '|' + t.downSince + '|' + t.maintenance + '|' + t.suppressedBy + '|' + t.failureCategory + ';';
     }
     return sig;
   }
@@ -958,6 +1091,9 @@ class InstancesPage {
             jobSelect.appendChild(opt);
           }
         });
+
+        this._syncJobDropdownOptions();
+        this._restoreDefaultJob(jobSelect);
       }
 
       const newTargets = data.targets || [];
@@ -981,6 +1117,270 @@ class InstancesPage {
       this._scheduleRetry('instances');
     } finally {
       if (this._loadAbortController === controller) this._loadAbortController = null;
+    }
+  }
+
+  // Job Filter custom dropdown + Default Job gear/popover — one controller,
+  // since both float off the same wrap and share outside-click/Escape
+  // handling. #jobSelect (native, hidden via CSS) stays the single state
+  // holder: every existing load()/loadAvailability()/_restoreDefaultJob
+  // codepath keeps reading jobSelect.value/.options and listening for
+  // 'change' on it unmodified — this controller only ever drives that same
+  // element and never re-implements filtering.
+  _initJobFilterUI() {
+    const wrap = document.getElementById('jobSelectWrap');
+    const jobSelect = document.getElementById('jobSelect');
+    const ddTrigger = document.getElementById('jobDdTrigger');
+    const ddMenu = document.getElementById('jobDdMenu');
+    const ddLabel = document.getElementById('jobDdLabel');
+    const gearBtn = document.getElementById('jobDefaultSettingsBtn');
+    const popover = document.getElementById('jobDefaultPopover');
+    const setRow = document.getElementById('jdpSetRow');
+    const setCheckbox = document.getElementById('jdpSetCheckbox');
+    const resetBtn = document.getElementById('jdpResetBtn');
+    const badge = document.getElementById('jobDefaultBadge');
+    if (!wrap || !jobSelect || !ddTrigger || !ddMenu || !gearBtn || !popover) return;
+
+    this._jobFilterEls = { wrap, jobSelect, ddTrigger, ddMenu, ddLabel, gearBtn, popover, setRow, setCheckbox, resetBtn, badge };
+
+    // ── Custom dropdown (UI layer only — see _selectJobDdOption) ──
+    ddTrigger.addEventListener('click', e => {
+      e.stopPropagation();
+      if (ddMenu.classList.contains('hidden')) this._openJobDropdown();
+      else this._closeJobDropdown();
+    });
+    ddTrigger.addEventListener('keydown', e => {
+      if (e.key === 'ArrowDown' || e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        this._openJobDropdown();
+      }
+    });
+    ddMenu.addEventListener('click', e => {
+      const li = e.target.closest('.job-dd-option');
+      if (li) this._selectJobDdOption(li);
+    });
+    ddMenu.addEventListener('keydown', e => this._onJobDdMenuKeydown(e));
+
+    // ── Default Job gear + popover ──
+    gearBtn.addEventListener('click', e => {
+      e.stopPropagation();
+      if (popover.classList.contains('hidden')) this._openJobDefaultPopover();
+      else this._closeJobDefaultPopover();
+    });
+
+    if (setCheckbox) {
+      setCheckbox.addEventListener('change', () => {
+        if (!setCheckbox.checked) return; // clearing the default only happens via Reset
+        try { localStorage.setItem(JOB_DEFAULT_LS_KEY, this.selectedJob); } catch (e) { }
+        this._triggerEventToast('Default Job saved.');
+        this._updateJobDefaultUI();
+        this._closeJobDefaultPopover();
+      });
+    }
+
+    if (resetBtn) {
+      resetBtn.addEventListener('click', () => {
+        try { localStorage.removeItem(JOB_DEFAULT_LS_KEY); } catch (e) { }
+        if (jobSelect.value !== 'all') {
+          jobSelect.value = 'all';
+          jobSelect.dispatchEvent(new Event('change')); // reuses the one filter code path
+        } else {
+          this._updateJobDefaultUI();
+        }
+        this._triggerEventToast('Default Job cleared.');
+        this._closeJobDefaultPopover();
+      });
+    }
+
+    // Click outside / Escape closes whichever of the two floats is open —
+    // neither is a modal, both stay lightweight popovers.
+    document.addEventListener('click', e => {
+      if (wrap.contains(e.target)) return;
+      this._closeJobDropdown();
+      this._closeJobDefaultPopover();
+    });
+    document.addEventListener('keydown', e => {
+      if (e.key !== 'Escape') return;
+      if (!ddMenu.classList.contains('hidden')) { this._closeJobDropdown(); ddTrigger.focus(); }
+      if (!popover.classList.contains('hidden')) this._closeJobDefaultPopover();
+    });
+
+    this._syncJobDropdownSelection();
+    this._updateJobDefaultUI();
+  }
+
+  /* ── Custom Job dropdown — pure UI, drives #jobSelect + its 'change' ── */
+  _openJobDropdown() {
+    const els = this._jobFilterEls;
+    if (!els) return;
+    this._closeJobDefaultPopover();
+    els.ddMenu.classList.remove('hidden');
+    els.ddTrigger.setAttribute('aria-expanded', 'true');
+    const current = els.ddMenu.querySelector('[aria-selected="true"]') || els.ddMenu.firstElementChild;
+    this._setActiveJobDdOption(current);
+    els.ddMenu.focus();
+  }
+
+  _closeJobDropdown() {
+    const els = this._jobFilterEls;
+    if (!els || els.ddMenu.classList.contains('hidden')) return;
+    els.ddMenu.classList.add('hidden');
+    els.ddTrigger.setAttribute('aria-expanded', 'false');
+  }
+
+  _setActiveJobDdOption(li) {
+    const els = this._jobFilterEls;
+    if (!els || !li) return;
+    els.ddMenu.querySelectorAll('.job-dd-option-active').forEach(el => el.classList.remove('job-dd-option-active'));
+    li.classList.add('job-dd-option-active');
+    li.scrollIntoView({ block: 'nearest' });
+  }
+
+  _onJobDdMenuKeydown(e) {
+    const els = this._jobFilterEls;
+    if (!els) return;
+    const options = Array.from(els.ddMenu.children);
+    if (!options.length) return;
+    const activeIdx = Math.max(0, options.findIndex(li => li.classList.contains('job-dd-option-active')));
+
+    switch (e.key) {
+      case 'ArrowDown':
+        e.preventDefault();
+        this._setActiveJobDdOption(options[Math.min(options.length - 1, activeIdx + 1)]);
+        break;
+      case 'ArrowUp':
+        e.preventDefault();
+        this._setActiveJobDdOption(options[Math.max(0, activeIdx - 1)]);
+        break;
+      case 'Home':
+        e.preventDefault();
+        this._setActiveJobDdOption(options[0]);
+        break;
+      case 'End':
+        e.preventDefault();
+        this._setActiveJobDdOption(options[options.length - 1]);
+        break;
+      case 'Enter':
+      case ' ':
+        e.preventDefault();
+        this._selectJobDdOption(options[activeIdx]);
+        break;
+      case 'Escape':
+        e.preventDefault();
+        this._closeJobDropdown();
+        els.ddTrigger.focus();
+        break;
+      case 'Tab':
+        this._closeJobDropdown();
+        break;
+    }
+  }
+
+  // The only place a dropdown click/keypress turns into a filter change —
+  // sets the hidden native select's value and dispatches 'change' on it,
+  // which the existing jobSelect listener in _bindEvents picks up exactly
+  // as it did when that select was visible. No parallel filtering logic.
+  _selectJobDdOption(li) {
+    const els = this._jobFilterEls;
+    if (!els || !li) return;
+    if (els.jobSelect.value !== li.dataset.value) {
+      els.jobSelect.value = li.dataset.value;
+      els.jobSelect.dispatchEvent(new Event('change'));
+    }
+    this._closeJobDropdown();
+    els.ddTrigger.focus();
+  }
+
+  // Rebuilds the <li> option list from the hidden <select>'s <option>s
+  // (itself populated by load()'s available_jobs merge) — never a second
+  // source of truth for what jobs exist.
+  _syncJobDropdownOptions() {
+    const els = this._jobFilterEls;
+    if (!els) return;
+    const existing = new Set(Array.from(els.ddMenu.children).map(li => li.dataset.value));
+    Array.from(els.jobSelect.options).forEach(opt => {
+      if (existing.has(opt.value)) return;
+      const li = document.createElement('li');
+      li.setAttribute('role', 'option');
+      li.className = 'job-dd-option';
+      li.dataset.value = opt.value;
+      li.textContent = opt.textContent;
+      els.ddMenu.appendChild(li);
+    });
+    this._syncJobDropdownSelection();
+  }
+
+  // Reflects #jobSelect's current value into the trigger label and the
+  // menu's aria-selected state.
+  _syncJobDropdownSelection() {
+    const els = this._jobFilterEls;
+    if (!els) return;
+    const selectedOpt = els.jobSelect.options[els.jobSelect.selectedIndex];
+    if (els.ddLabel) els.ddLabel.textContent = selectedOpt ? selectedOpt.textContent : 'Semua Job';
+    Array.from(els.ddMenu.children).forEach(li => {
+      li.setAttribute('aria-selected', String(li.dataset.value === els.jobSelect.value));
+    });
+  }
+
+  /* ── Default Job gear popover ── */
+  _openJobDefaultPopover() {
+    const els = this._jobFilterEls;
+    if (!els) return;
+    this._closeJobDropdown();
+    this._updateJobDefaultUI();
+    els.popover.classList.remove('hidden');
+    els.gearBtn.setAttribute('aria-expanded', 'true');
+  }
+
+  _closeJobDefaultPopover() {
+    const els = this._jobFilterEls;
+    if (!els || els.popover.classList.contains('hidden')) return;
+    els.popover.classList.add('hidden');
+    els.gearBtn.setAttribute('aria-expanded', 'false');
+  }
+
+  // Reflects whether the currently selected Job is the saved default:
+  // toggles the trigger's "Default" badge and shows/hides the "Set as
+  // Default" row in the popover (hidden when already default, per spec).
+  // Also keeps the dropdown label/selection in sync, since both change
+  // together whenever selectedJob changes.
+  _updateJobDefaultUI() {
+    const els = this._jobFilterEls;
+    if (!els) return;
+    this._syncJobDropdownSelection();
+
+    let stored = null;
+    try { stored = localStorage.getItem(JOB_DEFAULT_LS_KEY); } catch (e) { }
+    const isDefault = !!stored && stored === this.selectedJob;
+
+    if (els.badge) els.badge.classList.toggle('hidden', !isDefault);
+    if (els.setRow) els.setRow.classList.toggle('hidden', isDefault);
+    if (els.setCheckbox) els.setCheckbox.checked = isDefault;
+  }
+
+  // Startup restore of a saved default Job — runs once, first successful
+  // load() only (jobSelect must already be populated). Fires the same
+  // 'change' event the manual dropdown handler listens on (see _bindEvents)
+  // instead of duplicating the load()/loadAvailability() filter logic.
+  _restoreDefaultJob(jobSelect) {
+    if (this._defaultJobRestored) return;
+    this._defaultJobRestored = true;
+
+    let stored = null;
+    try { stored = localStorage.getItem(JOB_DEFAULT_LS_KEY); } catch (e) { }
+    if (!stored) return;
+
+    const exists = Array.from(jobSelect.options).some(o => o.value === stored);
+    if (!exists) {
+      try { localStorage.setItem(JOB_DEFAULT_LS_KEY, 'all'); } catch (e) { }
+      return;
+    }
+
+    if (jobSelect.value !== stored) {
+      jobSelect.value = stored;
+      jobSelect.dispatchEvent(new Event('change')); // also triggers _updateJobDefaultUI via the change listener
+    } else {
+      this._updateJobDefaultUI();
     }
   }
 
@@ -1019,6 +1419,16 @@ class InstancesPage {
     const h = Math.floor(sec / 3600);
     const m = Math.floor((sec % 3600) / 60);
     return `${h}h ${m}m`;
+  }
+
+  // Single place the wallboard card's down-state text is composed — reused by
+  // _tickDownCounters() (per-second update) and both _renderCards() branches,
+  // so the classifier's category (from /instances' failureCategory, backed by
+  // classify_scrape_failure() in app.py) never has to be re-derived client-side.
+  _downLabel(t, agingStr) {
+    if (t.suppressedBy) return `↳ via ${t.suppressedBy}`;
+    const cat = t.failureCategory;
+    return (cat && cat !== 'Unknown') ? `${cat} · ${agingStr}` : `Down ${agingStr}`;
   }
 
   _triggerEventToast(msg) {
@@ -1251,6 +1661,21 @@ class InstancesPage {
 
     this._sortedRows = rows;
 
+    // Paginate — max 80 cards/page for the TV wallboard (see PAGINATION
+    // REQUIREMENTS). Clamp instead of resetting to page 1 so polling/live
+    // updates never yank the operator off the page they're viewing.
+    this._totalPages = Math.max(1, Math.ceil(rows.length / this.pageSize));
+    this.currentPage = Math.min(Math.max(1, this.currentPage), this._totalPages);
+    const startIdx = (this.currentPage - 1) * this.pageSize;
+    const pageRows = rows.slice(startIdx, startIdx + this.pageSize);
+    this._updatePaginationUI(rows.length, startIdx, pageRows.length);
+
+    this._renderCards(pageRows);
+  }
+
+  // Renders exactly the given (already paginated) rows into the grid, with
+  // an in-place DOM diff to avoid flicker on same-page poll refreshes.
+  _renderCards(rows) {
     const now = Date.now();
     const existingDomCards = Array.from(this.table.querySelectorAll('.host-card'));
     const existingInstances = existingDomCards.map(c => c.dataset.instance);
@@ -1285,7 +1710,7 @@ class InstancesPage {
           } else if (this.downStartTimes[t.instance]) {
             downMs = Math.max(0, now - this.downStartTimes[t.instance]);
           }
-          latencyText = t.suppressedBy ? `↳ via ${t.suppressedBy}` : `Down ${this._fmtDownAging(downMs)}`;
+          latencyText = this._downLabel(t, this._fmtDownAging(downMs));
         } else {
           latencyText = t.responseTimeMs ? `${t.responseTimeMs} ms` : '< 1 ms';
         }
@@ -1326,7 +1751,7 @@ class InstancesPage {
           } else if (this.downStartTimes[t.instance]) {
             downMs = Math.max(0, now - this.downStartTimes[t.instance]);
           }
-          latencyText = t.suppressedBy ? `↳ via ${t.suppressedBy}` : `Down ${this._fmtDownAging(downMs)}`;
+          latencyText = this._downLabel(t, this._fmtDownAging(downMs));
         } else {
           latencyText = t.responseTimeMs ? `${t.responseTimeMs} ms` : '< 1 ms';
         }
@@ -1453,13 +1878,17 @@ class InstancesPage {
 
     const probeEl = document.getElementById('drawerHttpCode');
     if (probeEl) {
-      probeEl.textContent = target.httpStatusCode ? String(target.httpStatusCode) : (isDown ? 'FAIL' : 'OK');
+      probeEl.textContent = target.httpStatusCode ? String(target.httpStatusCode) : (isDown ? (target.failureCategory || 'FAIL') : 'OK');
     }
 
+    // Category from the backend classifier (classify_scrape_failure) prefixed
+    // onto the raw Prometheus error — raw text is never dropped, just labeled.
     const errorRowEl = document.getElementById('drawerErrorRow');
     if (errorRowEl) {
-      if (isDown && target.lastError) {
-        errorRowEl.textContent = target.lastError;
+      const cat = target.failureCategory;
+      const raw = target.failureDetail || target.lastError;
+      if (isDown && (raw || (cat && cat !== 'Unknown'))) {
+        errorRowEl.textContent = (cat && cat !== 'Unknown' && raw && raw !== cat) ? `${cat} — ${raw}` : (raw || cat);
         errorRowEl.classList.remove('hidden');
       } else {
         errorRowEl.textContent = '';
