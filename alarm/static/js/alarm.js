@@ -379,6 +379,8 @@ class InstancesPage {
           if (drawerUptimeLabel) drawerUptimeLabel.textContent = 'Uptime (Realtime)';
           const breakdownRangeEl = document.getElementById('availabilityBreakdownRange');
           if (breakdownRangeEl) breakdownRangeEl.textContent = '(Realtime)';
+          const drawerSparklineRangeEl = document.getElementById('drawerSparklineRange');
+          if (drawerSparklineRangeEl) drawerSparklineRangeEl.textContent = '(Realtime)';
           // Fleet-aggregate/lowest-availability breakdown is inherently a
           // time-weighted historical metric — doesn't apply to an instant
           // snapshot, so hide the Detail button rather than show stale data.
@@ -386,6 +388,9 @@ class InstancesPage {
           // Reflect whatever the last live poll already fetched immediately,
           // instead of waiting for the next 5s/10s/30s tick.
           this._updateStats();
+          if (this.selectedTarget) {
+            this.loadTargetHistory(this.selectedTarget.instance);
+          }
           return;
         }
 
@@ -396,6 +401,9 @@ class InstancesPage {
         this.periodEnd = null;
         this.periodLabel = range;
         this.loadAvailability();
+        if (this.selectedTarget) {
+          this.loadTargetHistory(this.selectedTarget.instance);
+        }
       });
     }
 
@@ -442,6 +450,73 @@ class InstancesPage {
     }
     if (this.sideDrawerOverlay) {
       this.sideDrawerOverlay.addEventListener('click', () => this._closeDrawer());
+    }
+
+    // Semi-Fullscreen Modal Tabs & Control Listeners
+    const tabsNav = document.getElementById('modalTabsNav');
+    if (tabsNav) {
+      tabsNav.addEventListener('click', e => {
+        const btn = e.target.closest('[data-tab]');
+        if (!btn) return;
+        this._switchModalTab(btn.dataset.tab);
+      });
+    }
+
+    const drawerRefreshBtn = document.getElementById('drawerRefreshBtn');
+    if (drawerRefreshBtn) {
+      drawerRefreshBtn.addEventListener('click', () => {
+        if (this.selectedTarget) {
+          this._openDrawer(this.selectedTarget);
+          this.loadAvailability();
+        }
+      });
+    }
+
+    const modalCloseBottomBtn = document.getElementById('modalCloseBottomBtn');
+    if (modalCloseBottomBtn) {
+      modalCloseBottomBtn.addEventListener('click', () => this._closeDrawer());
+    }
+
+    // Sparkline Time Range selector buttons (5m, 15m, 1h, 6h, 24h, 7d)
+    const spRangeGroup = document.getElementById('spRangeGroup');
+    if (spRangeGroup) {
+      spRangeGroup.addEventListener('click', e => {
+        const btn = e.target.closest('[data-range]');
+        if (!btn) return;
+        const range = btn.dataset.range;
+        const presets = { '5m': 5, '15m': 15, '1h': 60, '6h': 360, '24h': 1440, '7d': 10080 };
+        this.periodMinutes = presets[range] || 1440;
+        this.periodLabel = range;
+        this.periodEnd = null;
+        this._sparklineZoomRange = null;
+        
+        spRangeGroup.querySelectorAll('.sp-range-btn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+
+        const resetBtn = document.getElementById('sparklineResetZoomBtn');
+        if (resetBtn) resetBtn.style.display = 'none';
+
+        if (this.selectedTarget) {
+          this.loadTargetHistory(this.selectedTarget.instance);
+        }
+      });
+    }
+
+    // Sparkline Reset Zoom button
+    const spResetBtn = document.getElementById('sparklineResetZoomBtn');
+    if (spResetBtn) {
+      spResetBtn.addEventListener('click', () => {
+        this._sparklineZoomRange = null;
+        spResetBtn.style.display = 'none';
+        if (Array.isArray(this._rawSparklinePoints)) {
+          this._renderSparkline(this._rawSparklinePoints, true);
+        }
+      });
+    }
+
+    const btnViewAllEvents = document.getElementById('btnViewAllEvents');
+    if (btnViewAllEvents) {
+      btnViewAllEvents.addEventListener('click', () => this._switchModalTab('events'));
     }
 
     // Card click => open drawer; delegated keydown => D-pad nav + Enter/Space to open
@@ -705,6 +780,8 @@ class InstancesPage {
     if (drawerUptimeLabel) drawerUptimeLabel.textContent = `Uptime (${rangeText})`;
     const breakdownRangeEl = document.getElementById('availabilityBreakdownRange');
     if (breakdownRangeEl) breakdownRangeEl.textContent = `(${rangeText})`;
+    const drawerSparklineRangeEl = document.getElementById('drawerSparklineRange');
+    if (drawerSparklineRangeEl) drawerSparklineRangeEl.textContent = `(${rangeText})`;
 
     try {
       let url = `/api/availability?minutes=${Math.round(this.periodMinutes)}`;
@@ -869,8 +946,13 @@ class InstancesPage {
     this.availabilityBreakdownModal.classList.remove('hidden');
     if (this._untrapBreakdown) this._untrapBreakdown();
     this._untrapBreakdown = window.trapModalFocus(this.availabilityBreakdownModal);
-    this._renderAvailabilityBreakdown();
-    if (!this.availabilityBreakdown) this.loadAvailability();
+    
+    const currentMins = Math.round(this.periodMinutes);
+    if (!this.availabilityBreakdown || Math.round(this.availabilityBreakdown.period_minutes || 0) !== currentMins) {
+      this.loadAvailability();
+    } else {
+      this._renderAvailabilityBreakdown();
+    }
   }
 
   _closeAvailabilityBreakdown() {
@@ -880,32 +962,33 @@ class InstancesPage {
 
   _renderAvailabilityBreakdown() {
     const data = this.availabilityBreakdown;
+    const expectedMins = Math.round(this.periodMinutes);
+    const isMatchingData = data && Math.round(data.period_minutes || 0) === expectedMins;
 
-    const fmtPct = m => (m && typeof m.value === 'number') ? `${m.value.toFixed(2)}%` : '—';
+    const fmtPct = m => (isMatchingData && m && typeof m.value === 'number') ? `${m.value.toFixed(2)}%` : '—';
 
     const aggEl = document.getElementById('metricFleetAggregate');
-    if (aggEl) aggEl.textContent = data ? fmtPct(data.fleet_aggregate) : '—';
+    if (aggEl) aggEl.textContent = fmtPct(data?.fleet_aggregate);
 
     const avgEl = document.getElementById('metricFleetAverage');
-    if (avgEl) avgEl.textContent = data ? fmtPct(data.fleet_average) : '—';
+    if (avgEl) avgEl.textContent = fmtPct(data?.fleet_average);
 
     const healthEl = document.getElementById('metricHealthRatio');
-    if (healthEl) healthEl.textContent = data ? fmtPct(data.health_ratio) : '—';
+    if (healthEl) healthEl.textContent = fmtPct(data?.health_ratio);
 
-    const analytics = data && data.analytics;
+    const analytics = isMatchingData ? data?.analytics : null;
     const meanOutageEl = document.getElementById('metricMeanOutage');
     if (meanOutageEl) {
       const m = analytics && analytics.mean_outage_minutes;
       meanOutageEl.textContent = (typeof m === 'number') ? (m < 60 ? `${m.toFixed(1)}m` : `${(m / 60).toFixed(1)}h`) : '—';
     }
 
-    // Unstable Hosts (Phase 11 Revise) — analytics.most_unstable is the full
-    // filtered dataset (no Top-N cap); just render what's given, no
-    // additional fetch/aggregation here.
     const unstableTableEl = document.getElementById('mostUnstableTable');
     if (unstableTableEl) {
       const list = analytics && Array.isArray(analytics.most_unstable) ? analytics.most_unstable : [];
-      if (list.length === 0) {
+      if (!isMatchingData) {
+        unstableTableEl.innerHTML = '<div class="de-empty">Memuat data histori...</div>';
+      } else if (list.length === 0) {
         unstableTableEl.innerHTML = '<div class="de-empty">No incidents recorded</div>';
       } else {
         unstableTableEl.innerHTML = list.map((entry, i) => {
@@ -924,6 +1007,11 @@ class InstancesPage {
 
     const tableEl = document.getElementById('availabilityLowestTable');
     if (!tableEl) return;
+
+    if (!isMatchingData) {
+      tableEl.innerHTML = '<div class="de-empty">Memuat data histori server...</div>';
+      return;
+    }
 
     const lowest = (data && Array.isArray(data.lowest_availability)) ? data.lowest_availability : [];
     if (lowest.length === 0) {
@@ -1810,6 +1898,179 @@ class InstancesPage {
     allCards[nextIdx]?.focus();
   }
 
+  _switchModalTab(tabName) {
+    const nav = document.getElementById('modalTabsNav');
+    if (!nav) return;
+    const tabs = nav.querySelectorAll('[data-tab]');
+    tabs.forEach(t => {
+      t.classList.toggle('active', t.dataset.tab === tabName);
+    });
+
+    const panes = document.querySelectorAll('.modal-tab-pane');
+    panes.forEach(p => {
+      const isTarget = p.id.toLowerCase() === `tabpane${tabName.toLowerCase()}`;
+      p.classList.toggle('hidden', !isTarget);
+      p.style.display = isTarget ? 'flex' : 'none';
+    });
+  }
+
+  _renderDrawerAvailabilityBars(target, points = [], events = []) {
+    const container = document.getElementById('drawerAvailabilityBars');
+    const timeLabelsEl = document.getElementById('drawerAvailabilityTimeLabels');
+    if (!container) return;
+
+    const now_ts = Math.floor(Date.now() / 1000);
+    const isUp = target?.health === 'up';
+
+    let barsHtml = '';
+    const slotsCount = 24;
+
+    for (let i = 0; i < slotsCount; i++) {
+      const slotStart = now_ts - (24 - i) * 3600;
+      const slotEnd = now_ts - (23 - i) * 3600;
+
+      let slotDownSec = 0;
+      if (Array.isArray(events)) {
+        events.forEach(ev => {
+          if (ev.status === 'OFFLINE') {
+            const evStart = ev.start_ts;
+            const evEnd = ev.ongoing ? now_ts : (ev.end_ts || now_ts);
+            const oStart = Math.max(slotStart, evStart);
+            const oEnd = Math.min(slotEnd, evEnd);
+            if (oEnd > oStart) {
+              slotDownSec += (oEnd - oStart);
+            }
+          }
+        });
+      }
+
+      if (!isUp && i === 23 && slotDownSec === 0) {
+        slotDownSec = 3600;
+      }
+
+      let uptimePct = 100;
+      if (slotDownSec > 0) {
+        uptimePct = Math.max(0, Math.min(100, Math.round(((3600 - slotDownSec) / 3600) * 100)));
+      }
+
+      let slotPts = Array.isArray(points) ? points.filter(p => p[0] >= slotStart && p[0] < slotEnd) : [];
+      let avgLat = slotPts.length > 0 ? (slotPts.reduce((a, b) => a + b[1], 0) / slotPts.length) : (isUp ? target?.responseTimeMs || 0 : 0);
+
+      let barColor = '#22C55E';
+      let barHeight = '100%';
+      let statusText = `${uptimePct}% Up`;
+
+      if (uptimePct < 10) {
+        barColor = '#EF4444';
+        barHeight = '25%';
+        statusText = 'Down (0% Up)';
+      } else if (uptimePct < 95) {
+        barColor = '#F59E0B';
+        barHeight = `${Math.max(30, uptimePct)}%`;
+        statusText = `${uptimePct}% Up (Partial Outage)`;
+      } else if (avgLat > 500) {
+        barColor = '#F59E0B';
+        barHeight = '80%';
+        statusText = `Slow (${avgLat.toFixed(1)}ms avg)`;
+      }
+
+      const slotDate = new Date(slotStart * 1000);
+      const timeStr = slotDate.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' });
+
+      barsHtml += `<div title="${timeStr} • ${statusText}" style="flex:1; height:${barHeight}; background:${barColor}; border-radius:2px; transition:all 0.2s ease;"></div>`;
+    }
+
+    container.innerHTML = barsHtml;
+
+    if (timeLabelsEl) {
+      const markers = [0, 6, 12, 18, 24];
+      const labels = markers.map(hAgo => {
+        const dObj = new Date((now_ts - (24 - hAgo) * 3600) * 1000);
+        return dObj.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' });
+      });
+      timeLabelsEl.innerHTML = labels.map(l => `<span>${l}</span>`).join('');
+    }
+  }
+
+  _renderDrawerRecentEvents(events) {
+    const container = document.getElementById('drawerRecentEventsList');
+    if (!container) return;
+
+    if (!Array.isArray(events) || events.length === 0) {
+      container.innerHTML = '<div class="de-empty" style="font-size:12px; color:var(--text-secondary);">Tidak ada log event insiden</div>';
+      return;
+    }
+
+    const recent = events.slice(0, 3);
+    container.innerHTML = recent.map(ev => {
+      const isOnline = ev.status === 'ONLINE';
+      const iconSvg = isOnline
+        ? '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#22C55E" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>'
+        : '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#EF4444" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>';
+      
+      const title = isOnline ? 'Up' : 'Down';
+      const desc = isOnline ? 'Probe successful' : 'Timeout / No response';
+      const dObj = new Date(ev.start_ts * 1000);
+      const timeStr = dObj.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      const agoStr = this._relTime(ev.start_ts * 1000);
+
+      return `
+        <div style="display:flex; align-items:flex-start; justify-content:space-between; padding:6px 8px; background:rgba(15,23,42,0.6); border:1px solid var(--border); border-radius:6px; font-size:11px;">
+          <div style="display:flex; align-items:center; gap:8px;">
+            ${iconSvg}
+            <div>
+              <div style="font-weight:700; color:var(--text-primary);">${title}</div>
+              <div style="color:var(--text-secondary); font-size:10px;">${desc}</div>
+            </div>
+          </div>
+          <div style="text-align:right;">
+            <div style="color:var(--text-primary); font-family:var(--font-mono);">${timeStr}</div>
+            <div style="color:var(--text-muted); font-size:10px;">${agoStr}</div>
+          </div>
+        </div>`;
+    }).join('');
+  }
+
+  _renderDrawerProbeSummary(target, events) {
+    const elTotal = document.getElementById('spSummaryTotalProbes');
+    const elSuccess = document.getElementById('spSummarySuccess');
+    const elFailed = document.getElementById('spSummaryFailed');
+    const elMttr = document.getElementById('spSummaryMttr');
+    const elLongest = document.getElementById('spSummaryLongestOutage');
+    const elLastOutage = document.getElementById('spSummaryLastOutage');
+
+    if (!target) return;
+    const isDown = target.health !== 'up';
+
+    let downEvents = Array.isArray(events) ? events.filter(e => e.status === 'OFFLINE') : [];
+    let failedCount = downEvents.length + (isDown ? 1 : 0);
+    let totalProbes = 5760;
+    let successCount = Math.max(0, totalProbes - failedCount);
+    let successPct = ((successCount / totalProbes) * 100).toFixed(2);
+    let failedPct = ((failedCount / totalProbes) * 100).toFixed(2);
+
+    if (elTotal) elTotal.textContent = totalProbes.toLocaleString();
+    if (elSuccess) elSuccess.textContent = `${successCount.toLocaleString()} (${successPct}%)`;
+    if (elFailed) elFailed.textContent = `${failedCount} (${failedPct}%)`;
+
+    let totalDownSec = downEvents.reduce((acc, e) => acc + (e.duration_seconds || 0), 0);
+    let mttrSec = downEvents.length > 0 ? Math.round(totalDownSec / downEvents.length) : 0;
+    let maxDownSec = downEvents.length > 0 ? Math.max(...downEvents.map(e => e.duration_seconds || 0)) : 0;
+
+    if (elMttr) elMttr.textContent = mttrSec > 0 ? `${mttrSec}s` : '0s';
+    if (elLongest) elLongest.textContent = maxDownSec > 0 ? `${maxDownSec}s` : 'None';
+
+    if (elLastOutage) {
+      if (downEvents.length > 0) {
+        const lastEv = downEvents[0];
+        const dObj = new Date(lastEv.start_ts * 1000);
+        elLastOutage.textContent = dObj.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      } else {
+        elLastOutage.textContent = 'None';
+      }
+    }
+  }
+
   /* ── Target Side Drawer ────────────────────────── */
   _openDrawer(target) {
     // Remember the host card that had focus so it can be restored on close.
@@ -1821,9 +2082,13 @@ class InstancesPage {
     const isDown = !isUp;
     const now = Date.now();
 
+    this._switchModalTab('overview');
+
     // IP + job
     const titleEl = document.getElementById('drawerTargetTitle');
     if (titleEl) titleEl.textContent = target.instance;
+    const infoIpEl = document.getElementById('drawerInfoIp');
+    if (infoIpEl) infoIpEl.textContent = target.instance;
     const jobEl = document.getElementById('drawerJobBadge');
     if (jobEl) jobEl.textContent = target.job || 'blackbox-ping-internal';
     const infoJobEl = document.getElementById('drawerInfoJob');
@@ -1835,13 +2100,18 @@ class InstancesPage {
       dot.className = 'drawer-dot ' + (isDown ? 'dot-down' : (isSlow ? 'dot-slow' : 'dot-up'));
     }
 
-    // Status pill
+    // Status pill & status text
     const pill = document.getElementById('drawerStatusPill');
+    const statusTextEl = document.getElementById('drawerStatusText');
+    const label = isDown ? 'Offline' : (isSlow ? 'Slow (>500ms)' : 'Online');
+    const cls = isDown ? 'dsp-down' : (isSlow ? 'dsp-slow' : 'dsp-up');
     if (pill) {
-      const label = isDown ? 'Offline' : (isSlow ? 'Slow (>500ms)' : 'Online');
-      const cls = isDown ? 'dsp-down' : (isSlow ? 'dsp-slow' : 'dsp-up');
       pill.textContent = label;
       pill.className = `drawer-status-pill ${cls}`;
+    }
+    if (statusTextEl) {
+      statusTextEl.textContent = isDown ? 'OFFLINE' : (isSlow ? 'SLOW' : 'ONLINE');
+      statusTextEl.style.color = isDown ? '#EF4444' : (isSlow ? '#F59E0B' : '#22C55E');
     }
 
     // Last check / Aging
@@ -1916,6 +2186,8 @@ class InstancesPage {
 
     this._renderDrawerMaintenance(target);
     this._renderDrawerDependency(target);
+    this._renderDrawerAvailabilityBars(target);
+    this._renderDrawerProbeSummary(target, []);
 
     // Open
     if (this.sideDrawerOverlay) {
@@ -2122,46 +2394,496 @@ class InstancesPage {
     ].join('');
   }
 
-  _renderSparkline(points) {
-    const wrap = document.getElementById('drawerSparkline');
-    if (!wrap || !Array.isArray(points) || points.length < 2) return;
+  _buildMSGradientDefs(rangeMin, rangeMax, gradIdLine, gradIdArea) {
+    const rangeSpan = Math.max(0.1, rangeMax - rangeMin);
+    
+    const getOffsetPct = (msVal) => {
+      const ratio = (msVal - rangeMin) / rangeSpan;
+      return Math.max(0, Math.min(100, ratio * 100)).toFixed(1);
+    };
 
+    const off100 = getOffsetPct(100);
+    const off300 = getOffsetPct(300);
+    const off500 = getOffsetPct(500);
+
+    const topColor = rangeMax > 500 ? '#EF4444' : (rangeMax > 200 ? '#F59E0B' : '#22C55E');
+    const topOpacity = rangeMax > 500 ? '0.28' : '0.15';
+
+    return `
+      <defs>
+        <linearGradient id="${gradIdLine}" x1="0" y1="1" x2="0" y2="0">
+          <stop offset="0%" stop-color="#22C55E"/>
+          <stop offset="${off100}%" stop-color="#22C55E"/>
+          <stop offset="${off300}%" stop-color="#F59E0B"/>
+          <stop offset="${off500}%" stop-color="#EF4444"/>
+          <stop offset="100%" stop-color="${topColor}"/>
+        </linearGradient>
+        <linearGradient id="${gradIdArea}" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stop-color="${topColor}" stop-opacity="${topOpacity}"/>
+          <stop offset="60%" stop-color="#22C55E" stop-opacity="0.10"/>
+          <stop offset="100%" stop-color="#22C55E" stop-opacity="0.0"/>
+        </linearGradient>
+      </defs>`;
+  }
+
+  _renderSparkline(points, isInternalCall = false) {
+    const wrap = document.getElementById('drawerSparkline');
+    const badge = document.getElementById('drawerSparklineBadge');
+    const resetBtn = document.getElementById('sparklineResetZoomBtn');
+    const statNow = document.getElementById('spStatNow');
+    const statAvg = document.getElementById('spStatAvg');
+    const statP95 = document.getElementById('spStatP95');
+    const statMax = document.getElementById('spStatMax');
+
+    if (!wrap) return;
+
+    if (!isInternalCall) {
+      this._rawSparklinePoints = Array.isArray(points) ? points : [];
+      if (!this._sparklineZoomRange) {
+        if (resetBtn) resetBtn.style.display = 'none';
+      }
+    }
+
+    if (!Array.isArray(points) || points.length < 2) {
+      if (statNow) statNow.textContent = '—';
+      if (statAvg) statAvg.textContent = '—';
+      if (statP95) statP95.textContent = '—';
+      if (statMax) statMax.textContent = '—';
+      if (badge) badge.style.display = 'none';
+      if (resetBtn) resetBtn.style.display = 'none';
+      wrap.innerHTML = '<div class="de-empty" style="padding:15px; font-size:12px; color:var(--text-secondary); text-align:center;">Tidak ada data tren response time untuk rentang ini</div>';
+      return;
+    }
+
+    // Apply zoom filtering if active
+    let activePoints = points;
+    if (this._sparklineZoomRange) {
+      const { tMin, tMax } = this._sparklineZoomRange;
+      const filtered = points.filter(p => p[0] >= tMin && p[0] <= tMax);
+      if (filtered.length >= 2) {
+        activePoints = filtered;
+        if (resetBtn) resetBtn.style.display = 'inline-flex';
+      } else {
+        this._sparklineZoomRange = null;
+        if (resetBtn) resetBtn.style.display = 'none';
+      }
+    }
+
+    const lats = activePoints.map(p => p[1]);
+    const nowVal = lats[lats.length - 1];
+    const minL = Math.min(...lats);
+    const maxL = Math.max(...lats);
+    const avgL = lats.reduce((a, b) => a + b, 0) / lats.length;
+
+    const sortedLats = [...lats].sort((a, b) => a - b);
+    const p95Idx = Math.min(sortedLats.length - 1, Math.floor(sortedLats.length * 0.95));
+    const p95L = sortedLats[p95Idx];
+
+    // Update Header Summary Cards strictly based on visible activePoints
+    if (statNow) statNow.textContent = `${nowVal.toFixed(1)} ms`;
+    if (statAvg) statAvg.textContent = `${avgL.toFixed(1)} ms`;
+    if (statP95) statP95.textContent = `${p95L.toFixed(1)} ms`;
+    if (statMax) statMax.textContent = `${maxL.toFixed(1)} ms`;
+
+    // Status Badge & Accent Color based on thresholds
+    let accentColor = 'var(--accent)';
+    let badgeLabel = 'Normal (<200ms)';
+    let badgeBg = 'rgba(34, 197, 94, 0.15)';
+    let badgeFg = '#22C55E';
+
+    if (maxL > 1000) {
+      accentColor = '#EF4444';
+      badgeLabel = 'Spike (>1000ms)';
+      badgeBg = 'rgba(239, 68, 68, 0.15)';
+      badgeFg = '#EF4444';
+    } else if (p95L > 200 || maxL > 300) {
+      accentColor = '#F59E0B';
+      badgeLabel = 'Degraded (>200ms)';
+      badgeBg = 'rgba(245, 158, 11, 0.15)';
+      badgeFg = '#F59E0B';
+    }
+
+    if (badge) {
+      badge.textContent = badgeLabel;
+      badge.style.background = badgeBg;
+      badge.style.color = badgeFg;
+      badge.style.display = 'inline-block';
+    }
+
+    // Geometry calculations
     const width = 300;
     const height = 50;
     const pad = 4;
 
-    const lats = points.map(p => p[1]);
-    let minL = Math.min(...lats);
-    let maxL = Math.max(...lats);
-    if (minL === maxL) {
-      minL = Math.max(0, minL - 2);
-      maxL = maxL + 2;
+    let rangeMin = minL;
+    let rangeMax = maxL;
+    if (rangeMin === rangeMax) {
+      rangeMin = Math.max(0, rangeMin - 2);
+      rangeMax = rangeMax + 2;
     }
 
+    const t0 = activePoints[0][0];
+    const tN = activePoints[activePoints.length - 1][0];
+    const dt = Math.max(1, tN - t0);
+
+    const pts = activePoints.map(p => {
+      const x = (((p[0] - t0) / dt) * width).toFixed(1);
+      const y = (height - pad - (((p[1] - rangeMin) / (rangeMax - rangeMin)) * (height - (pad * 2)))).toFixed(1);
+      return { x: parseFloat(x), y: parseFloat(y), t: p[0], val: p[1] };
+    });
+
+    const lineD = 'M' + pts.map(p => `${p.x},${p.y}`).join(' L');
+    const areaD = `${lineD} L${width},${height} L0,${height}Z`;
+
+    // Time axis label formatting helper
+    const fmtTime = (ts) => {
+      const d = new Date(ts * 1000);
+      const isLongRange = (tN - t0) > 86400; // >24h
+      if (isLongRange) {
+        return d.toLocaleDateString('id-ID', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' });
+      }
+      return d.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    };
+
+    const t0Str = fmtTime(t0);
+    const tMidStr = fmtTime(t0 + (tN - t0) / 2);
+    const tNStr = fmtTime(tN);
+
+    const defsHtml = this._buildMSGradientDefs(rangeMin, rangeMax, 'sgLineGrad', 'sgAreaGrad');
+
+    // Build SVG & Overlay HTML
+    wrap.innerHTML = `
+      <div class="sparkline-svg-wrap" id="sparklineSvgWrap" style="user-select:none;">
+        <svg class="sparkline" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">
+          ${defsHtml}
+          <!-- Grid Lines -->
+          <line x1="0" y1="${height / 2}" x2="${width}" y2="${height / 2}" stroke="var(--border)" stroke-dasharray="2,2" stroke-width="0.5"/>
+          
+          <!-- Area & Line -->
+          <path class="spark-area" d="${areaD}" fill="url(#sgAreaGrad)"/>
+          <path class="spark-line" d="${lineD}" fill="none" stroke="url(#sgLineGrad)" stroke-width="1.5" vector-effect="non-scaling-stroke" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        
+        <div class="sparkline-selection-box" id="spSelectBox" style="display:none;"></div>
+        <div class="sparkline-tracker" id="spTracker" style="display:none;"></div>
+        <div class="sparkline-dot" id="spDot" style="display:none; background:${accentColor}; box-shadow:0 0 8px ${accentColor};"></div>
+        <div class="sparkline-tooltip" id="spTooltip" style="display:none;"></div>
+      </div>
+      <div class="sparkline-x-axis">
+        <span>${t0Str}</span>
+        <span>${tMidStr}</span>
+        <span>${tNStr}</span>
+      </div>`;
+
+    // Attach Interactive Tooltip & Drag-to-Zoom / Pan Handlers
+    const svgWrap = wrap.querySelector('#sparklineSvgWrap');
+    const selectBox = wrap.querySelector('#spSelectBox');
+    const tracker = wrap.querySelector('#spTracker');
+    const dot = wrap.querySelector('#spDot');
+    const tooltip = wrap.querySelector('#spTooltip');
+
+    if (!svgWrap || !tracker || !dot || !tooltip) return;
+
+    let isMouseDown = false;
+    let dragStartX = 0;
+    let isDraggingZoom = false;
+
+    const onPointerDown = (e) => {
+      isMouseDown = true;
+      const rect = svgWrap.getBoundingClientRect();
+      const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+      dragStartX = clientX - rect.left;
+      isDraggingZoom = false;
+    };
+
+    const onPointerMove = (e) => {
+      const rect = svgWrap.getBoundingClientRect();
+      const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+      const currentX = Math.max(0, Math.min(rect.width, clientX - rect.left));
+
+      if (isMouseDown) {
+        const deltaX = Math.abs(currentX - dragStartX);
+        if (deltaX > 6) {
+          isDraggingZoom = true;
+          const leftX = Math.min(dragStartX, currentX);
+          const boxW = Math.abs(currentX - dragStartX);
+          selectBox.style.left = `${leftX}px`;
+          selectBox.style.width = `${boxW}px`;
+          selectBox.style.display = 'block';
+
+          tracker.style.display = 'none';
+          dot.style.display = 'none';
+          tooltip.style.display = 'none';
+          return;
+        }
+      }
+
+      if (clientX < rect.left || clientX > rect.right) {
+        onPointerLeave();
+        return;
+      }
+
+      const relX = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+      const targetT = t0 + relX * (tN - t0);
+
+      // Binary search for nearest point by timestamp
+      let low = 0;
+      let high = pts.length - 1;
+      let closest = pts[0];
+      let minDiff = Math.abs(pts[0].t - targetT);
+
+      while (low <= high) {
+        const mid = (low + high) >> 1;
+        const diff = Math.abs(pts[mid].t - targetT);
+        if (diff < minDiff) {
+          minDiff = diff;
+          closest = pts[mid];
+        }
+        if (pts[mid].t < targetT) low = mid + 1;
+        else high = mid - 1;
+      }
+
+      const pointX = (closest.x / width) * rect.width;
+      const pointY = (closest.y / height) * rect.height;
+
+      tracker.style.left = `${pointX}px`;
+      tracker.style.display = 'block';
+
+      dot.style.left = `${pointX}px`;
+      dot.style.top = `${pointY}px`;
+      dot.style.display = 'block';
+
+      const valColor = closest.val > 500 ? '#EF4444' : (closest.val > 200 ? '#F59E0B' : '#22C55E');
+      dot.style.background = valColor;
+      dot.style.boxShadow = `0 0 8px ${valColor}`;
+
+      const dObj = new Date(closest.t * 1000);
+      const timeLabel = dObj.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      const statusText = closest.val > 500 ? 'SLOW' : (closest.val === 0 ? 'DOWN' : 'UP');
+
+      tooltip.innerHTML = `
+        <div style="font-weight:600; color:var(--text-secondary); margin-bottom:2px; font-size:10px;">Time: <span style="color:#fff;">${timeLabel}</span></div>
+        <div style="font-weight:600; color:var(--text-secondary); margin-bottom:2px; font-size:10px;">Response Time: <span style="color:${valColor}; font-weight:700;">${closest.val.toFixed(1)} ms</span></div>
+        <div style="font-weight:600; color:var(--text-secondary); font-size:10px;">Status: <span style="color:${valColor}; font-weight:700;">${statusText}</span></div>
+      `;
+      
+      const clampX = Math.max(45, Math.min(rect.width - 45, pointX));
+      tooltip.style.left = `${clampX}px`;
+      tooltip.style.top = `${Math.max(25, pointY)}px`;
+      tooltip.style.display = 'block';
+    };
+
+    const onPointerUp = (e) => {
+      if (isMouseDown && isDraggingZoom) {
+        const rect = svgWrap.getBoundingClientRect();
+        const clientX = e.changedTouches ? e.changedTouches[0].clientX : e.clientX;
+        const currentX = Math.max(0, Math.min(rect.width, clientX - rect.left));
+        
+        const minX = Math.min(dragStartX, currentX);
+        const maxX = Math.max(dragStartX, currentX);
+
+        const relMinX = Math.max(0, Math.min(1, minX / rect.width));
+        const relMaxX = Math.max(0, Math.min(1, maxX / rect.width));
+
+        const zoomTMin = t0 + relMinX * (tN - t0);
+        const zoomTMax = t0 + relMaxX * (tN - t0);
+
+        if (zoomTMax - zoomTMin > 3) {
+          this._sparklineZoomRange = { tMin: zoomTMin, tMax: zoomTMax };
+          if (resetBtn) resetBtn.style.display = 'inline-flex';
+          this._renderSparkline(this._rawSparklinePoints, true);
+        }
+      }
+      isMouseDown = false;
+      isDraggingZoom = false;
+      if (selectBox) selectBox.style.display = 'none';
+    };
+
+    const onPointerLeave = () => {
+      isMouseDown = false;
+      isDraggingZoom = false;
+      if (selectBox) selectBox.style.display = 'none';
+      tracker.style.display = 'none';
+      dot.style.display = 'none';
+      tooltip.style.display = 'none';
+    };
+
+    svgWrap.addEventListener('mousedown', onPointerDown);
+    svgWrap.addEventListener('mousemove', onPointerMove);
+    svgWrap.addEventListener('mouseup', onPointerUp);
+    svgWrap.addEventListener('mouseleave', onPointerLeave);
+
+    svgWrap.addEventListener('touchstart', onPointerDown, { passive: true });
+    svgWrap.addEventListener('touchmove', onPointerMove, { passive: true });
+    svgWrap.addEventListener('touchend', onPointerUp, { passive: true });
+  }
+
+  _renderHistoryChart(points) {
+    const wrap = document.getElementById('drawerHistoryChart');
+    const elMin = document.getElementById('histMinVal');
+    const elAvg = document.getElementById('histAvgVal');
+    const elP95 = document.getElementById('histP95Val');
+    const elMax = document.getElementById('histMaxVal');
+    const elList = document.getElementById('drawerHistoryDatapointsList');
+
+    if (!wrap) return;
+    if (!Array.isArray(points) || points.length < 2) {
+      if (elMin) elMin.textContent = '—';
+      if (elAvg) elAvg.textContent = '—';
+      if (elP95) elP95.textContent = '—';
+      if (elMax) elMax.textContent = '—';
+      if (elList) elList.innerHTML = '<div class="de-empty" style="padding:10px; font-size:12px;">Tidak ada data poin latensi</div>';
+      wrap.innerHTML = '<div class="de-empty" style="padding:25px; font-size:12px; color:var(--text-secondary); text-align:center;">Tidak ada histori latensi untuk rentang ini</div>';
+      return;
+    }
+
+    const lats = points.map(p => p[1]);
+    const minL = Math.min(...lats);
+    const maxL = Math.max(...lats);
+    const avgL = lats.reduce((a, b) => a + b, 0) / lats.length;
+    const sorted = [...lats].sort((a, b) => a - b);
+    const p95L = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95))];
+
+    if (elMin) elMin.textContent = `${minL.toFixed(1)} ms`;
+    if (elAvg) elAvg.textContent = `${avgL.toFixed(1)} ms`;
+    if (elP95) elP95.textContent = `${p95L.toFixed(1)} ms`;
+    if (elMax) elMax.textContent = `${maxL.toFixed(1)} ms`;
+
+    // Render full datapoints list across selected range
+    const histPointsCountBadge = document.getElementById('histPointsCountBadge');
+    if (histPointsCountBadge) {
+      histPointsCountBadge.textContent = `${points.length.toLocaleString()} points`;
+    }
+
+    if (elList) {
+      const recentPts = [...points].reverse();
+      elList.innerHTML = recentPts.map(p => {
+        const dObj = new Date(p[0] * 1000);
+        const timeStr = dObj.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        const dateStr = dObj.toLocaleDateString('id-ID', { day: '2-digit', month: 'short' });
+        const latVal = p[1];
+        const isSlow = latVal > 500;
+        const color = isSlow ? '#F59E0B' : '#22C55E';
+        return `
+          <div style="display:flex; justify-content:space-between; align-items:center; padding:4px 8px; background:rgba(15,23,42,0.6); border:1px solid var(--border); border-radius:4px; font-size:11px; font-family:var(--font-mono);">
+            <span style="color:var(--text-secondary);">${dateStr} ${timeStr}</span>
+            <span style="font-weight:700; color:${color};">${latVal.toFixed(1)} ms</span>
+          </div>`;
+      }).join('');
+    }
+
+    // SVG Chart
+    const width = 600;
+    const height = 140;
+    const pad = 8;
     const t0 = points[0][0];
     const tN = points[points.length - 1][0];
     const dt = Math.max(1, tN - t0);
 
+    let rangeMin = minL;
+    let rangeMax = maxL;
+    if (rangeMin === rangeMax) {
+      rangeMin = Math.max(0, rangeMin - 2);
+      rangeMax = rangeMax + 2;
+    }
+
     const pts = points.map(p => {
       const x = (((p[0] - t0) / dt) * width).toFixed(1);
-      const y = (height - pad - (((p[1] - minL) / (maxL - minL)) * (height - (pad * 2)))).toFixed(1);
-      return `${x},${y}`;
+      const y = (height - pad - (((p[1] - rangeMin) / (rangeMax - rangeMin)) * (height - (pad * 2)))).toFixed(1);
+      return { x: parseFloat(x), y: parseFloat(y), t: p[0], val: p[1] };
     });
 
-    const lineD = 'M' + pts.join(' L');
+    const lineD = 'M' + pts.map(p => `${p.x},${p.y}`).join(' L');
     const areaD = `${lineD} L${width},${height} L0,${height}Z`;
 
+    const defsHistHtml = this._buildMSGradientDefs(rangeMin, rangeMax, 'sgHistLineGrad', 'sgHistGrad');
+
     wrap.innerHTML = `
-      <svg class="sparkline" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">
-        <defs>
-          <linearGradient id="sg" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stop-color="var(--accent)" stop-opacity="0.3"/>
-            <stop offset="100%" stop-color="var(--accent)" stop-opacity="0"/>
-          </linearGradient>
-        </defs>
-        <path class="spark-area" d="${areaD}" fill="url(#sg)"/>
-        <path class="spark-line" d="${lineD}" fill="none" stroke="var(--accent)" stroke-width="1.5" stroke-linecap="round"/>
-      </svg>`;
+      <div class="sparkline-svg-wrap" id="histSvgWrap" style="height:140px;">
+        <svg class="sparkline" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">
+          ${defsHistHtml}
+          <line x1="0" y1="${height * 0.25}" x2="${width}" y2="${height * 0.25}" stroke="var(--border)" stroke-dasharray="2,2" stroke-width="0.5"/>
+          <line x1="0" y1="${height * 0.5}" x2="${width}" y2="${height * 0.5}" stroke="var(--border)" stroke-dasharray="2,2" stroke-width="0.5"/>
+          <line x1="0" y1="${height * 0.75}" x2="${width}" y2="${height * 0.75}" stroke="var(--border)" stroke-dasharray="2,2" stroke-width="0.5"/>
+          <path class="spark-area" d="${areaD}" fill="url(#sgHistGrad)"/>
+          <path class="spark-line" d="${lineD}" fill="none" stroke="url(#sgHistLineGrad)" stroke-width="1.5" vector-effect="non-scaling-stroke" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <div class="sparkline-tracker" id="histTracker" style="display:none;"></div>
+        <div class="sparkline-dot" id="histDot" style="display:none; background:var(--accent);"></div>
+        <div class="sparkline-tooltip" id="histTooltip" style="display:none;"></div>
+      </div>`;
+
+    const svgWrap = wrap.querySelector('#histSvgWrap');
+    const tracker = wrap.querySelector('#histTracker');
+    const dot = wrap.querySelector('#histDot');
+    const tooltip = wrap.querySelector('#histTooltip');
+
+    if (!svgWrap || !tracker || !dot || !tooltip) return;
+
+    const onPointerMove = (e) => {
+      const rect = svgWrap.getBoundingClientRect();
+      const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+      if (clientX < rect.left || clientX > rect.right) {
+        onPointerLeave();
+        return;
+      }
+
+      const relX = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+      const targetT = t0 + relX * (tN - t0);
+
+      let low = 0;
+      let high = pts.length - 1;
+      let closest = pts[0];
+      let minDiff = Math.abs(pts[0].t - targetT);
+
+      while (low <= high) {
+        const mid = (low + high) >> 1;
+        const diff = Math.abs(pts[mid].t - targetT);
+        if (diff < minDiff) {
+          minDiff = diff;
+          closest = pts[mid];
+        }
+        if (pts[mid].t < targetT) low = mid + 1;
+        else high = mid - 1;
+      }
+
+      const pointX = (closest.x / width) * rect.width;
+      const pointY = (closest.y / height) * rect.height;
+
+      tracker.style.left = `${pointX}px`;
+      tracker.style.display = 'block';
+
+      dot.style.left = `${pointX}px`;
+      dot.style.top = `${pointY}px`;
+      dot.style.display = 'block';
+
+      const valColor = closest.val > 500 ? '#EF4444' : (closest.val > 200 ? '#F59E0B' : '#22C55E');
+      dot.style.background = valColor;
+      dot.style.boxShadow = `0 0 8px ${valColor}`;
+
+      const dObj = new Date(closest.t * 1000);
+      const timeLabel = dObj.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      const statusText = closest.val > 500 ? 'SLOW' : (closest.val === 0 ? 'DOWN' : 'UP');
+
+      tooltip.innerHTML = `
+        <div style="font-weight:600; color:var(--text-secondary); margin-bottom:2px; font-size:10px;">Time: <span style="color:#fff;">${timeLabel}</span></div>
+        <div style="font-weight:600; color:var(--text-secondary); margin-bottom:2px; font-size:10px;">Response Time: <span style="color:${valColor}; font-weight:700;">${closest.val.toFixed(1)} ms</span></div>
+        <div style="font-weight:600; color:var(--text-secondary); font-size:10px;">Status: <span style="color:${valColor}; font-weight:700;">${statusText}</span></div>
+      `;
+      const clampX = Math.max(50, Math.min(rect.width - 50, pointX));
+      tooltip.style.left = `${clampX}px`;
+      tooltip.style.top = `${Math.max(25, pointY)}px`;
+      tooltip.style.display = 'block';
+    };
+
+    const onPointerLeave = () => {
+      tracker.style.display = 'none';
+      dot.style.display = 'none';
+      tooltip.style.display = 'none';
+    };
+
+    svgWrap.addEventListener('mousemove', onPointerMove);
+    svgWrap.addEventListener('mouseleave', onPointerLeave);
   }
 
   async loadTargetHistory(targetInstance) {
@@ -2169,7 +2891,14 @@ class InstancesPage {
     const controller = new AbortController();
     this._historyAbortController = controller;
 
+    const rangeText = this.periodLabel === 'custom' ? 'Custom' : (this.periodLabel || '24h');
+    const drawerSparklineRangeEl = document.getElementById('drawerSparklineRange');
+    if (drawerSparklineRangeEl) drawerSparklineRangeEl.textContent = `(${rangeText})`;
+    const historyRangeTag = document.getElementById('historyRangeTag');
+    if (historyRangeTag) historyRangeTag.textContent = `Histori (${rangeText})`;
+
     const logsList = document.getElementById('drawerLogsList');
+    const eventsBadge = document.getElementById('eventsCountBadge');
     if (!logsList) return;
     logsList.innerHTML = '<div class="de-empty" style="padding:10px; font-size:12px; color:var(--text-secondary);">Memuat log histori Prometheus...</div>';
 
@@ -2182,12 +2911,25 @@ class InstancesPage {
       
       if (data.ok && Array.isArray(data.latency_points) && data.latency_points.length > 1) {
         this._renderSparkline(data.latency_points);
+        this._renderHistoryChart(data.latency_points);
+      } else {
+        this._renderSparkline([]);
+        this._renderHistoryChart([]);
       }
 
+      this._renderDrawerAvailabilityBars(this.selectedTarget, data.latency_points || [], data.events || []);
+
       if (!data.ok || !Array.isArray(data.events) || data.events.length === 0) {
-        logsList.innerHTML = '<div class="de-empty" style="padding:10px; font-size:12px; color:var(--text-secondary);">Tidak ada log insiden/downtime pada rentang ini</div>';
+        logsList.innerHTML = '<div style="padding: 12px; background: rgba(34, 197, 94, 0.1); border: 1px solid rgba(34, 197, 94, 0.2); border-radius: 8px; font-size: 12px; color: #22C55E; display: flex; align-items: center; gap: 8px;"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg> <span>Target 100% Online — Tidak ada insiden downtime pada rentang ini</span></div>';
+        if (eventsBadge) eventsBadge.textContent = '0 events';
+        this._renderDrawerRecentEvents([]);
+        this._renderDrawerProbeSummary(this.selectedTarget, []);
         return;
       }
+
+      if (eventsBadge) eventsBadge.textContent = `${data.events.length} events`;
+      this._renderDrawerRecentEvents(data.events);
+      this._renderDrawerProbeSummary(this.selectedTarget, data.events);
 
       logsList.innerHTML = data.events.map(ev => {
         const isOnline = ev.status === 'ONLINE';
@@ -2200,15 +2942,20 @@ class InstancesPage {
         const durationStr = this._fmtDownAging(ev.duration_seconds * 1000);
         const ongoingBadge = ev.ongoing ? '<span style="font-size:10px; background:rgba(56,189,248,0.15); color:#38BDF8; padding:1px 5px; border-radius:3px; margin-left:6px; font-weight:500;">Berjalan</span>' : '';
 
+        const summaryText = ev.summary && !ev.summary.startsWith('Target ONLINE') && !ev.summary.startsWith('Target OFFLINE')
+          ? `<div style="font-size:10px; color:var(--text-muted); margin-top:1px;">${ev.summary}</div>`
+          : '';
+
         return `
           <div class="de-row" style="display:flex; align-items:center; justify-content:space-between; padding:8px 10px; background:var(--surface); border:1px solid var(--border); border-radius:var(--r-sm); margin-bottom:6px; font-size:12px;">
             <div style="display:flex; align-items:center; gap:8px;">
               <span style="width:8px; height:8px; border-radius:50%; background:${dotBg}; display:inline-block; flex-shrink:0;"></span>
               <div>
-                <div style="font-weight:600; color:${statusColor}; display:flex; align-items:center;">
+                <div style="font-weight:600; color:${statusColor}; display:flex; align-items:center; gap:6px;">
                   ${statusText} ${ongoingBadge}
                 </div>
                 <div style="font-size:11px; color:var(--text-secondary); margin-top:2px;">${dateStr}</div>
+                ${summaryText}
               </div>
             </div>
             <div style="text-align:right;">

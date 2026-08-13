@@ -183,7 +183,7 @@ DEFAULT_JOB_FILTER = os.environ.get("JOB_FILTER", "all")
 
 # Minimal shape check for the Add Target form — not full RFC validation, just
 # enough to reject obvious garbage (e.g. a bare number) before it's written to
-# websites.yml. Bare Docker/internal hostnames without a dot (e.g. "nginx")
+# websites.yml. Bare Docker/internal hostnames without a dot (e.g. "webapp")
 # are intentionally allowed — that's a real, valid target shape here.
 TARGET_HOST_RE = re.compile(r'^[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?)*$')
 
@@ -246,9 +246,6 @@ def load_website_targets():
                         urls.append(u)
         except Exception as e:
             print(f"Error loading targets: {e}", flush=True)
-    if not os.path.exists(target_file) and not urls:
-        urls = ["http://nginx"]
-        save_website_targets(urls)
     return urls
 
 def save_website_targets(urls):
@@ -323,7 +320,7 @@ def fetch_url(url, timeout=1.5):
         pass
     return None
 
-def fetch_prometheus_json(path, use_cache=True, cache_ttl=None):
+def fetch_prometheus_json(path, use_cache=True, cache_ttl=None, timeout=None):
     global LAST_WORKING_PROMETHEUS_URL, PROMETHEUS_CACHE
     if cache_ttl is None:
         cache_ttl = PROMETHEUS_CACHE_TTL_DEFAULT
@@ -363,8 +360,11 @@ def fetch_prometheus_json(path, use_cache=True, cache_ttl=None):
                 candidates.append(base_url)
 
         for base_url in candidates:
-            timeout = 0.8 if (base_url == active_url or base_url == LAST_WORKING_PROMETHEUS_URL) else 0.3
-            raw = fetch_url(f"{base_url.rstrip('/')}{path}", timeout=timeout)
+            if timeout is None:
+                req_timeout = 2.5 if (base_url == active_url or base_url == LAST_WORKING_PROMETHEUS_URL) else 0.8
+            else:
+                req_timeout = timeout
+            raw = fetch_url(f"{base_url.rstrip('/')}{path}", timeout=req_timeout)
             if raw:
                 try:
                     data = json.loads(raw)
@@ -885,9 +885,9 @@ def delete_dependency_api(dep_id):
     save_json(DEPENDENCIES_FILE, remaining)
     return jsonify({"ok": True})
 
-def fetch_prom_query_map(query_expr, cache_ttl=5.0):
+def fetch_prom_query_map(query_expr, cache_ttl=5.0, timeout=None):
     from urllib.parse import quote
-    raw, base = fetch_prometheus_json(f"/api/v1/query?query={quote(query_expr)}", use_cache=True, cache_ttl=cache_ttl)
+    raw, base = fetch_prometheus_json(f"/api/v1/query?query={quote(query_expr)}", use_cache=True, cache_ttl=cache_ttl, timeout=timeout)
     val_map = {}
     if raw and raw.get('status') == 'success':
         results = raw.get('data', {}).get('result', [])
@@ -1246,30 +1246,46 @@ def api_availability():
 
     from concurrent.futures import ThreadPoolExecutor
 
+    req_timeout = max(4.0, min(25.0, minutes / 1500.0))
+
     queries = {
-        'avail': f"avg_over_time(probe_success[{minutes_int}m]{at_suffix}) * 100",
-        'count': f"count_over_time(probe_success[{minutes_int}m]{at_suffix})",
+        'probe_avail': f"avg_over_time(probe_success[{minutes_int}m]{at_suffix}) * 100",
+        'up_avail': f"avg_over_time(up[{minutes_int}m]{at_suffix}) * 100",
+        'probe_count': f"count_over_time(probe_success[{minutes_int}m]{at_suffix})",
+        'up_count': f"count_over_time(up[{minutes_int}m]{at_suffix})",
         'duration': f"avg_over_time(probe_duration_seconds[{minutes_int}m]{at_suffix}) * 1000",
-        'incidents': f"changes(probe_success[{minutes_int}m]{at_suffix})",
-        'live': "probe_success" if end_ts is None else None
+        'probe_incidents': f"changes(probe_success[{minutes_int}m]{at_suffix})",
+        'up_incidents': f"changes(up[{minutes_int}m]{at_suffix})",
+        'live_probe': "probe_success" if end_ts is None else None,
+        'live_up': "up" if end_ts is None else None
     }
 
     results = {}
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = {k: executor.submit(fetch_prom_query_map, q) for k, q in queries.items() if q}
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {k: executor.submit(fetch_prom_query_map, q, 5.0, req_timeout) for k, q in queries.items() if q}
         for k, f in futures.items():
             try:
                 results[k] = f.result()
             except Exception:
                 results[k] = {}
 
-    avail_map = results.get('avail') or fetch_prom_query_map(f"avg_over_time(up[{minutes_int}m]{at_suffix}) * 100")
-    count_map = results.get('count', {})
+    probe_avail = results.get('probe_avail', {})
+    up_avail = results.get('up_avail', {})
+    avail_map = {**up_avail, **probe_avail}
+
+    probe_count = results.get('probe_count', {})
+    up_count = results.get('up_count', {})
+    count_map = {**up_count, **probe_count}
+
+    probe_incidents = results.get('probe_incidents', {})
+    up_incidents = results.get('up_incidents', {})
+    incidents_map = {**up_incidents, **probe_incidents}
+
     duration_map = results.get('duration', {})
-    incidents_map = results.get('incidents', {})
-    live_map = results.get('live', {})
-    if not live_map and end_ts is None:
-        live_map = fetch_prom_query_map("up")
+
+    live_probe = results.get('live_probe', {})
+    live_up = results.get('live_up', {})
+    live_map = {**live_up, **live_probe}
 
     entries = []
     counts = {"online": 0, "warning": 0, "offline": 0}
@@ -1291,9 +1307,18 @@ def api_availability():
         if raw_count is not None:
             try:
                 sample_count = max(0.0, float(raw_count))
-                denominator_minutes = min(sample_count * SCRAPE_INTERVAL_SECONDS / 60.0, minutes)
+                if sample_count > 0:
+                    inferred_interval_sec = (minutes * 60.0) / sample_count
+                    if inferred_interval_sec >= 1.0:
+                        denominator_minutes = min(sample_count * inferred_interval_sec / 60.0, minutes)
+                    else:
+                        denominator_minutes = min(sample_count * SCRAPE_INTERVAL_SECONDS / 60.0, minutes)
+                else:
+                    denominator_minutes = 0.0
             except (TypeError, ValueError):
                 denominator_minutes = 0.0
+        elif availability_pct is not None:
+            denominator_minutes = float(minutes)
 
         downtime_minutes = (
             round(denominator_minutes * (1 - availability_pct / 100.0), 2)
@@ -1486,15 +1511,87 @@ def target_history_api():
                 "ongoing": is_ongoing
             })
 
+    # Always merge all sources: Prometheus range states + logs.json + history.json
+    raw_events = list(events)
+    logs = load_json(LOGS_FILE, [])
+    history_records = load_json(HISTORY_FILE, [])
+    combined_sources = logs + history_records
+
+    for item in combined_sources:
+        inst = item.get('instance') or ''
+        ts = item.get('time')
+        if ts and (inst == target_url or clean_target in inst) and start_ts <= ts <= end_ts:
+            ev_type = item.get('event') or item.get('status')
+            is_up = ev_type in ('resolved', 'ONLINE', 'up')
+            dur = item.get('duration_seconds') or 0
+            start_t = int(ts - dur if dur else ts)
+            
+            raw_events.append({
+                "status": "ONLINE" if is_up else "OFFLINE",
+                "start_ts": start_t,
+                "end_ts": int(ts),
+                "duration_seconds": int(dur),
+                "ongoing": False,
+                "summary": item.get('summary') or (f"Target {'ONLINE' if is_up else 'OFFLINE'}")
+            })
+
+    # Deduplicate using composite key matching: instance + status + start_ts/end_ts window + summary
+    deduped_events = []
+    for candidate in raw_events:
+        c_status = candidate['status']
+        c_start = candidate['start_ts']
+        c_end = candidate.get('end_ts', c_start)
+        c_ongoing = candidate.get('ongoing', False)
+        c_summary = candidate.get('summary', '')
+
+        match = None
+        for existing in deduped_events:
+            if existing['status'] == c_status:
+                time_close = abs(existing['start_ts'] - c_start) <= 15 or abs(existing['end_ts'] - c_end) <= 15
+                summary_match = (
+                    not c_summary or not existing.get('summary') or 
+                    c_summary == existing.get('summary') or 
+                    'Target ONLINE' in c_summary or 'Target OFFLINE' in c_summary or
+                    'Target ONLINE' in existing.get('summary', '') or 'Target OFFLINE' in existing.get('summary', '')
+                )
+                if time_close and summary_match:
+                    match = existing
+                    break
+                if c_ongoing and existing.get('ongoing'):
+                    match = existing
+                    break
+
+        if match:
+            if c_ongoing and not match.get('ongoing'):
+                match['ongoing'] = True
+                match['end_ts'] = candidate['end_ts']
+            if c_summary and (not match.get('summary') or 'Target ONLINE' in match.get('summary', '') or 'Target OFFLINE' in match.get('summary', '')):
+                match['summary'] = c_summary
+            if candidate.get('duration_seconds', 0) > match.get('duration_seconds', 0):
+                match['duration_seconds'] = candidate['duration_seconds']
+        else:
+            deduped_events.append(candidate)
+
+    # Sort descending: Ongoing/Current event at very top (NOW), followed by historical events by end_ts / start_ts
+    def get_event_sort_key(ev):
+        is_ongoing = 2 if ev.get('ongoing') else 1
+        end_t = ev.get('end_ts') or ev.get('start_ts') or 0
+        start_t = ev.get('start_ts') or 0
+        return (is_ongoing, end_t, start_t)
+
+    deduped_events.sort(key=get_event_sort_key, reverse=True)
+    events = deduped_events
+
     # Fetch latency range history for sparkline graph
     latency_points = []
+    dur_step = max(15, int((end_ts - start_ts) / 300))
     dur_queries = [
         f'probe_duration_seconds{{instance="{target_url}"}} * 1000',
         f'probe_duration_seconds{{instance=~".*{re.escape(clean_target)}.*"}} * 1000',
         'probe_duration_seconds * 1000'
     ]
     for dq in dur_queries:
-        dur_path = f"/api/v1/query_range?query={quote(dq)}&start={start_ts}&end={end_ts}&step={step}"
+        dur_path = f"/api/v1/query_range?query={quote(dq)}&start={start_ts}&end={end_ts}&step={dur_step}"
         raw_dur, _ = fetch_prometheus_json(dur_path)
         if raw_dur and raw_dur.get('status') == 'success':
             for r in raw_dur.get('data', {}).get('result', []):
@@ -1511,7 +1608,18 @@ def target_history_api():
             if latency_points:
                 break
 
-    events.reverse()
+    if not latency_points:
+        logs = load_json(LOGS_FILE, [])
+        log_points = []
+        for l in logs:
+            inst = l.get('instance') or ''
+            ts = l.get('time')
+            lat = l.get('latency_ms')
+            if ts and lat is not None and (inst == target_url or clean_target in inst):
+                if start_ts <= ts <= end_ts:
+                    log_points.append([int(ts), round(float(lat), 1)])
+        log_points.sort(key=lambda x: x[0])
+        latency_points = log_points
 
     return jsonify({
         "ok": True,

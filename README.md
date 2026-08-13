@@ -218,19 +218,19 @@ docker compose ps
 
 ### 1. Pengujian Simulasi Maintenance Mode
 1. Masuk ke Web Console `http://<IP-SERVER-UBUNTU>:5000`.
-2. Buka menu Maintenance dan tambahkan target `http://nginx`.
-3. Matikan container nginx (`docker stop nginx`).
+2. Buka menu Maintenance dan tambahkan target `http://webapp`.
+3. Matikan container target (`docker stop webapp`).
 4. **Hasil**: Target ditandai sedang maintenance, badge visual menjadi kuning, dan sirine suara **tidak akan berbunyi**.
 
 ### 2. Pengujian Simulasi Website Down (Sirine Alarm)
-1. Matikan container nginx tanpa status maintenance:
+1. Matikan container target tanpa status maintenance:
    ```bash
-   docker stop nginx
+   docker stop webapp
    ```
 2. Dalam kurun waktu 5–10 detik, indikator target berubah menjadi merah (`CRITICAL`), sirine suara MP3 berbunyi, dan log insiden tercatat secara real-time.
 3. Hidupkan kembali container:
    ```bash
-   docker start nginx
+   docker start webapp
    ```
 4. Status otomatis pulih (`NORMAL`) dan sirine berhenti.
 

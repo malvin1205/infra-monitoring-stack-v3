@@ -62,7 +62,7 @@ class ClassifyScrapeFailureTests(unittest.TestCase):
 
 class IsValidTargetTests(unittest.TestCase):
     def test_bare_docker_hostname_is_valid(self):
-        self.assertTrue(alarm_app.is_valid_target('http://nginx'))
+        self.assertTrue(alarm_app.is_valid_target('http://webapp'))
 
     def test_ipv4_is_valid(self):
         self.assertTrue(alarm_app.is_valid_target('192.168.9.16'))
