@@ -2394,6 +2394,67 @@ class InstancesPage {
     ].join('');
   }
 
+  _calculateNiceScale(minVal, maxVal, maxTicks = 4) {
+    let min = 0;
+    if (minVal < 0) min = minVal;
+    
+    let max = Math.max(min + 0.1, maxVal);
+    let rawMax = max > 0 ? max * 1.15 : 1.0;
+    let range = rawMax - min;
+    
+    let rawStep = range / maxTicks;
+    let exponent = Math.floor(Math.log10(rawStep));
+    let fraction = rawStep / Math.pow(10, exponent);
+    
+    let niceFraction;
+    if (fraction < 1.25) niceFraction = 1;
+    else if (fraction < 2.5) niceFraction = 2;
+    else if (fraction < 3.75) niceFraction = 3;
+    else if (fraction < 7.5) niceFraction = 5;
+    else niceFraction = 10;
+    
+    let step = niceFraction * Math.pow(10, exponent);
+    if (step <= 0) step = 1;
+
+    let niceMin = Math.floor(min / step) * step;
+    if (niceMin < 0 && min >= 0) niceMin = 0;
+    
+    let niceMax = Math.ceil(rawMax / step) * step;
+    while (niceMax < max) {
+      niceMax += step;
+    }
+
+    let ticks = [];
+    for (let tick = niceMin; tick <= niceMax + (step * 0.0001); tick += step) {
+      const cleanTick = Math.round(tick * 10000) / 10000;
+      ticks.push(cleanTick);
+    }
+
+    const formatTick = (val) => {
+      if (val >= 1000) {
+        return val.toLocaleString('en-US', { maximumFractionDigits: 0 });
+      }
+      if (step >= 10) {
+        return val.toFixed(2);
+      }
+      if (step >= 1) {
+        return val.toFixed(2);
+      }
+      if (step >= 0.1) {
+        return val.toFixed(2);
+      }
+      return val.toFixed(3);
+    };
+
+    return {
+      niceMin,
+      niceMax,
+      step,
+      ticks,
+      formatTick
+    };
+  }
+
   _buildMSGradientDefs(rangeMin, rangeMax, gradIdLine, gradIdArea) {
     const rangeSpan = Math.max(0.1, rangeMax - rangeMin);
     
@@ -2407,7 +2468,7 @@ class InstancesPage {
     const off500 = getOffsetPct(500);
 
     const topColor = rangeMax > 500 ? '#EF4444' : (rangeMax > 200 ? '#F59E0B' : '#22C55E');
-    const topOpacity = rangeMax > 500 ? '0.28' : '0.15';
+    const topOpacity = rangeMax > 500 ? '0.30' : '0.18';
 
     return `
       <defs>
@@ -2420,7 +2481,7 @@ class InstancesPage {
         </linearGradient>
         <linearGradient id="${gradIdArea}" x1="0" y1="0" x2="0" y2="1">
           <stop offset="0%" stop-color="${topColor}" stop-opacity="${topOpacity}"/>
-          <stop offset="60%" stop-color="#22C55E" stop-opacity="0.10"/>
+          <stop offset="60%" stop-color="#22C55E" stop-opacity="0.08"/>
           <stop offset="100%" stop-color="#22C55E" stop-opacity="0.0"/>
         </linearGradient>
       </defs>`;
@@ -2510,17 +2571,17 @@ class InstancesPage {
       badge.style.display = 'inline-block';
     }
 
-    // Geometry calculations
-    const width = 300;
-    const height = 50;
-    const pad = 4;
+    // Dynamic Adaptive Nice Scale Math
+    const niceScale = this._calculateNiceScale(minL, maxL, 4);
+    const rangeMin = niceScale.niceMin;
+    const rangeMax = niceScale.niceMax;
+    const rangeSpan = Math.max(0.001, rangeMax - rangeMin);
 
-    let rangeMin = minL;
-    let rangeMax = maxL;
-    if (rangeMin === rangeMax) {
-      rangeMin = Math.max(0, rangeMin - 2);
-      rangeMax = rangeMax + 2;
-    }
+    const width = 600;
+    const height = 130;
+    const padTop = 10;
+    const padBottom = 10;
+    const drawHeight = height - padTop - padBottom;
 
     const t0 = activePoints[0][0];
     const tN = activePoints[activePoints.length - 1][0];
@@ -2528,12 +2589,30 @@ class InstancesPage {
 
     const pts = activePoints.map(p => {
       const x = (((p[0] - t0) / dt) * width).toFixed(1);
-      const y = (height - pad - (((p[1] - rangeMin) / (rangeMax - rangeMin)) * (height - (pad * 2)))).toFixed(1);
+      const yRatio = (p[1] - rangeMin) / rangeSpan;
+      const y = (height - padBottom - (yRatio * drawHeight)).toFixed(1);
       return { x: parseFloat(x), y: parseFloat(y), t: p[0], val: p[1] };
     });
 
     const lineD = 'M' + pts.map(p => `${p.x},${p.y}`).join(' L');
-    const areaD = `${lineD} L${width},${height} L0,${height}Z`;
+    const bottomY = (height - padBottom - (((0 - rangeMin) / rangeSpan) * drawHeight)).toFixed(1);
+    const areaD = `${lineD} L${width},${bottomY} L0,${bottomY}Z`;
+
+    // Grid lines & Y-axis labels matching dynamic tick positions
+    const gridLines = [];
+    const leftLabels = [];
+    const rightLabels = [];
+
+    niceScale.ticks.forEach(t => {
+      const tRatio = (t - rangeMin) / rangeSpan;
+      const tY = height - padBottom - (tRatio * drawHeight);
+      const topPct = ((tY / height) * 100).toFixed(2);
+      const formattedVal = niceScale.formatTick(t);
+
+      gridLines.push(`<line x1="0" y1="${tY.toFixed(1)}" x2="${width}" y2="${tY.toFixed(1)}" stroke="rgba(255,255,255,0.07)" stroke-dasharray="3,3" stroke-width="1"/>`);
+      leftLabels.push(`<span style="position:absolute; right:0; top:${topPct}%; transform:translateY(-50%); font-size:10.5px; font-family:var(--font-mono); color:var(--text-secondary); opacity:0.85; white-space:nowrap;">${formattedVal}</span>`);
+      rightLabels.push(`<span style="position:absolute; left:0; top:${topPct}%; transform:translateY(-50%); font-size:10.5px; font-family:var(--font-mono); color:var(--text-secondary); opacity:0.85; white-space:nowrap;">${formattedVal}</span>`);
+    });
 
     // Time axis label formatting helper
     const fmtTime = (ts) => {
@@ -2551,25 +2630,33 @@ class InstancesPage {
 
     const defsHtml = this._buildMSGradientDefs(rangeMin, rangeMax, 'sgLineGrad', 'sgAreaGrad');
 
-    // Build SVG & Overlay HTML
+    // Build SVG & Adaptive ms Meter Overlay HTML
     wrap.innerHTML = `
-      <div class="sparkline-svg-wrap" id="sparklineSvgWrap" style="user-select:none;">
-        <svg class="sparkline" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">
-          ${defsHtml}
-          <!-- Grid Lines -->
-          <line x1="0" y1="${height / 2}" x2="${width}" y2="${height / 2}" stroke="var(--border)" stroke-dasharray="2,2" stroke-width="0.5"/>
-          
-          <!-- Area & Line -->
-          <path class="spark-area" d="${areaD}" fill="url(#sgAreaGrad)"/>
-          <path class="spark-line" d="${lineD}" fill="none" stroke="url(#sgLineGrad)" stroke-width="1.5" vector-effect="non-scaling-stroke" stroke-linecap="round" stroke-linejoin="round"/>
-        </svg>
-        
-        <div class="sparkline-selection-box" id="spSelectBox" style="display:none;"></div>
-        <div class="sparkline-tracker" id="spTracker" style="display:none;"></div>
-        <div class="sparkline-dot" id="spDot" style="display:none; background:${accentColor}; box-shadow:0 0 8px ${accentColor};"></div>
-        <div class="sparkline-tooltip" id="spTooltip" style="display:none;"></div>
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px; font-size:11px; font-weight:600; color:var(--text-secondary); opacity:0.8; padding:0 2px;">
+        <span>ms</span>
+        <span>ms</span>
       </div>
-      <div class="sparkline-x-axis">
+      <div style="display:flex; gap:10px; position:relative; align-items:stretch;">
+        <div style="position:relative; width:44px; flex-shrink:0; pointer-events:none;">
+          ${leftLabels.join('')}
+        </div>
+        <div class="sparkline-svg-wrap" id="sparklineSvgWrap" style="flex:1; position:relative; height:130px; cursor:crosshair;">
+          <svg class="sparkline" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">
+            ${defsHtml}
+            ${gridLines.join('')}
+            <path class="spark-area" d="${areaD}" fill="url(#sgAreaGrad)"/>
+            <path class="spark-line" d="${lineD}" fill="none" stroke="url(#sgLineGrad)" stroke-width="1.8" vector-effect="non-scaling-stroke" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          <div class="sparkline-selection-box" id="spSelectBox" style="display:none;"></div>
+          <div class="sparkline-tracker" id="spTracker" style="display:none;"></div>
+          <div class="sparkline-dot" id="spDot" style="display:none; background:${accentColor}; box-shadow:0 0 8px ${accentColor};"></div>
+          <div class="sparkline-tooltip" id="spTooltip" style="display:none;"></div>
+        </div>
+        <div style="position:relative; width:44px; flex-shrink:0; pointer-events:none;">
+          ${rightLabels.join('')}
+        </div>
+      </div>
+      <div class="sparkline-x-axis" style="display:flex; justify-content:space-between; font-size:10px; font-family:var(--font-mono); color:var(--text-secondary); margin-top:8px; padding:6px 54px 0 54px; border-top:1px dashed rgba(255,255,255,0.08);">
         <span>${t0Str}</span>
         <span>${tMidStr}</span>
         <span>${tNStr}</span>
@@ -2647,6 +2734,8 @@ class InstancesPage {
       const pointY = (closest.y / height) * rect.height;
 
       tracker.style.left = `${pointX}px`;
+      tracker.style.top = `${padTop}px`;
+      tracker.style.height = `${drawHeight}px`;
       tracker.style.display = 'block';
 
       dot.style.left = `${pointX}px`;
@@ -2669,7 +2758,7 @@ class InstancesPage {
       
       const clampX = Math.max(45, Math.min(rect.width - 45, pointX));
       tooltip.style.left = `${clampX}px`;
-      tooltip.style.top = `${Math.max(25, pointY)}px`;
+      tooltip.style.top = `${Math.max(20, pointY)}px`;
       tooltip.style.display = 'block';
     };
 
@@ -2772,45 +2861,93 @@ class InstancesPage {
       }).join('');
     }
 
-    // SVG Chart
+    // Dynamic Adaptive Nice Scale Math
+    const niceScale = this._calculateNiceScale(minL, maxL, 4);
+    const rangeMin = niceScale.niceMin;
+    const rangeMax = niceScale.niceMax;
+    const rangeSpan = Math.max(0.001, rangeMax - rangeMin);
+
     const width = 600;
     const height = 140;
-    const pad = 8;
+    const padTop = 10;
+    const padBottom = 10;
+    const drawHeight = height - padTop - padBottom;
+
     const t0 = points[0][0];
     const tN = points[points.length - 1][0];
     const dt = Math.max(1, tN - t0);
 
-    let rangeMin = minL;
-    let rangeMax = maxL;
-    if (rangeMin === rangeMax) {
-      rangeMin = Math.max(0, rangeMin - 2);
-      rangeMax = rangeMax + 2;
-    }
-
     const pts = points.map(p => {
       const x = (((p[0] - t0) / dt) * width).toFixed(1);
-      const y = (height - pad - (((p[1] - rangeMin) / (rangeMax - rangeMin)) * (height - (pad * 2)))).toFixed(1);
+      const yRatio = (p[1] - rangeMin) / rangeSpan;
+      const y = (height - padBottom - (yRatio * drawHeight)).toFixed(1);
       return { x: parseFloat(x), y: parseFloat(y), t: p[0], val: p[1] };
     });
 
     const lineD = 'M' + pts.map(p => `${p.x},${p.y}`).join(' L');
-    const areaD = `${lineD} L${width},${height} L0,${height}Z`;
+    const bottomY = (height - padBottom - (((0 - rangeMin) / rangeSpan) * drawHeight)).toFixed(1);
+    const areaD = `${lineD} L${width},${bottomY} L0,${bottomY}Z`;
+
+    // Grid lines & Y-axis labels matching dynamic tick positions
+    const gridLines = [];
+    const leftLabels = [];
+    const rightLabels = [];
+
+    niceScale.ticks.forEach(t => {
+      const tRatio = (t - rangeMin) / rangeSpan;
+      const tY = height - padBottom - (tRatio * drawHeight);
+      const topPct = ((tY / height) * 100).toFixed(2);
+      const formattedVal = niceScale.formatTick(t);
+
+      gridLines.push(`<line x1="0" y1="${tY.toFixed(1)}" x2="${width}" y2="${tY.toFixed(1)}" stroke="rgba(255,255,255,0.07)" stroke-dasharray="3,3" stroke-width="1"/>`);
+      leftLabels.push(`<span style="position:absolute; right:0; top:${topPct}%; transform:translateY(-50%); font-size:10.5px; font-family:var(--font-mono); color:var(--text-secondary); opacity:0.85; white-space:nowrap;">${formattedVal}</span>`);
+      rightLabels.push(`<span style="position:absolute; left:0; top:${topPct}%; transform:translateY(-50%); font-size:10.5px; font-family:var(--font-mono); color:var(--text-secondary); opacity:0.85; white-space:nowrap;">${formattedVal}</span>`);
+    });
+
+    // Time axis label formatting helper
+    const fmtTime = (ts) => {
+      const d = new Date(ts * 1000);
+      const isLongRange = (tN - t0) > 86400; // >24h
+      if (isLongRange) {
+        return d.toLocaleDateString('id-ID', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' });
+      }
+      return d.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    };
+
+    const t0Str = fmtTime(t0);
+    const tMidStr = fmtTime(t0 + (tN - t0) / 2);
+    const tNStr = fmtTime(tN);
 
     const defsHistHtml = this._buildMSGradientDefs(rangeMin, rangeMax, 'sgHistLineGrad', 'sgHistGrad');
 
     wrap.innerHTML = `
-      <div class="sparkline-svg-wrap" id="histSvgWrap" style="height:140px;">
-        <svg class="sparkline" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">
-          ${defsHistHtml}
-          <line x1="0" y1="${height * 0.25}" x2="${width}" y2="${height * 0.25}" stroke="var(--border)" stroke-dasharray="2,2" stroke-width="0.5"/>
-          <line x1="0" y1="${height * 0.5}" x2="${width}" y2="${height * 0.5}" stroke="var(--border)" stroke-dasharray="2,2" stroke-width="0.5"/>
-          <line x1="0" y1="${height * 0.75}" x2="${width}" y2="${height * 0.75}" stroke="var(--border)" stroke-dasharray="2,2" stroke-width="0.5"/>
-          <path class="spark-area" d="${areaD}" fill="url(#sgHistGrad)"/>
-          <path class="spark-line" d="${lineD}" fill="none" stroke="url(#sgHistLineGrad)" stroke-width="1.5" vector-effect="non-scaling-stroke" stroke-linecap="round" stroke-linejoin="round"/>
-        </svg>
-        <div class="sparkline-tracker" id="histTracker" style="display:none;"></div>
-        <div class="sparkline-dot" id="histDot" style="display:none; background:var(--accent);"></div>
-        <div class="sparkline-tooltip" id="histTooltip" style="display:none;"></div>
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px; font-size:11px; font-weight:600; color:var(--text-secondary); opacity:0.8; padding:0 2px;">
+        <span>ms</span>
+        <span>ms</span>
+      </div>
+      <div style="display:flex; gap:10px; position:relative; align-items:stretch;">
+        <div style="position:relative; width:44px; flex-shrink:0; pointer-events:none;">
+          ${leftLabels.join('')}
+        </div>
+        <div class="sparkline-svg-wrap" id="histSvgWrap" style="flex:1; position:relative; height:140px; cursor:crosshair;">
+          <svg class="sparkline" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">
+            ${defsHistHtml}
+            ${gridLines.join('')}
+            <path class="spark-area" d="${areaD}" fill="url(#sgHistGrad)"/>
+            <path class="spark-line" d="${lineD}" fill="none" stroke="url(#sgHistLineGrad)" stroke-width="1.8" vector-effect="non-scaling-stroke" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          <div class="sparkline-tracker" id="histTracker" style="display:none;"></div>
+          <div class="sparkline-dot" id="histDot" style="display:none; background:var(--accent);"></div>
+          <div class="sparkline-tooltip" id="histTooltip" style="display:none;"></div>
+        </div>
+        <div style="position:relative; width:44px; flex-shrink:0; pointer-events:none;">
+          ${rightLabels.join('')}
+        </div>
+      </div>
+      <div class="sparkline-x-axis" style="display:flex; justify-content:space-between; font-size:10px; font-family:var(--font-mono); color:var(--text-secondary); margin-top:8px; padding:6px 54px 0 54px; border-top:1px dashed rgba(255,255,255,0.08);">
+        <span>${t0Str}</span>
+        <span>${tMidStr}</span>
+        <span>${tNStr}</span>
       </div>`;
 
     const svgWrap = wrap.querySelector('#histSvgWrap');
@@ -2851,6 +2988,8 @@ class InstancesPage {
       const pointY = (closest.y / height) * rect.height;
 
       tracker.style.left = `${pointX}px`;
+      tracker.style.top = `${padTop}px`;
+      tracker.style.height = `${drawHeight}px`;
       tracker.style.display = 'block';
 
       dot.style.left = `${pointX}px`;
@@ -2872,7 +3011,7 @@ class InstancesPage {
       `;
       const clampX = Math.max(50, Math.min(rect.width - 50, pointX));
       tooltip.style.left = `${clampX}px`;
-      tooltip.style.top = `${Math.max(25, pointY)}px`;
+      tooltip.style.top = `${Math.max(20, pointY)}px`;
       tooltip.style.display = 'block';
     };
 
