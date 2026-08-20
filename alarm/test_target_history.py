@@ -53,3 +53,18 @@ def test_target_history_ranges(client, tmp_path, monkeypatch):
     assert data30d['period_minutes'] == 43200
     # Should include all 3 points
     assert len(data30d['latency_points']) == 3
+
+def test_target_history_injection_rejection(client):
+    # Injection attempts with quotes, brackets, semicolons, etc.
+    malicious_targets = [
+        'test" or probe_success or {',
+        'http://example.com/api?q=1; DROP TABLE',
+        'host`whoami`',
+        'host$(id)',
+        'foo{}'
+    ]
+    for bad_target in malicious_targets:
+        res = client.get(f'/api/target-history?target={bad_target}')
+        assert res.status_code == 400
+        data = json.loads(res.data)
+        assert data['ok'] is False

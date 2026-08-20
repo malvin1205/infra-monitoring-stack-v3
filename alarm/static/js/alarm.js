@@ -156,6 +156,12 @@ class InstancesPage {
     this._lastDataSignature = null;
     this._searchDebounceTimer = null;
 
+    // Monotonic sequence number for /api/availability requests: guards
+    // against a stale/superseded response overwriting newer state even in
+    // the edge case where fetch resolves instead of rejecting on an aborted
+    // signal (timing is browser-dependent).
+    this._availRequestSeq = 0;
+
     this._bindEvents();
   }
 
@@ -745,8 +751,13 @@ class InstancesPage {
     // must not also abort the in-flight loadAvailability() call onActivate()
     // just made.
     if (this.availabilityPollInterval) clearInterval(this.availabilityPollInterval);
-    // Poll availability every 15s from Prometheus historical PromQL range queries
-    this.availabilityPollInterval = setInterval(() => this.loadAvailability(), 15000);
+    // Poll availability every 15s from Prometheus historical PromQL range
+    // queries. force:false — a wide range (7d/30d) can legitimately take
+    // longer than 15s to answer; forcing an abort+restart on every tick
+    // would kill the previous request before it ever lands, leaving the UI
+    // stuck on stale/loading data forever. Skip the tick instead and let
+    // the in-flight request finish.
+    this.availabilityPollInterval = setInterval(() => this.loadAvailability(false), 15000);
   }
 
   stopAvailabilityPolling() {
@@ -761,17 +772,28 @@ class InstancesPage {
     }
   }
 
-  async loadAvailability() {
+  async loadAvailability(force = true) {
     // Realtime mode is driven entirely by the live /instances poll (see
     // _updateStats()) — no historical Prometheus aggregate to fetch here.
     if (this.isRealtime) return;
 
-    // Cancel any still-in-flight /api/availability request (overlapping poll
-    // tick, rapid range/job change) instead of letting a stale response land
-    // after a newer one.
-    if (this._availAbortController) this._availAbortController.abort();
+    // force=true (range/job/custom-range change, manual refresh, initial
+    // load): a newer, more relevant request supersedes whatever's in
+    // flight — cancel it and start fresh.
+    // force=false (the 15s background poll tick): only start a new request
+    // if the previous one has already finished. Never abort a still-valid
+    // in-flight request just because a poll tick fired.
+    if (this._availAbortController) {
+      if (!force) return;
+      this._availAbortController.abort();
+    }
     const controller = new AbortController();
     this._availAbortController = controller;
+    // Belt-and-suspenders stale guard: even if a response resolves instead
+    // of rejecting after its controller was aborted (timing edge case), a
+    // mismatched sequence number means a newer request owns the UI now.
+    const seq = ++this._availRequestSeq;
+    const isStale = () => seq !== this._availRequestSeq;
 
     const rangeText = this.periodLabel === 'custom' ? 'Custom' : this.periodLabel;
 
@@ -792,9 +814,13 @@ class InstancesPage {
 
       const res = await fetch(url, { signal: controller.signal });
       const data = await res.json();
+      if (isStale()) return;
+
       if (!data.ok) {
         this._availFailCount = Math.min(this._availFailCount + 1, 6);
         this._scheduleRetry('availability');
+        // Non-blocking: this.availabilityBreakdown (last-good SLA data) and
+        // live monitoring are left exactly as they were — never zeroed out.
         return;
       }
       this._availFailCount = 0;
@@ -826,7 +852,7 @@ class InstancesPage {
         this._renderAvailabilityBreakdown();
       }
     } catch (e) {
-      if (e.name === 'AbortError') return;
+      if (e.name === 'AbortError' || isStale()) return;
       // Keep last known values; availability is a secondary, best-effort metric
       console.warn('[InfraWatch] Availability fetch failed:', e);
       this._availFailCount = Math.min(this._availFailCount + 1, 6);
@@ -960,6 +986,27 @@ class InstancesPage {
     if (this.availabilityBreakdownModal) this.availabilityBreakdownModal.classList.add('hidden');
   }
 
+  // Single source of truth for SLA status: read the backend's own
+  // COMPLIANT/NON_COMPLIANT/INSUFFICIENT_DATA verdict (which already
+  // accounts for coverage, not just the raw availability number) instead of
+  // re-deriving a pct-only threshold in the UI. A target with barely any
+  // observed coverage must never render as compliant just because the
+  // little data it has happens to look good.
+  _slaBadgeInfo(entry) {
+    const status = entry && entry.sla_status;
+    if (status === 'COMPLIANT') return { cls: 'alt-ok', label: 'COMPLIANT' };
+    if (status === 'NON_COMPLIANT') return { cls: 'alt-warning', label: 'NON-COMPLIANT' };
+    if (status === 'INSUFFICIENT_DATA') return { cls: 'alt-insufficient', label: 'INSUFFICIENT DATA' };
+    // Backend didn't send a verdict (older payload shape) — fall back to the
+    // same eligibility rule the backend uses (coverage-gated), never a bare
+    // pct threshold that could paint a low-coverage target green.
+    const cov = typeof entry?.coverage_percent === 'number' ? entry.coverage_percent
+      : (typeof entry?.coverage_pct === 'number' ? entry.coverage_pct : null);
+    const avail = typeof entry?.availability_pct === 'number' ? entry.availability_pct : null;
+    if (avail === null || cov === null || cov < 50) return { cls: 'alt-insufficient', label: 'INSUFFICIENT DATA' };
+    return avail >= 99.9 ? { cls: 'alt-ok', label: 'COMPLIANT' } : { cls: 'alt-warning', label: 'NON-COMPLIANT' };
+  }
+
   _renderAvailabilityBreakdown() {
     const data = this.availabilityBreakdown;
     const expectedMins = Math.round(this.periodMinutes);
@@ -973,8 +1020,14 @@ class InstancesPage {
     const avgEl = document.getElementById('metricFleetAverage');
     if (avgEl) avgEl.textContent = fmtPct(data?.fleet_average);
 
+    const slaEl = document.getElementById('metricSlaCompliance');
+    if (slaEl) slaEl.textContent = fmtPct(data?.sla_compliance_ratio || data?.sla_compliance);
+
     const healthEl = document.getElementById('metricHealthRatio');
     if (healthEl) healthEl.textContent = fmtPct(data?.health_ratio);
+
+    const covRatioEl = document.getElementById('metricCoverageRatio');
+    if (covRatioEl) covRatioEl.textContent = fmtPct(data?.coverage_ratio);
 
     const analytics = isMatchingData ? data?.analytics : null;
     const meanOutageEl = document.getElementById('metricMeanOutage');
@@ -993,13 +1046,14 @@ class InstancesPage {
       } else {
         unstableTableEl.innerHTML = list.map((entry, i) => {
           const pct = typeof entry.availability_pct === 'number' ? entry.availability_pct.toFixed(2) + '%' : '—';
-          const pctCls = entry.availability_pct < 95 ? 'alt-critical' : (entry.availability_pct < 99.9 ? 'alt-warning' : 'alt-ok');
+          const sla = this._slaBadgeInfo(entry);
           return `
             <div class="alt-row alt-row-ranked">
               <span class="alt-rank">#${i + 1}</span>
               <span class="alt-host">${this._esc(entry.name || entry.id || '—')}</span>
               <span class="alt-incidents">${entry.incidents} incident${entry.incidents === 1 ? '' : 's'}</span>
-              <span class="alt-pct ${pctCls}">${pct}</span>
+              <span class="sla-badge ${sla.cls}">${sla.label}</span>
+              <span class="alt-pct ${sla.cls}">${pct}</span>
             </div>`;
         }).join('');
       }
@@ -1021,11 +1075,12 @@ class InstancesPage {
 
     tableEl.innerHTML = lowest.map(entry => {
       const pct = entry.availability_pct;
-      const cls = pct < 95 ? 'alt-critical' : (pct < 99.9 ? 'alt-warning' : 'alt-ok');
+      const sla = this._slaBadgeInfo(entry);
       return `
         <div class="alt-row">
           <span class="alt-host">${this._esc(entry.name || entry.id || '—')}</span>
-          <span class="alt-pct ${cls}">${typeof pct === 'number' ? pct.toFixed(2) + '%' : '—'}</span>
+          <span class="sla-badge ${sla.cls}">${sla.label}</span>
+          <span class="alt-pct ${sla.cls}">${typeof pct === 'number' ? pct.toFixed(2) + '%' : '—'}</span>
         </div>`;
     }).join('');
 
@@ -1062,7 +1117,11 @@ class InstancesPage {
           }
 
           const downText = downSec > 0 ? (downSec < 60 ? `${downSec}s` : `${downMin.toFixed(1)}m`) : '0s';
-          const cls = pct < 95 ? 'alt-critical' : (pct < 99.9 ? 'alt-warning' : 'alt-ok');
+          // SLA badge comes from the backend's own historical verdict
+          // (entry.sla_status) — never from `pct`, which above is blended
+          // with the live ongoing-outage extension. Live status and
+          // historical SLA status stay on separate signals.
+          const sla = this._slaBadgeInfo(entry);
 
           return `
             <div class="alt-row" style="display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 0.4rem 0.75rem; padding: 0.5rem 0.75rem; border-bottom: 1px solid var(--border-subtle, rgba(255,255,255,0.05)); font-size: 0.85rem;">
@@ -1070,7 +1129,8 @@ class InstancesPage {
               <div style="display: flex; flex-wrap: wrap; gap: 0.5rem 1rem; align-items: center;">
                 <span style="color: var(--fg-muted); font-size: 0.8rem; white-space: nowrap;">Incidents: <strong style="color: ${incidents > 0 ? 'var(--critical)' : 'var(--success)'};">${incidents}</strong></span>
                 <span style="color: var(--fg-muted); font-size: 0.8rem; white-space: nowrap;">Downtime: <strong style="color: ${downSec > 0 ? 'var(--critical)' : 'var(--success)'};">${downText}</strong></span>
-                <span class="alt-pct ${cls}">${typeof pct === 'number' ? pct.toFixed(2) + '%' : '—'}</span>
+                <span class="sla-badge ${sla.cls}">${sla.label}</span>
+                <span class="alt-pct ${sla.cls}">${typeof pct === 'number' ? pct.toFixed(2) + '%' : '—'}</span>
               </div>
             </div>`;
         }).join('');
@@ -2040,31 +2100,57 @@ class InstancesPage {
     const elLastOutage = document.getElementById('spSummaryLastOutage');
 
     if (!target) return;
-    const isDown = target.health !== 'up';
+
+    const rangeText = this.periodLabel === 'custom' ? 'Custom' : (this.periodLabel || '24h');
+    const rangeLabelEl = document.getElementById('spSummaryRangeLabel');
+    if (rangeLabelEl) rangeLabelEl.textContent = `(${rangeText})`;
+
+    // No entry (target filtered out, or this /api/availability response
+    // hasn't landed yet) means "we don't know" — never fabricate 100%
+    // coverage/availability to fill the gap.
+    const entry = this.availabilityBreakdown?.entries?.find(e => e.id === target.instance || e.name === target.instance);
+    const covMin = entry ? entry.coverage_minutes : null;
+    const upMin = entry ? entry.uptime_minutes : null;
+    const downMin = entry ? entry.downtime_minutes : null;
+    const covPct = entry && typeof entry.coverage_pct === 'number' ? entry.coverage_pct
+      : (entry && typeof entry.coverage_percent === 'number' ? entry.coverage_percent : null);
+    const availPct = entry && typeof entry.availability_pct === 'number' ? entry.availability_pct : null;
+
+    const slaBadgeEl = document.getElementById('spSummarySlaBadge');
+    if (slaBadgeEl) {
+      const sla = this._slaBadgeInfo(entry || {});
+      slaBadgeEl.textContent = sla.label;
+      slaBadgeEl.className = `sla-badge ${sla.cls}`;
+    }
 
     let downEvents = Array.isArray(events) ? events.filter(e => e.status === 'OFFLINE') : [];
-    let failedCount = downEvents.length + (isDown ? 1 : 0);
-    let totalProbes = 5760;
-    let successCount = Math.max(0, totalProbes - failedCount);
-    let successPct = ((successCount / totalProbes) * 100).toFixed(2);
-    let failedPct = ((failedCount / totalProbes) * 100).toFixed(2);
+    let failedCount = entry?.incidents || downEvents.length || (target.health !== 'up' ? 1 : 0);
 
-    if (elTotal) elTotal.textContent = totalProbes.toLocaleString();
-    if (elSuccess) elSuccess.textContent = `${successCount.toLocaleString()} (${successPct}%)`;
-    if (elFailed) elFailed.textContent = `${failedCount} (${failedPct}%)`;
+    const fmtDur = m => (typeof m !== 'number') ? '—' : (m < 60 ? `${m.toFixed(1)}m` : `${(m / 60).toFixed(1)}h`);
 
+    if (elTotal) elTotal.textContent = covMin !== null ? `${fmtDur(covMin)} (${covPct !== null ? covPct.toFixed(1) : '—'}% observed)` : '—';
+    if (elSuccess) elSuccess.textContent = upMin !== null ? `${fmtDur(upMin)} (${availPct !== null ? availPct.toFixed(2) + '%' : '—'})` : '—';
+    if (elFailed) elFailed.textContent = downMin !== null ? `${fmtDur(downMin)} (${failedCount} incident${failedCount === 1 ? '' : 's'})` : '—';
+
+    const haveDowntimeData = downMin !== null || downEvents.length > 0;
     let totalDownSec = downEvents.reduce((acc, e) => acc + (e.duration_seconds || 0), 0);
-    let mttrSec = downEvents.length > 0 ? Math.round(totalDownSec / downEvents.length) : 0;
-    let maxDownSec = downEvents.length > 0 ? Math.max(...downEvents.map(e => e.duration_seconds || 0)) : 0;
+    let mttrSec = downEvents.length > 0 ? Math.round(totalDownSec / downEvents.length) : ((downMin || 0) > 0 && failedCount > 0 ? Math.round((downMin * 60) / failedCount) : 0);
+    let maxDownSec = downEvents.length > 0 ? Math.max(...downEvents.map(e => e.duration_seconds || 0)) : Math.round((downMin || 0) * 60);
 
-    if (elMttr) elMttr.textContent = mttrSec > 0 ? `${mttrSec}s` : '0s';
-    if (elLongest) elLongest.textContent = maxDownSec > 0 ? `${maxDownSec}s` : 'None';
+    const fmtSec = s => s > 0 ? (s < 60 ? `${s}s` : (s < 3600 ? `${(s / 60).toFixed(1)}m` : `${(s / 3600).toFixed(1)}h`)) : '0s';
+
+    if (elMttr) elMttr.textContent = haveDowntimeData ? fmtSec(mttrSec) : '—';
+    if (elLongest) elLongest.textContent = !haveDowntimeData ? '—' : (maxDownSec > 0 ? fmtSec(maxDownSec) : 'None');
 
     if (elLastOutage) {
       if (downEvents.length > 0) {
         const lastEv = downEvents[0];
         const dObj = new Date(lastEv.start_ts * 1000);
         elLastOutage.textContent = dObj.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      } else if (!haveDowntimeData) {
+        elLastOutage.textContent = '—';
+      } else if (downMin > 0) {
+        elLastOutage.textContent = 'Past Outage';
       } else {
         elLastOutage.textContent = 'None';
       }
@@ -3854,10 +3940,19 @@ class ServerMonitor {
     // slower cadence in the background, tightened to 5s once the modal opens.
     this.logsPage._startPolling(30000);
     this.logsPage.load();
-    this.historyPage.load();
-
     this._checkSelfHealth();
     setInterval(() => this._checkSelfHealth(), 20000);
+
+    // Kiosk / TV Standby lifecycle management: pause/resume cleanly on wake
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') {
+        // Immediate clean sync on wake without timer accumulation
+        this.checkStatus();
+        this.instancesPage.load();
+        this.instancesPage.loadAvailability();
+        this._checkSelfHealth();
+      }
+    });
   }
 
   // Phase 13 self-monitoring — reuses /health rather than a second endpoint.

@@ -8,7 +8,7 @@ services:
     ports:
       - "5000:5000"
     environment:
-      - PROMETHEUS_URL=http://192.168.9.16:9090
+      - PROMETHEUS_URL=${PROMETHEUS_URL:-http://prometheus:9090}
     volumes:
       - ./alarm:/app
       - ./alarm/targets:/app/targets
@@ -17,5 +17,11 @@ services:
       interval: 10s
       timeout: 5s
       retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: '1.50'
+          memory: 1024M
+
 
 

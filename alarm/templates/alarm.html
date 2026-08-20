@@ -112,7 +112,7 @@
       <!-- Endpoint Selector Dropdown & Manage Button -->
       <div class="filter-select-wrap">
         <select id="endpointSelect" class="filter-select" title="Pilih Endpoint Prometheus Active" aria-label="Prometheus Endpoint">
-          <option value="http://192.168.9.16:9090">Prometheus: 192.168.9.16:9090</option>
+          <option value="">Pilih Endpoint...</option>
         </select>
       </div>
 
@@ -603,11 +603,15 @@
 
           <!-- Probe Summary -->
           <div class="drawer-section" style="background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; padding: 14px;">
-            <div class="drawer-section-title" style="font-size: 13px; font-weight: 700; margin-bottom: 10px;">PROBE SUMMARY</div>
+            <div class="drawer-section-title" style="font-size: 13px; font-weight: 700; margin-bottom: 10px;">PROBE SUMMARY <span id="spSummaryRangeLabel" style="font-weight: 400; color: var(--text-secondary); text-transform: none;">(24h)</span></div>
+            <div class="dil-row" style="padding: 0 0 8px;">
+              <span class="dil-label" style="font-size: 12px;">Historical SLA</span>
+              <span class="sla-badge" id="spSummarySlaBadge">—</span>
+            </div>
             <div class="drawer-info-list" style="border: none; background: transparent;">
               <div class="dil-row" style="padding: 6px 0; border-bottom: 1px solid rgba(255,255,255,0.05);">
-                <span class="dil-label" style="font-size: 12px;">Total Probes (24h)</span>
-                <span class="dil-value" id="spSummaryTotalProbes" style="font-weight: 700; font-size: 12px;">5,760</span>
+                <span class="dil-label" style="font-size: 12px;">Observed Coverage</span>
+                <span class="dil-value" id="spSummaryTotalProbes" style="font-weight: 700; font-size: 12px;">—</span>
               </div>
               <div class="dil-row" style="padding: 6px 0; border-bottom: 1px solid rgba(255,255,255,0.05);">
                 <span class="dil-label" style="font-size: 12px;">Successful</span>
@@ -809,7 +813,7 @@
       </div>
 
       <div class="modal-body">
-        <!-- 4 metrics, kept explicitly separate — not blended into one number -->
+        <!-- 5 metrics, kept explicitly separate — not blended into one number -->
         <div class="avail-metric-grid">
           <div class="avail-metric-card avail-metric-primary">
             <span class="avail-metric-label">Fleet Aggregate <em>(weighted by time — SLA)</em></span>
@@ -820,12 +824,20 @@
             <span class="avail-metric-value" id="metricFleetAverage">—</span>
           </div>
           <div class="avail-metric-card">
-            <span class="avail-metric-label">Health Ratio <em>(never-down servers)</em></span>
+            <span class="avail-metric-label">SLA Compliance <em>(&ge; 99.9%)</em></span>
+            <span class="avail-metric-value" id="metricSlaCompliance">—</span>
+          </div>
+          <div class="avail-metric-card">
+            <span class="avail-metric-label">Health Ratio <em>(zero downtime)</em></span>
             <span class="avail-metric-value" id="metricHealthRatio">—</span>
           </div>
           <div class="avail-metric-card">
             <span class="avail-metric-label">Mean Outage Duration</span>
             <span class="avail-metric-value" id="metricMeanOutage">—</span>
+          </div>
+          <div class="avail-metric-card">
+            <span class="avail-metric-label">Fleet Coverage <em>(observed time)</em></span>
+            <span class="avail-metric-value" id="metricCoverageRatio">—</span>
           </div>
         </div>
 

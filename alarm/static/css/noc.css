@@ -1743,12 +1743,31 @@ html, body {
 .alt-pct.alt-critical { color: var(--critical); }
 .alt-pct.alt-warning { color: var(--warning); }
 .alt-pct.alt-ok { color: var(--success); }
+.alt-pct.alt-insufficient { color: var(--text-muted); }
+
+/* Explicit SLA status badge — text, not just color, so COMPLIANT /
+   NON-COMPLIANT / INSUFFICIENT DATA are never conflated by a color-only
+   signal. Insufficient data is a distinct neutral grey, never green/red,
+   so a low-coverage target never visually reads as "passing" or "failing". */
+.sla-badge {
+  font-size: 9.5px;
+  font-weight: 800;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  padding: 2px 6px;
+  border-radius: 4px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.sla-badge.alt-ok { color: var(--success); background: color-mix(in srgb, var(--success) 15%, transparent); }
+.sla-badge.alt-warning { color: var(--warning); background: color-mix(in srgb, var(--warning) 15%, transparent); }
+.sla-badge.alt-insufficient { color: var(--text-muted); background: color-mix(in srgb, var(--text-muted) 15%, transparent); }
 
 /* Top 5 Unstable Hosts (Phase 11 Revise) — same row chrome as .alt-row,
-   laid out as a grid since it carries a rank + incident count too. */
+   laid out as a grid since it carries a rank + incident count + SLA badge. */
 .alt-row-ranked {
   display: grid;
-  grid-template-columns: 28px 1fr auto auto;
+  grid-template-columns: 28px 1fr auto auto auto;
   gap: 10px;
   align-items: center;
 }

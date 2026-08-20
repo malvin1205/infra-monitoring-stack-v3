@@ -6,9 +6,9 @@ from urllib.error import URLError
 
 sys.path.insert(0, os.path.dirname(__file__))
 try:
-    from fleet_availability import summarize_entries
+    from fleet_availability import summarize_entries, reconstruct_time_series_intervals, calculate_percentile
 except ImportError:
-    from alarm.fleet_availability import summarize_entries
+    from alarm.fleet_availability import summarize_entries, reconstruct_time_series_intervals, calculate_percentile
 
 # Matches prometheus/prometheus.yml `global.scrape_interval`. Used to turn a
 # Prometheus `count_over_time(...)` sample count back into a monitored-duration
@@ -130,6 +130,14 @@ def load_json(path, default=None):
             return default
     return default
 
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s'
+)
+logger = logging.getLogger("infrawatch")
+
 def save_json(path, data):
     try:
         tmp_path = path + ".tmp"
@@ -138,11 +146,11 @@ def save_json(path, data):
             json.dump(data, f, indent=2)
         os.replace(tmp_path, path)
     except Exception as e:
-        print(f"Error saving {path}: {e}", flush=True)
+        logger.error(f"Error saving {path}: {e}")
 
+_DEFAULT_PROM_URL = os.environ.get("PROMETHEUS_URL", "http://prometheus:9090")
 PROMETHEUS_CANDIDATES = [
-    os.environ.get("PROMETHEUS_URL", "http://192.168.9.16:9090"),
-    "http://192.168.9.16:9090",
+    _DEFAULT_PROM_URL,
     "http://prometheus:9090",
     "http://host.docker.internal:9090",
     "http://localhost:9090",
@@ -158,7 +166,7 @@ def load_endpoints():
     if cached is not None and now - _ENDPOINTS_CACHE["ts"] < _ENDPOINTS_CACHE_TTL:
         return cached
 
-    default_url = os.environ.get("PROMETHEUS_URL", "http://192.168.9.16:9090")
+    default_url = _DEFAULT_PROM_URL
     default_data = {
         "active": default_url,
         "endpoints": [default_url]
@@ -628,6 +636,10 @@ def add_endpoint_api():
     parsed = urlparse(url)
     if parsed.scheme not in ('http', 'https') or not parsed.netloc:
         return jsonify({"ok": False, "error": "Format URL Endpoint Prometheus tidak valid"}), 400
+
+    hostname = (parsed.hostname or '').lower()
+    if hostname.startswith("169.254.") or hostname in ('100.100.100.200', 'metadata.google.internal'):
+        return jsonify({"ok": False, "error": "Endpoint URL tidak diizinkan (restricted network)"}), 400
 
     data = load_endpoints()
     if url not in data["endpoints"]:
@@ -1248,12 +1260,18 @@ def api_availability():
 
     req_timeout = max(4.0, min(25.0, minutes / 1500.0))
 
+    step_suffix = ""
+    if minutes_int > 10080:
+        step_suffix = ":5m"
+    elif minutes_int > 1440:
+        step_suffix = ":30s"
+
     queries = {
-        'probe_avail': f"avg_over_time(probe_success[{minutes_int}m]{at_suffix}) * 100",
-        'up_avail': f"avg_over_time(up[{minutes_int}m]{at_suffix}) * 100",
+        'probe_avail': f"avg_over_time(probe_success[{minutes_int}m{step_suffix}]{at_suffix}) * 100",
+        'up_avail': f"avg_over_time(up[{minutes_int}m{step_suffix}]{at_suffix}) * 100",
         'probe_count': f"count_over_time(probe_success[{minutes_int}m]{at_suffix})",
         'up_count': f"count_over_time(up[{minutes_int}m]{at_suffix})",
-        'duration': f"avg_over_time(probe_duration_seconds[{minutes_int}m]{at_suffix}) * 1000",
+        'duration': f"avg_over_time(probe_duration_seconds[{minutes_int}m{step_suffix}]{at_suffix}) * 1000",
         'probe_incidents': f"changes(probe_success[{minutes_int}m]{at_suffix})",
         'up_incidents': f"changes(up[{minutes_int}m]{at_suffix})",
         'live_probe': "probe_success" if end_ts is None else None,
@@ -1296,11 +1314,14 @@ def api_availability():
         raw_duration = duration_map.get(inst)
         raw_incidents = incidents_map.get(inst)
 
+        raw_avail_float = None
         availability_pct = None
         if raw_avail is not None:
             try:
-                availability_pct = round(max(0.0, min(100.0, float(raw_avail))), 2)
+                raw_avail_float = max(0.0, min(100.0, float(raw_avail)))
+                availability_pct = round(raw_avail_float, 2)
             except (TypeError, ValueError):
+                raw_avail_float = None
                 availability_pct = None
 
         denominator_minutes = 0.0
@@ -1308,11 +1329,7 @@ def api_availability():
             try:
                 sample_count = max(0.0, float(raw_count))
                 if sample_count > 0:
-                    inferred_interval_sec = (minutes * 60.0) / sample_count
-                    if inferred_interval_sec >= 1.0:
-                        denominator_minutes = min(sample_count * inferred_interval_sec / 60.0, minutes)
-                    else:
-                        denominator_minutes = min(sample_count * SCRAPE_INTERVAL_SECONDS / 60.0, minutes)
+                    denominator_minutes = min(round(sample_count * SCRAPE_INTERVAL_SECONDS / 60.0, 2), float(minutes))
                 else:
                     denominator_minutes = 0.0
             except (TypeError, ValueError):
@@ -1321,16 +1338,19 @@ def api_availability():
             denominator_minutes = float(minutes)
 
         downtime_minutes = (
-            round(denominator_minutes * (1 - availability_pct / 100.0), 2)
-            if availability_pct is not None else 0.0
+            round(denominator_minutes * (1.0 - (raw_avail_float / 100.0)), 2)
+            if raw_avail_float is not None else 0.0
         )
 
         incidents_count = 0
         if raw_incidents is not None:
             try:
-                incidents_count = int(round(float(raw_incidents) / 2.0))
+                incidents_count = int(math.ceil(float(raw_incidents) / 2.0))
             except (TypeError, ValueError):
                 incidents_count = 0
+        # If target has downtime but changes was 0 (e.g. down continuously the entire window), count as 1 incident
+        if incidents_count == 0 and downtime_minutes > 0:
+            incidents_count = 1
 
         avg_latency_ms = 0.0
         if raw_duration is not None:
@@ -1349,6 +1369,7 @@ def api_availability():
             "avg_latency_ms": avg_latency_ms
         })
 
+        # Historical status grouping for the card counts
         if availability_pct is not None:
             if availability_pct >= 99.9:
                 status = 'online'
@@ -1376,17 +1397,7 @@ def api_availability():
         key=lambda e: e['availability_pct']
     )
 
-    # Fleet analytics (Phase 11) — pure aggregation over `entries`, already
-    # computed above from the same Prometheus queries this endpoint already
-    # makes. No extra polling.
-    total_incidents = sum(e['incidents'] for e in entries)
-    total_downtime_minutes = sum(e['downtime_minutes'] for e in entries)
-    mean_outage_minutes = round(total_downtime_minutes / total_incidents, 1) if total_incidents else None
-    # Full filtered dataset, highest incident count first — no Top-N cap;
-    # the Detail modal renders every host with an incident belonging to the
-    # active Job filter.
-    most_unstable = sorted(entries, key=lambda e: (-e['incidents'], -e['downtime_minutes']))
-    most_unstable = [e for e in most_unstable if e['incidents'] > 0]
+    analytics = summary.get('analytics', {})
 
     return jsonify({
         "ok": True,
@@ -1394,6 +1405,8 @@ def api_availability():
         "end": end_ts,
         "counts": {
             "total": len(monitored_instances),
+            "scored": summary.get('scored_count', 0),
+            "eligible": summary.get('eligible_count', 0),
             "online": counts['online'],
             "warning": counts['warning'],
             "offline": counts['offline'],
@@ -1403,15 +1416,15 @@ def api_availability():
         "fleet_aggregate": summary['fleet_aggregate'],
         "fleet_average": summary['fleet_average'],
         "health_ratio": summary['health_ratio'],
+        "zero_downtime_ratio": summary.get('zero_downtime_ratio'),
+        "sla_compliance": summary.get('sla_compliance'),
+        "sla_compliance_ratio": summary.get('sla_compliance_ratio'),
+        "coverage_ratio": summary.get('coverage_ratio'),
         "per_server": summary['per_server'],
         "lowest_availability": lowest_availability,
-        "entries": entries,
+        "entries": summary['per_server']['values'],
         "targets": {e['id']: e['availability_pct'] for e in summary['per_server']['values']},
-        "analytics": {
-            "total_incidents": total_incidents,
-            "mean_outage_minutes": mean_outage_minutes,
-            "most_unstable": most_unstable,
-        },
+        "analytics": analytics,
     })
 
 @app.route('/api/target-history')
@@ -1425,6 +1438,14 @@ def target_history_api():
 
     if not target_url:
         return jsonify({"ok": False, "error": "Target parameter is required"}), 400
+
+    # PromQL Injection prevention: reject invalid characters
+    clean_target = target_url.replace('http://', '').replace('https://', '').rstrip('/')
+    if not re.match(r'^[a-zA-Z0-9.:_\-\/]+$', target_url):
+        return jsonify({"ok": False, "error": "Format target tidak valid"}), 400
+
+    safe_target_url = target_url.replace('"', '\\"')
+    safe_clean_target = clean_target.replace('"', '\\"')
 
     now_ts = int(time.time())
     end_param = request.args.get('end')
@@ -1441,11 +1462,10 @@ def target_history_api():
 
     from urllib.parse import quote
     
-    clean_target = target_url.replace('http://', '').replace('https://', '').rstrip('/')
     candidate_queries = [
-        f'probe_success{{instance="{target_url}"}}',
+        f'probe_success{{instance="{safe_target_url}"}}',
         f'probe_success{{instance=~".*{re.escape(clean_target)}.*"}}',
-        f'up{{instance="{target_url}"}}',
+        f'up{{instance="{safe_target_url}"}}',
         f'up{{instance=~".*{re.escape(clean_target)}.*"}}',
         'probe_success',
         'up'
@@ -1468,26 +1488,57 @@ def target_history_api():
                 break
 
     events = []
+    intervals_summary = None
     if values:
+        intervals_summary = reconstruct_time_series_intervals(
+            values,
+            window_start_ts=start_ts,
+            window_end_ts=end_ts,
+            expected_interval_sec=step
+        )
+
         current_state = None
         state_start_ts = None
+        max_gap_sec = step * 3.0
 
-        for ts, val_str in values:
-            val = 1 if str(val_str) in ('1', '1.0') else 0
+        for i, (ts, val_str) in enumerate(values):
+            val = 1 if str(val_str) in ('1', '1.0', 'up', 'true', 'True') else 0
             if current_state is None:
                 current_state = val
                 state_start_ts = ts
-            elif val != current_state:
-                duration_sec = int(ts - state_start_ts)
-                events.append({
-                    "status": "ONLINE" if current_state == 1 else "OFFLINE",
-                    "start_ts": int(state_start_ts),
-                    "end_ts": int(ts),
-                    "duration_seconds": duration_sec,
-                    "ongoing": False
-                })
-                current_state = val
-                state_start_ts = ts
+            else:
+                prev_ts = values[i - 1][0]
+                delta_t = ts - prev_ts
+                if delta_t > max_gap_sec:
+                    # Excess gap is UNKNOWN
+                    duration_sec = int(prev_ts - state_start_ts + step)
+                    events.append({
+                        "status": "ONLINE" if current_state == 1 else "OFFLINE",
+                        "start_ts": int(state_start_ts),
+                        "end_ts": int(prev_ts + step),
+                        "duration_seconds": max(0, duration_sec),
+                        "ongoing": False
+                    })
+                    events.append({
+                        "status": "UNKNOWN",
+                        "start_ts": int(prev_ts + step),
+                        "end_ts": int(ts),
+                        "duration_seconds": int(ts - (prev_ts + step)),
+                        "ongoing": False
+                    })
+                    current_state = val
+                    state_start_ts = ts
+                elif val != current_state:
+                    duration_sec = int(ts - state_start_ts)
+                    events.append({
+                        "status": "ONLINE" if current_state == 1 else "OFFLINE",
+                        "start_ts": int(state_start_ts),
+                        "end_ts": int(ts),
+                        "duration_seconds": max(0, duration_sec),
+                        "ongoing": False
+                    })
+                    current_state = val
+                    state_start_ts = ts
 
         if current_state is not None and state_start_ts is not None:
             is_ongoing = end_ts >= now_ts - 60
@@ -1507,7 +1558,7 @@ def target_history_api():
                 "status": "ONLINE" if current_state == 1 else "OFFLINE",
                 "start_ts": int(state_start_ts),
                 "end_ts": end_ts,
-                "duration_seconds": duration_sec,
+                "duration_seconds": max(0, duration_sec),
                 "ongoing": is_ongoing
             })
 
@@ -1626,7 +1677,8 @@ def target_history_api():
         "target": target_url,
         "period_minutes": minutes,
         "events": events,
-        "latency_points": latency_points
+        "latency_points": latency_points,
+        "intervals_summary": intervals_summary
     })
 
 
