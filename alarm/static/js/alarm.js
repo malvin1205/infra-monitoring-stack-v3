@@ -144,6 +144,7 @@ class InstancesPage {
 
     this.availabilityDetailBtn = document.getElementById('availabilityDetailBtn');
     this.availabilityBreakdownModal = document.getElementById('availabilityBreakdownModal');
+    this._showAllHostsInBreakdown = false;
 
     // In-flight request cancellation (AbortController), retry backoff state, and
     // a cheap "did the data actually change" signature to skip unnecessary
@@ -440,6 +441,46 @@ class InstancesPage {
     if (this.availabilityBreakdownModal) {
       this.availabilityBreakdownModal.addEventListener('click', e => {
         if (e.target === this.availabilityBreakdownModal) this._closeAvailabilityBreakdown();
+      });
+    }
+
+    const modalRangeSelect = document.getElementById('modalRangeSelect');
+    if (modalRangeSelect) {
+      modalRangeSelect.addEventListener('change', e => {
+        const mins = parseFloat(e.target.value);
+        if (!isNaN(mins) && mins > 0) {
+          this.periodMinutes = mins;
+          this.isRealtime = false;
+          this.periodEnd = null;
+          let label = '24h';
+          if (mins === 4320) label = '3d';
+          else if (mins === 10080) label = '7d';
+          else if (mins === 43200) label = '30d';
+          this.periodLabel = label;
+          this._setActiveRangeChip(label);
+          this.loadAvailability();
+        }
+      });
+    }
+
+    const btnViewAllHosts = document.getElementById('btnViewAllHosts');
+    if (btnViewAllHosts) {
+      btnViewAllHosts.addEventListener('click', () => {
+        this._showAllHostsInBreakdown = !this._showAllHostsInBreakdown;
+        const lbl = document.getElementById('viewAllHostsLabel');
+        if (lbl) lbl.textContent = this._showAllHostsInBreakdown ? 'Show top hosts' : 'View all hosts';
+        this._renderAvailabilityBreakdown();
+      });
+    }
+
+    const btnLearnCalculations = document.getElementById('btnLearnCalculations');
+    if (btnLearnCalculations) {
+      btnLearnCalculations.addEventListener('click', () => {
+        const panel = document.getElementById('calcExplanationPanel');
+        if (panel) {
+          const isHidden = panel.classList.toggle('hidden');
+          btnLearnCalculations.setAttribute('aria-expanded', !isHidden);
+        }
       });
     }
 
@@ -966,12 +1007,21 @@ class InstancesPage {
     }
   }
 
-  /* ── Availability breakdown modal (4 metrics, kept separate) ──── */
+  /* ── Availability breakdown modal (Historical service health) ── */
   _openAvailabilityBreakdown() {
     if (!this.availabilityBreakdownModal) return;
     this.availabilityBreakdownModal.classList.remove('hidden');
     if (this._untrapBreakdown) this._untrapBreakdown();
     this._untrapBreakdown = window.trapModalFocus(this.availabilityBreakdownModal);
+
+    const modalRangeSelect = document.getElementById('modalRangeSelect');
+    if (modalRangeSelect) {
+      const curMins = Math.round(this.periodMinutes);
+      const matchingOpt = Array.from(modalRangeSelect.options).find(o => Math.round(parseFloat(o.value)) === curMins);
+      if (matchingOpt) {
+        modalRangeSelect.value = matchingOpt.value;
+      }
+    }
     
     const currentMins = Math.round(this.periodMinutes);
     if (!this.availabilityBreakdown || Math.round(this.availabilityBreakdown.period_minutes || 0) !== currentMins) {
@@ -986,20 +1036,38 @@ class InstancesPage {
     if (this.availabilityBreakdownModal) this.availabilityBreakdownModal.classList.add('hidden');
   }
 
-  // Single source of truth for SLA status: read the backend's own
-  // COMPLIANT/NON_COMPLIANT/INSUFFICIENT_DATA verdict (which already
-  // accounts for coverage, not just the raw availability number) instead of
-  // re-deriving a pct-only threshold in the UI. A target with barely any
-  // observed coverage must never render as compliant just because the
-  // little data it has happens to look good.
+  // Format downtime in seconds to human-readable format: "12h 18m downtime", "4m 20s downtime", "0s downtime"
+  _formatDowntimeDuration(seconds) {
+    if (!seconds || seconds <= 0) return '0s downtime';
+    if (seconds < 60) return `${Math.round(seconds)}s downtime`;
+    if (seconds < 3600) {
+      const m = Math.floor(seconds / 60);
+      const s = Math.round(seconds % 60);
+      return s > 0 ? `${m}m ${s}s downtime` : `${m}m downtime`;
+    }
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    return `${h}h ${m.toString().padStart(2, '0')}m downtime`;
+  }
+
+  // Get clean friendly role/job badge for a host
+  _getHostRoleLabel(target, entry) {
+    if (target && target.labels && target.labels.role) return target.labels.role;
+    if (target && target.labels && target.labels.job && target.labels.job !== 'blackbox') return target.labels.job;
+    const job = (target && target.job) || (entry && entry.job) || '';
+    if (job === 'blackbox-ping-internal' || job === 'ping') return 'ICMP Ping';
+    if (job === 'blackbox_http' || job === 'http' || (target && target.isWeb)) return 'Web Server';
+    if (job === 'custom') return 'Custom Target';
+    if (job) return job;
+    return 'Server';
+  }
+
+  // Single source of truth for SLA status (used by detail drawer)
   _slaBadgeInfo(entry) {
     const status = entry && entry.sla_status;
     if (status === 'COMPLIANT') return { cls: 'alt-ok', label: 'COMPLIANT' };
     if (status === 'NON_COMPLIANT') return { cls: 'alt-warning', label: 'NON-COMPLIANT' };
     if (status === 'INSUFFICIENT_DATA') return { cls: 'alt-insufficient', label: 'INSUFFICIENT DATA' };
-    // Backend didn't send a verdict (older payload shape) — fall back to the
-    // same eligibility rule the backend uses (coverage-gated), never a bare
-    // pct threshold that could paint a low-coverage target green.
     const cov = typeof entry?.coverage_percent === 'number' ? entry.coverage_percent
       : (typeof entry?.coverage_pct === 'number' ? entry.coverage_pct : null);
     const avail = typeof entry?.availability_pct === 'number' ? entry.availability_pct : null;
@@ -1012,130 +1080,248 @@ class InstancesPage {
     const expectedMins = Math.round(this.periodMinutes);
     const isMatchingData = data && Math.round(data.period_minutes || 0) === expectedMins;
 
-    const fmtPct = m => (isMatchingData && m && typeof m.value === 'number') ? `${m.value.toFixed(2)}%` : '—';
+    // 1. Fleet Availability (Card 1)
+    const fleetAvail = (isMatchingData && data?.fleet_aggregate && typeof data.fleet_aggregate.value === 'number')
+      ? data.fleet_aggregate.value
+      : ((isMatchingData && typeof data?.overall === 'number') ? data.overall : null);
 
     const aggEl = document.getElementById('metricFleetAggregate');
-    if (aggEl) aggEl.textContent = fmtPct(data?.fleet_aggregate);
+    const splitUpEl = document.getElementById('splitBarUptime');
+    const splitDownEl = document.getElementById('splitBarDowntime');
+    const legendUpEl = document.getElementById('legendUptimePct');
+    const legendDownEl = document.getElementById('legendDowntimePct');
+    const gaugeCircleEl = document.getElementById('fleetGaugeCircle');
 
-    const avgEl = document.getElementById('metricFleetAverage');
-    if (avgEl) avgEl.textContent = fmtPct(data?.fleet_average);
+    if (fleetAvail !== null) {
+      const upPctStr = `${fleetAvail.toFixed(2)}%`;
+      const downPct = Math.max(0, 100 - fleetAvail);
+      const downPctStr = `${downPct.toFixed(2)}%`;
 
-    const slaEl = document.getElementById('metricSlaCompliance');
-    if (slaEl) slaEl.textContent = fmtPct(data?.sla_compliance_ratio || data?.sla_compliance);
+      if (aggEl) aggEl.textContent = upPctStr;
+      if (splitUpEl) splitUpEl.style.width = `${fleetAvail.toFixed(2)}%`;
+      if (splitDownEl) splitDownEl.style.width = `${downPct.toFixed(2)}%`;
+      if (legendUpEl) legendUpEl.textContent = upPctStr;
+      if (legendDownEl) legendDownEl.textContent = downPctStr;
+
+      if (gaugeCircleEl) {
+        // Circumference for r=34 is 2 * PI * 34 = 213.63
+        const offset = Math.max(0, Math.min(213.6, 213.6 * (1.0 - (fleetAvail / 100.0))));
+        gaugeCircleEl.style.strokeDashoffset = offset.toFixed(1);
+      }
+    } else {
+      if (aggEl) aggEl.textContent = '—';
+      if (splitUpEl) splitUpEl.style.width = '0%';
+      if (splitDownEl) splitDownEl.style.width = '0%';
+      if (legendUpEl) legendUpEl.textContent = '—';
+      if (legendDownEl) legendDownEl.textContent = '—';
+      if (gaugeCircleEl) gaugeCircleEl.style.strokeDashoffset = '213.6';
+    }
+
+    // 2. Healthy Hosts (Card 2)
+    const healthRatio = (isMatchingData && data?.health_ratio && typeof data.health_ratio.value === 'number')
+      ? data.health_ratio.value
+      : null;
+    const healthyCount = data?.health_ratio?.healthy_count ?? data?.healthy_hosts_count ?? null;
+    const totalCount = data?.health_ratio?.total_count ?? data?.counts?.total ?? (data?.entries ? data.entries.length : null);
 
     const healthEl = document.getElementById('metricHealthRatio');
-    if (healthEl) healthEl.textContent = fmtPct(data?.health_ratio);
+    const healthyCountEl = document.getElementById('metricHealthyHostsCount');
 
-    const covRatioEl = document.getElementById('metricCoverageRatio');
-    if (covRatioEl) covRatioEl.textContent = fmtPct(data?.coverage_ratio);
-
-    const analytics = isMatchingData ? data?.analytics : null;
-    const meanOutageEl = document.getElementById('metricMeanOutage');
-    if (meanOutageEl) {
-      const m = analytics && analytics.mean_outage_minutes;
-      meanOutageEl.textContent = (typeof m === 'number') ? (m < 60 ? `${m.toFixed(1)}m` : `${(m / 60).toFixed(1)}h`) : '—';
-    }
-
-    const unstableTableEl = document.getElementById('mostUnstableTable');
-    if (unstableTableEl) {
-      const list = analytics && Array.isArray(analytics.most_unstable) ? analytics.most_unstable : [];
-      if (!isMatchingData) {
-        unstableTableEl.innerHTML = '<div class="de-empty">Memuat data histori...</div>';
-      } else if (list.length === 0) {
-        unstableTableEl.innerHTML = '<div class="de-empty">No incidents recorded</div>';
-      } else {
-        unstableTableEl.innerHTML = list.map((entry, i) => {
-          const pct = typeof entry.availability_pct === 'number' ? entry.availability_pct.toFixed(2) + '%' : '—';
-          const sla = this._slaBadgeInfo(entry);
-          return `
-            <div class="alt-row alt-row-ranked">
-              <span class="alt-rank">#${i + 1}</span>
-              <span class="alt-host">${this._esc(entry.name || entry.id || '—')}</span>
-              <span class="alt-incidents">${entry.incidents} incident${entry.incidents === 1 ? '' : 's'}</span>
-              <span class="sla-badge ${sla.cls}">${sla.label}</span>
-              <span class="alt-pct ${sla.cls}">${pct}</span>
-            </div>`;
-        }).join('');
+    if (healthRatio !== null) {
+      if (healthEl) healthEl.textContent = `${healthRatio.toFixed(2)}%`;
+      if (healthyCountEl && healthyCount !== null && totalCount !== null) {
+        healthyCountEl.textContent = `${healthyCount} / ${totalCount} hosts`;
+      } else if (healthyCountEl) {
+        healthyCountEl.textContent = `${healthRatio.toFixed(1)}% healthy`;
       }
+    } else {
+      if (healthEl) healthEl.textContent = '—';
+      if (healthyCountEl) healthyCountEl.textContent = '— / — hosts';
     }
 
-    const tableEl = document.getElementById('availabilityLowestTable');
-    if (!tableEl) return;
+    // Keep hidden secondary metrics updated for test/DOM compatibility
+    const avgEl = document.getElementById('metricFleetAverage');
+    if (avgEl) avgEl.textContent = (isMatchingData && data?.fleet_average?.value !== null) ? `${data.fleet_average.value.toFixed(2)}%` : '—';
+    const slaEl = document.getElementById('metricSlaCompliance');
+    if (slaEl) slaEl.textContent = (isMatchingData && data?.sla_compliance_ratio?.value !== null) ? `${data.sla_compliance_ratio.value.toFixed(2)}%` : '—';
+    const covRatioEl = document.getElementById('metricCoverageRatio');
+    if (covRatioEl) covRatioEl.textContent = (isMatchingData && data?.coverage_ratio?.value !== null) ? `${data.coverage_ratio.value.toFixed(2)}%` : '—';
+
+    // 3. Hosts Requiring Attention
+    const listEl = document.getElementById('hostsRequiringAttentionList');
+    if (!listEl) return;
 
     if (!isMatchingData) {
-      tableEl.innerHTML = '<div class="de-empty">Memuat data histori server...</div>';
+      listEl.innerHTML = '<div class="de-empty" style="padding: 24px; text-align: center; color: var(--text-secondary);">Loading host availability data...</div>';
       return;
     }
 
-    const lowest = (data && Array.isArray(data.lowest_availability)) ? data.lowest_availability : [];
-    if (lowest.length === 0) {
-      tableEl.innerHTML = '<div class="de-empty">All monitored servers currently have 100% availability.</div>';
+    const rawEntries = (data && Array.isArray(data.entries)) ? data.entries
+      : (data && data.per_server && Array.isArray(data.per_server.values) ? data.per_server.values : []);
+
+    if (rawEntries.length === 0) {
+      listEl.innerHTML = '<div class="de-empty" style="padding: 24px; text-align: center; color: var(--text-secondary);">No monitored hosts found.</div>';
       return;
     }
 
-    tableEl.innerHTML = lowest.map(entry => {
-      const pct = entry.availability_pct;
-      const sla = this._slaBadgeInfo(entry);
+    // Normalizing and preparing entries
+    const processedHosts = rawEntries.map(e => {
+      const avail = typeof e.availability_pct === 'number' ? e.availability_pct : null;
+      const downMin = typeof e.downtime_minutes === 'number' ? e.downtime_minutes : 0;
+      const downSec = typeof e.downtime_seconds === 'number' ? e.downtime_seconds : (downMin * 60);
+      const inc = parseInt(e.incidents || e.incident_count || 0, 10) || 0;
+      const covPct = typeof e.coverage_percent === 'number' ? e.coverage_percent : (typeof e.coverage_pct === 'number' ? e.coverage_pct : 0);
+      const obsSec = typeof e.observed_seconds === 'number' ? e.observed_seconds : ((e.observed_minutes || e.coverage_minutes || 0) * 60);
+
+      const isNoData = obsSec <= 0 || avail === null;
+      const isLimitedData = !isNoData && (covPct < 50);
+
+      return {
+        id: e.id || e.name,
+        name: e.name || e.id || '—',
+        job: e.job || '',
+        availability: avail,
+        downtimeDurationSeconds: downSec,
+        incidentCount: inc,
+        coveragePercent: covPct,
+        observedDurationSeconds: obsSec,
+        isNoData: isNoData,
+        isLimitedData: isLimitedData,
+        rawEntry: e
+      };
+    });
+
+    // 3-level priority sorting:
+    // 1. Availability ascending (lowest availability first)
+    // 2. Downtime duration descending (longest downtime first)
+    // 3. Incident count descending (most incidents first)
+    processedHosts.sort((a, b) => {
+      const availA = a.availability !== null ? a.availability : 999;
+      const availB = b.availability !== null ? b.availability : 999;
+      if (availA !== availB) return availA - availB;
+      if (b.downtimeDurationSeconds !== a.downtimeDurationSeconds) return b.downtimeDurationSeconds - a.downtimeDurationSeconds;
+      return b.incidentCount - a.incidentCount;
+    });
+
+    // Find hosts needing attention
+    const hostsNeedingAttention = processedHosts.filter(h => (h.availability !== null && h.availability < 100) || h.downtimeDurationSeconds > 0 || h.incidentCount > 0 || h.isNoData);
+
+    const displayList = this._showAllHostsInBreakdown
+      ? processedHosts
+      : (hostsNeedingAttention.length > 0 ? hostsNeedingAttention.slice(0, 5) : processedHosts.slice(0, 5));
+
+    if (displayList.length === 0) {
+      listEl.innerHTML = '<div class="de-empty" style="padding: 24px; text-align: center; color: var(--text-secondary);">All monitored hosts currently have 100% availability with zero recorded downtime.</div>';
+      return;
+    }
+
+    listEl.innerHTML = displayList.map(h => {
+      const target = this.data.find(t => t.instance === h.id || t.instance === h.name);
+      const roleLabel = this._getHostRoleLabel(target, h);
+
+      // Severity styling & icon
+      let sevClass = 'ara-sev-good';
+      let sevIcon = '<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="3.5 8 6.5 11 12.5 5"></polyline></svg>';
+      let pctClass = 'pct-good';
+      let barClass = 'bar-fill-good';
+
+      if (h.isNoData) {
+        sevClass = 'ara-sev-warning';
+        sevIcon = '?';
+        pctClass = 'pct-muted';
+        barClass = 'bar-fill-warning';
+      } else if (h.availability < 60) {
+        sevClass = 'ara-sev-critical';
+        sevIcon = '!';
+        pctClass = 'pct-critical';
+        barClass = 'bar-fill-critical';
+      } else if (h.availability < 80) {
+        sevClass = 'ara-sev-orange';
+        sevIcon = '!';
+        pctClass = 'pct-orange';
+        barClass = 'bar-fill-orange';
+      } else if (h.availability < 95) {
+        sevClass = 'ara-sev-warning';
+        sevIcon = '!';
+        pctClass = 'pct-warning';
+        barClass = 'bar-fill-warning';
+      }
+
+      const availText = h.isNoData ? '—' : `${h.availability.toFixed(2)}%`;
+      const barWidth = h.isNoData ? 0 : Math.max(0, Math.min(100, h.availability));
+      const downtimeText = this._formatDowntimeDuration(h.downtimeDurationSeconds);
+      const incidentsText = `${h.incidentCount} incident${h.incidentCount === 1 ? '' : 's'}`;
+
+      let badgeHtml = '';
+      if (h.isNoData) {
+        badgeHtml = '<span class="ara-nodata-badge">NO DATA</span>';
+      } else if (h.isLimitedData) {
+        badgeHtml = '<span class="ara-limited-badge" title="Observed duration is < 50% of the selected window">LIMITED DATA</span>';
+      }
+
       return `
-        <div class="alt-row">
-          <span class="alt-host">${this._esc(entry.name || entry.id || '—')}</span>
-          <span class="sla-badge ${sla.cls}">${sla.label}</span>
-          <span class="alt-pct ${sla.cls}">${typeof pct === 'number' ? pct.toFixed(2) + '%' : '—'}</span>
+        <div class="ara-row" data-instance="${this._esc(h.id)}" role="button" tabindex="0" title="Click to view host details">
+          <!-- Col 1: Host / IP -->
+          <div class="ara-host-col">
+            <div class="ara-severity-icon ${sevClass}">${sevIcon}</div>
+            <div class="ara-host-meta">
+              <span class="ara-hostname">${this._esc(h.name)}</span>
+              <div class="ara-badges-row">
+                <span class="ara-job-badge">${this._esc(roleLabel)}</span>
+                ${badgeHtml}
+              </div>
+            </div>
+          </div>
+
+          <!-- Col 2: Availability & Bar -->
+          <div class="ara-avail-col">
+            <span class="ara-avail-pct ${pctClass}">${availText}</span>
+            <div class="ara-bar-container">
+              <div class="ara-bar-track">
+                <div class="ara-bar-fill ${barClass}" style="width: ${barWidth}%;"></div>
+              </div>
+              <div class="ara-bar-ticks">
+                <span>0%</span>
+                <span>50%</span>
+                <span>100%</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Col 3: Impact -->
+          <div class="ara-impact-col">
+            <div class="ara-impact-info">
+              <svg class="ara-pulse-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline>
+              </svg>
+              <div class="ara-impact-texts">
+                <span class="ara-incidents-text">${incidentsText}</span>
+                <span class="ara-downtime-text">${downtimeText}</span>
+              </div>
+            </div>
+            <svg class="ara-chevron" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="6 3 11 8 6 13"></polyline>
+            </svg>
+          </div>
         </div>`;
     }).join('');
 
-    const logTableEl = document.getElementById('availabilityIncidentLogTable');
-    if (logTableEl) {
-      const allEntries = (data && Array.isArray(data.entries)) ? data.entries : (data && data.summary && data.summary.per_server && Array.isArray(data.summary.per_server.values) ? data.summary.per_server.values : lowest);
-      
-      if (!allEntries || allEntries.length === 0) {
-        logTableEl.innerHTML = '<div class="de-empty">No downtime incidents recorded</div>';
-      } else {
-        const nowMs = Date.now();
-        const periodSec = (this.periodMinutes || 1440) * 60;
-
-        logTableEl.innerHTML = allEntries.map(entry => {
-          let pct = typeof entry.availability_pct === 'number' ? entry.availability_pct : 100;
-          let incidents = entry.incidents || 0;
-          let downMin = entry.downtime_minutes || 0;
-          let downSec = Math.round(downMin * 60);
-
-          const target = this.data.find(t => t.instance === (entry.name || entry.id));
-          if (target && target.health !== 'up') {
-            let liveDownSec = 0;
-            if (target.downSince && target.downSince > 0) {
-              liveDownSec = Math.max(0, (nowMs - target.downSince * 1000) / 1000);
-            } else if (this.downStartTimes[target.instance]) {
-              liveDownSec = Math.max(0, (nowMs - this.downStartTimes[target.instance]) / 1000);
-            }
-            if (liveDownSec > 0) {
-              downSec = Math.max(downSec, Math.round(liveDownSec));
-              downMin = downSec / 60.0;
-              const livePct = Math.max(0, Math.min(100, ((periodSec - downSec) / periodSec) * 100));
-              pct = Math.min(pct, livePct);
-            }
-          }
-
-          const downText = downSec > 0 ? (downSec < 60 ? `${downSec}s` : `${downMin.toFixed(1)}m`) : '0s';
-          // SLA badge comes from the backend's own historical verdict
-          // (entry.sla_status) — never from `pct`, which above is blended
-          // with the live ongoing-outage extension. Live status and
-          // historical SLA status stay on separate signals.
-          const sla = this._slaBadgeInfo(entry);
-
-          return `
-            <div class="alt-row" style="display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 0.4rem 0.75rem; padding: 0.5rem 0.75rem; border-bottom: 1px solid var(--border-subtle, rgba(255,255,255,0.05)); font-size: 0.85rem;">
-              <div style="font-weight: 500; font-family: var(--font-mono, monospace); color: var(--fg-main); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; max-width: 100%;">${this._esc(entry.name || entry.id || '—')}</div>
-              <div style="display: flex; flex-wrap: wrap; gap: 0.5rem 1rem; align-items: center;">
-                <span style="color: var(--fg-muted); font-size: 0.8rem; white-space: nowrap;">Incidents: <strong style="color: ${incidents > 0 ? 'var(--critical)' : 'var(--success)'};">${incidents}</strong></span>
-                <span style="color: var(--fg-muted); font-size: 0.8rem; white-space: nowrap;">Downtime: <strong style="color: ${downSec > 0 ? 'var(--critical)' : 'var(--success)'};">${downText}</strong></span>
-                <span class="sla-badge ${sla.cls}">${sla.label}</span>
-                <span class="alt-pct ${sla.cls}">${typeof pct === 'number' ? pct.toFixed(2) + '%' : '—'}</span>
-              </div>
-            </div>`;
-        }).join('');
-      }
-    }
+    // Attach click listeners to rows to open drawer
+    listEl.querySelectorAll('.ara-row').forEach(row => {
+      const inst = row.dataset.instance;
+      const onSelect = () => {
+        const target = this.data.find(t => t.instance === inst) || { instance: inst, job: 'blackbox' };
+        this._closeAvailabilityBreakdown();
+        this._openDrawer(target);
+      };
+      row.addEventListener('click', onSelect);
+      row.addEventListener('keydown', e => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          onSelect();
+        }
+      });
+    });
   }
 
   startPolling(ms) {

@@ -394,16 +394,23 @@ def summarize_entries(
         per_server.append({
             "id": entry.get("id"),
             "name": entry.get("name") or entry.get("id"),
+            "job": entry.get("job", ""),
             "availability_pct": availability_pct,
             "coverage_minutes": round(coverage_minutes, 2),
             "denominator_minutes": round(coverage_minutes, 2),
+            "observed_minutes": round(coverage_minutes, 2),
+            "observed_seconds": round(coverage_minutes * 60.0, 1),
             "uptime_minutes": round(uptime_minutes, 2),
+            "uptime_seconds": round(uptime_minutes * 60.0, 1),
             "downtime_minutes": round(downtime_minutes, 2),
+            "downtime_seconds": round(downtime_minutes * 60.0, 1),
             "unknown_minutes": round(unknown_minutes, 2),
             "coverage_pct": coverage_pct,
             "coverage_percent": coverage_pct,
             "unknown_pct": unknown_pct,
             "unknown_percent": unknown_pct,
+            "is_limited_data": (coverage_pct < min_sla_coverage_pct and coverage_minutes > 0),
+            "is_no_data": (coverage_minutes <= 0 or availability_pct is None),
             "sla_eligible": is_eligible,
             "sla_compliant": (sla_status == "COMPLIANT"),
             "sla_status": sla_status,
@@ -457,11 +464,14 @@ def summarize_entries(
         key=lambda e: (-e["incidents"], -e["downtime_minutes"])
     )
 
+    downtime_split_pct = round(_clamp_pct(100.0 - fleet_aggregate), 2) if fleet_aggregate is not None else None
+
     return {
         "period_minutes": round(period_minutes, 2),
         "server_count": server_count,
         "scored_count": scored_count,
         "eligible_count": eligible_count,
+        "healthy_hosts_count": never_down_count,
         "per_server": {
             "label": "Per-Server Availability",
             "unit": "%",
@@ -473,13 +483,21 @@ def summarize_entries(
             "unit": "%",
         },
         "fleet_aggregate": {
-            "label": "Fleet Aggregate Availability (weighted, SLA)",
+            "label": "Fleet Aggregate Availability (weighted)",
             "value": fleet_aggregate,
+            "uptime_percent": fleet_aggregate,
+            "downtime_percent": downtime_split_pct,
+            "total_uptime_minutes": round(total_uptime, 2),
+            "total_downtime_minutes": round(total_downtime, 2),
+            "total_observed_minutes": round(total_coverage, 2),
             "unit": "%",
         },
         "health_ratio": {
-            "label": "Health Ratio (never-down servers)",
+            "label": "Healthy Hosts (no recorded downtime)",
             "value": health_ratio,
+            "healthy_count": never_down_count,
+            "total_count": scored_count,
+            "server_count": server_count,
             "unit": "%",
         },
         "zero_downtime_ratio": {

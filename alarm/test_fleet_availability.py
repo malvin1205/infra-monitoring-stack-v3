@@ -317,6 +317,53 @@ class FleetAvailabilityTests(unittest.TestCase):
         self.assertFalse(server["sla_eligible"])
         self.assertNotEqual(server["sla_status"], "COMPLIANT")
 
+    def test_observed_vs_coverage_decoupling_and_limited_data_flags(self):
+        """Availability must be computed from observed duration (not full window),
+        coverage must be separate, and limited/no data flags must be correct."""
+        # 7-day window (10080 min):
+        # host-1: observed 2 days (2880 min), 1 day up, 1 day down -> 50% avail, coverage = 2880/10080 = 28.57% (<50% -> is_limited_data)
+        # host-2: observed 7 days (10080 min), 7 days up -> 100% avail, coverage = 100%, 0 downtime (healthy)
+        # host-3: observed 0 min -> no data
+        window = 10080.0
+        entries = [
+            {"id": "h1", "name": "host-1", "denominator_minutes": 2880.0, "downtime_minutes": 1440.0, "incidents": 1},
+            {"id": "h2", "name": "host-2", "denominator_minutes": 10080.0, "downtime_minutes": 0.0, "incidents": 0},
+            {"id": "h3", "name": "host-3", "denominator_minutes": 0.0, "downtime_minutes": 0.0, "incidents": 0, "availability_pct": None},
+        ]
+        result = summarize_entries(entries, window, min_sla_coverage_pct=50.0)
+
+        h1 = result["per_server"]["values"][0]
+        self.assertEqual(h1["availability_pct"], 50.0)
+        self.assertEqual(h1["observed_minutes"], 2880.0)
+        self.assertEqual(h1["observed_seconds"], 2880.0 * 60.0)
+        self.assertEqual(h1["downtime_seconds"], 1440.0 * 60.0)
+        self.assertAlmostEqual(h1["coverage_percent"], 28.57, places=1)
+        self.assertTrue(h1["is_limited_data"])
+        self.assertFalse(h1["is_no_data"])
+
+        h2 = result["per_server"]["values"][1]
+        self.assertEqual(h2["availability_pct"], 100.0)
+        self.assertFalse(h2["is_limited_data"])
+        self.assertFalse(h2["is_no_data"])
+
+        h3 = result["per_server"]["values"][2]
+        self.assertIsNone(h3["availability_pct"])
+        self.assertTrue(h3["is_no_data"])
+        self.assertFalse(h3["is_limited_data"])
+
+        # Health ratio: 1 healthy (h2) out of 2 scored (h1, h2) -> 50%
+        self.assertEqual(result["healthy_hosts_count"], 1)
+        self.assertEqual(result["health_ratio"]["healthy_count"], 1)
+        self.assertEqual(result["health_ratio"]["total_count"], 2)
+        self.assertEqual(result["health_ratio"]["server_count"], 3)
+        self.assertEqual(result["health_ratio"]["value"], 50.0)
+
+        # Fleet aggregate: total uptime = 1440 + 10080 = 11520, total observed = 2880 + 10080 = 12960
+        expected_fleet_avail = round((11520 / 12960) * 100.0, 2)
+        self.assertEqual(result["fleet_aggregate"]["value"], expected_fleet_avail)
+        self.assertEqual(result["fleet_aggregate"]["uptime_percent"], expected_fleet_avail)
+        self.assertEqual(result["fleet_aggregate"]["downtime_percent"], round(100.0 - expected_fleet_avail, 2))
+
 
 if __name__ == "__main__":
     unittest.main()

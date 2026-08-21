@@ -806,61 +806,195 @@
 
   <!-- Availability Breakdown Modal -->
   <div id="availabilityBreakdownModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="availabilityBreakdownTitle">
-    <div class="modal-card modal-card-wide">
-      <div class="modal-header">
-        <h3 class="modal-title" id="availabilityBreakdownTitle">Availability Breakdown <span id="availabilityBreakdownRange" class="modal-title-sub">(24h)</span></h3>
-        <button id="closeAvailabilityBreakdown" class="modal-close" type="button" aria-label="Close modal">&times;</button>
+    <div class="modal-card modal-card-wide avail-modal-card">
+      <div class="avail-modal-header">
+        <div class="avail-header-left">
+          <div class="avail-header-icon-box">
+            <svg class="avail-header-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline>
+            </svg>
+          </div>
+          <div class="avail-header-text">
+            <h3 class="avail-modal-title" id="availabilityBreakdownTitle">Availability Breakdown <span id="availabilityBreakdownRange" class="modal-title-sub hidden">(24h)</span></h3>
+            <p class="avail-modal-subtitle">Historical availability overview across your infrastructure.</p>
+          </div>
+        </div>
+        <div class="avail-header-right">
+          <div class="avail-range-selector">
+            <svg class="avail-calendar-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect>
+              <line x1="16" y1="2" x2="16" y2="6"></line>
+              <line x1="8" y1="2" x2="8" y2="6"></line>
+              <line x1="3" y1="10" x2="21" y2="10"></line>
+            </svg>
+            <select id="modalRangeSelect" class="avail-range-select" aria-label="Select time range">
+              <option value="1440">Last 24 Hours</option>
+              <option value="4320" selected>Last 3 Days</option>
+              <option value="10080">Last 7 Days</option>
+              <option value="43200">Last 30 Days</option>
+            </select>
+          </div>
+          <button id="closeAvailabilityBreakdown" class="modal-close" type="button" aria-label="Close modal">&times;</button>
+        </div>
       </div>
 
-      <div class="modal-body">
-        <!-- 5 metrics, kept explicitly separate — not blended into one number -->
-        <div class="avail-metric-grid">
-          <div class="avail-metric-card avail-metric-primary">
-            <span class="avail-metric-label">Fleet Aggregate <em>(weighted by time — SLA)</em></span>
-            <span class="avail-metric-value" id="metricFleetAggregate">—</span>
+      <div class="modal-body avail-modal-body">
+        <!-- Top 2 Primary Metric Cards -->
+        <div class="avail-hero-grid">
+          <!-- Card 1: Fleet Availability -->
+          <div class="avail-hero-card avail-hero-fleet">
+            <div class="avail-hero-content">
+              <div class="avail-hero-header">
+                <span class="avail-hero-title">FLEET AVAILABILITY</span>
+                <span class="avail-info-btn" title="Overall uptime across all monitored hosts (sum of all uptime durations / sum of all observed durations)" aria-label="Fleet Availability Info">
+                  <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="16" x2="12" y2="12"></line><line x1="12" y1="8" x2="12.01" y2="8"></line></svg>
+                </span>
+              </div>
+              <div class="avail-hero-value" id="metricFleetAggregate">—</div>
+              <div class="avail-hero-desc">Overall uptime across all monitored hosts</div>
+
+              <div class="avail-split-bar-wrap">
+                <div class="avail-split-bar">
+                  <div class="avail-split-fill-up" id="splitBarUptime" style="width: 100%;"></div>
+                  <div class="avail-split-fill-down" id="splitBarDowntime" style="width: 0%;"></div>
+                </div>
+                <div class="avail-split-legend">
+                  <span class="legend-item"><span class="legend-dot dot-up"></span> Uptime <strong id="legendUptimePct">—</strong></span>
+                  <span class="legend-item"><span class="legend-dot dot-down"></span> Downtime <strong id="legendDowntimePct">—</strong></span>
+                </div>
+              </div>
+            </div>
+
+            <div class="avail-hero-graphic" aria-hidden="true">
+              <svg class="avail-gauge-ring" viewBox="0 0 80 80">
+                <circle class="gauge-bg" cx="40" cy="40" r="34" />
+                <circle class="gauge-fill" id="fleetGaugeCircle" cx="40" cy="40" r="34" stroke-dasharray="213.6" stroke-dashoffset="0" />
+              </svg>
+              <div class="avail-gauge-icon-wrap">
+                <svg class="server-rack-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="2" y="2" width="20" height="8" rx="2" ry="2"></rect>
+                  <rect x="2" y="14" width="20" height="8" rx="2" ry="2"></rect>
+                  <line x1="6" y1="6" x2="6.01" y2="6"></line>
+                  <line x1="6" y1="18" x2="6.01" y2="18"></line>
+                </svg>
+                <div class="gauge-check-badge">
+                  <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="2.5 6 4.5 8.5 9.5 3.5"></polyline></svg>
+                </div>
+              </div>
+            </div>
           </div>
-          <div class="avail-metric-card">
-            <span class="avail-metric-label">Fleet Average <em>(unweighted)</em></span>
-            <span class="avail-metric-value" id="metricFleetAverage">—</span>
-          </div>
-          <div class="avail-metric-card">
-            <span class="avail-metric-label">SLA Compliance <em>(&ge; 99.9%)</em></span>
-            <span class="avail-metric-value" id="metricSlaCompliance">—</span>
-          </div>
-          <div class="avail-metric-card">
-            <span class="avail-metric-label">Health Ratio <em>(zero downtime)</em></span>
-            <span class="avail-metric-value" id="metricHealthRatio">—</span>
-          </div>
-          <div class="avail-metric-card">
-            <span class="avail-metric-label">Mean Outage Duration</span>
-            <span class="avail-metric-value" id="metricMeanOutage">—</span>
-          </div>
-          <div class="avail-metric-card">
-            <span class="avail-metric-label">Fleet Coverage <em>(observed time)</em></span>
-            <span class="avail-metric-value" id="metricCoverageRatio">—</span>
+
+          <!-- Card 2: Healthy Hosts -->
+          <div class="avail-hero-card avail-hero-healthy">
+            <div class="avail-hero-content">
+              <div class="avail-hero-header">
+                <span class="avail-hero-title">HEALTHY HOSTS</span>
+                <span class="avail-info-btn" title="Hosts with zero recorded downtime within the observed time range" aria-label="Healthy Hosts Info">
+                  <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="16" x2="12" y2="12"></line><line x1="12" y1="8" x2="12.01" y2="8"></line></svg>
+                </span>
+              </div>
+              <div class="avail-hero-value" id="metricHealthRatio">—</div>
+              <div class="avail-hero-desc">Hosts with no recorded downtime</div>
+
+              <div class="avail-healthy-stat">
+                <span class="avail-healthy-count-text" id="metricHealthyHostsCount">— / — hosts</span>
+              </div>
+            </div>
+
+            <div class="avail-hero-graphic" aria-hidden="true">
+              <div class="avail-shield-container">
+                <svg class="avail-shield-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
+                  <polyline points="9 12 11 14 15 10"></polyline>
+                </svg>
+              </div>
+            </div>
           </div>
         </div>
 
-        <div class="avail-breakdown-section">
-          <div class="avail-breakdown-title">Unstable Hosts <em>(by incident count)</em></div>
-          <div class="avail-lowest-table" id="mostUnstableTable">
-            <div class="de-empty">No incidents recorded</div>
+        <!-- Hidden compat elements for secondary metrics if needed by tests/scripts -->
+        <div class="hidden" aria-hidden="true">
+          <span id="metricFleetAverage">—</span>
+          <span id="metricSlaCompliance">—</span>
+          <span id="metricCoverageRatio">—</span>
+          <span id="metricMeanOutage">—</span>
+          <div id="mostUnstableTable"></div>
+          <div id="availabilityLowestTable"></div>
+          <div id="availabilityIncidentLogTable"></div>
+        </div>
+
+        <!-- Section: Hosts Requiring Attention -->
+        <div class="avail-attention-section">
+          <div class="avail-attention-header">
+            <div>
+              <h4 class="avail-attention-title">HOSTS REQUIRING ATTENTION</h4>
+              <p class="avail-attention-subtitle">Sorted by availability (ascending)</p>
+            </div>
+            <button type="button" id="btnViewAllHosts" class="avail-view-all-btn">
+              <span id="viewAllHostsLabel">View all hosts</span>
+              <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="6 3 11 8 6 13"></polyline>
+              </svg>
+            </button>
+          </div>
+
+          <div class="avail-attention-table-wrap">
+            <div class="avail-table-header">
+              <span class="ath-col ath-host">HOST / IP</span>
+              <span class="ath-col ath-avail">AVAILABILITY</span>
+              <span class="ath-col ath-impact">IMPACT</span>
+            </div>
+
+            <div class="avail-attention-list" id="hostsRequiringAttentionList">
+              <div class="de-empty">Loading host availability data...</div>
+            </div>
           </div>
         </div>
 
-        <div class="avail-breakdown-section" style="margin-top: 1.25rem;">
-          <div class="avail-breakdown-title">Lowest Availability — Per Server</div>
-          <div class="avail-lowest-table" id="availabilityLowestTable">
-            <div class="de-empty">No data</div>
+        <!-- Section: Calculations Details Drawer (Collapsible) -->
+        <div id="calcExplanationPanel" class="avail-calc-panel hidden">
+          <div class="avail-calc-card">
+            <div class="avail-calc-title">How Availability & Coverage are Calculated</div>
+            <div class="avail-calc-grid">
+              <div class="avail-calc-item">
+                <strong>Observed Duration</strong>
+                <span>Total time a host was actively monitored by Prometheus in the selected window.</span>
+              </div>
+              <div class="avail-calc-item">
+                <strong>Availability</strong>
+                <span><code>(Uptime / Observed Duration) × 100%</code>. Unmonitored time is excluded so newly added hosts are not penalized.</span>
+              </div>
+              <div class="avail-calc-item">
+                <strong>Coverage</strong>
+                <span><code>(Observed Duration / Selected Window) × 100%</code>. Hosts with &lt;50% coverage display a <span class="badge-limited-data-sample">LIMITED DATA</span> indicator.</span>
+              </div>
+              <div class="avail-calc-item">
+                <strong>Fleet Availability</strong>
+                <span><code>(Total Uptime across Fleet / Total Observed Duration) × 100%</code>.</span>
+              </div>
+            </div>
           </div>
         </div>
+      </div>
 
-        <div class="avail-breakdown-section" style="margin-top: 1.25rem;">
-          <div class="avail-breakdown-title">Downtime & Incident Log — Per Server</div>
-          <div class="avail-lowest-table" id="availabilityIncidentLogTable">
-            <div class="de-empty">No downtime incidents recorded</div>
-          </div>
+      <!-- Modal Footer -->
+      <div class="avail-modal-footer">
+        <div class="avail-footer-info">
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="10"></circle>
+            <line x1="12" y1="16" x2="12" y2="12"></line>
+            <line x1="12" y1="8" x2="12.01" y2="8"></line>
+          </svg>
+          <span>Availability is calculated based on observed monitoring time for each host.</span>
         </div>
+        <button type="button" id="btnLearnCalculations" class="avail-footer-link" aria-expanded="false" aria-controls="calcExplanationPanel">
+          <span>Learn more about calculations</span>
+          <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path>
+            <polyline points="15 3 21 3 21 9"></polyline>
+            <line x1="10" y1="14" x2="21" y2="3"></line>
+          </svg>
+        </button>
       </div>
     </div>
   </div>

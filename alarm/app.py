@@ -1387,14 +1387,17 @@ def api_availability():
 
     summary = summarize_entries(entries, minutes)
 
-    # Full filtered dataset, lowest availability first — no Top-N cap; the
-    # Detail modal renders every host belonging to the active Job filter that
-    # isn't at perfect (100.00%) availability. A server exactly at 100% has
-    # nothing "lowest" to report, so it's excluded from this list only (it
-    # still counts normally everywhere else — counts/fleet_aggregate/etc).
+    # 3-level priority sort:
+    # 1. Availability ascending (lowest first)
+    # 2. Downtime duration descending (longest outage first)
+    # 3. Incident count descending (most frequent incidents first)
     lowest_availability = sorted(
         [e for e in summary['per_server']['values'] if e['availability_pct'] is not None and e['availability_pct'] < 100.0],
-        key=lambda e: e['availability_pct']
+        key=lambda e: (
+            e['availability_pct'],
+            -(e.get('downtime_minutes') or 0.0),
+            -(e.get('incidents') or 0)
+        )
     )
 
     analytics = summary.get('analytics', {})
@@ -1411,7 +1414,7 @@ def api_availability():
             "warning": counts['warning'],
             "offline": counts['offline'],
         },
-        # Headline SLA number shown big on the card = fleet_aggregate (weighted)
+        # Headline availability number shown on the card = fleet_aggregate (weighted)
         "overall": summary['fleet_aggregate']['value'],
         "fleet_aggregate": summary['fleet_aggregate'],
         "fleet_average": summary['fleet_average'],
@@ -1422,6 +1425,7 @@ def api_availability():
         "coverage_ratio": summary.get('coverage_ratio'),
         "per_server": summary['per_server'],
         "lowest_availability": lowest_availability,
+        "hosts_requiring_attention": lowest_availability,
         "entries": summary['per_server']['values'],
         "targets": {e['id']: e['availability_pct'] for e in summary['per_server']['values']},
         "analytics": analytics,

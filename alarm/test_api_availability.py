@@ -105,3 +105,50 @@ def test_availability_route_time_windows(client, monkeypatch, minutes_val):
     assert data['analytics']['total_incidents'] == 1
     assert data['analytics']['mean_outage_minutes'] > 0
 
+
+def test_availability_route_3_level_priority_sorting(client, monkeypatch):
+    """Test that hosts requiring attention are sorted by:
+    1. Availability (asc)
+    2. Downtime duration (desc)
+    3. Incident count (desc)"""
+    monkeypatch.setattr(app_module, 'get_monitored_instances', lambda job_filter=None: ['srv-50pct-low-inc', 'srv-50pct-high-inc', 'srv-70pct'])
+    monkeypatch.setattr(app_module, 'load_json', lambda path, default=None: [])
+
+    def fake_queries(expr, cache_ttl=5.0, timeout=None):
+        if 'probe_success[' in expr or 'up[' in expr:
+            if 'changes(' in expr:
+                return {'srv-50pct-low-inc': '1', 'srv-50pct-high-inc': '5', 'srv-70pct': '2'}
+            if 'count_over_time(' in expr:
+                return {'srv-50pct-low-inc': '1800', 'srv-50pct-high-inc': '1800', 'srv-70pct': '1800'}
+            # avg_over_time
+            return {'srv-50pct-low-inc': '50.0', 'srv-50pct-high-inc': '50.0', 'srv-70pct': '70.0'}
+        if expr in ('probe_success', 'up'):
+            return {'srv-50pct-low-inc': '1', 'srv-50pct-high-inc': '1', 'srv-70pct': '1'}
+        return {}
+
+    monkeypatch.setattr(app_module, 'fetch_prom_query_map', fake_queries)
+
+    res = client.get('/api/availability?minutes=60')
+    assert res.status_code == 200
+    data = json.loads(res.data)
+    assert data['ok'] is True
+    assert 'hosts_requiring_attention' in data
+
+    # 50% hosts should come before 70% host
+    # Between the two 50% hosts, same downtime so higher incident count comes first
+    lowest = data['lowest_availability']
+    assert len(lowest) == 3
+    assert lowest[0]['id'] == 'srv-50pct-high-inc'
+    assert lowest[1]['id'] == 'srv-50pct-low-inc'
+    assert lowest[2]['id'] == 'srv-70pct'
+
+    # Check that entries have explicit duration fields
+    first_entry = lowest[0]
+    assert 'observed_minutes' in first_entry
+    assert 'observed_seconds' in first_entry
+    assert 'uptime_seconds' in first_entry
+    assert 'downtime_seconds' in first_entry
+    assert 'coverage_percent' in first_entry
+    assert 'incident_count' in first_entry
+
+
