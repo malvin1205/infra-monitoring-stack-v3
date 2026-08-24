@@ -6,10 +6,17 @@ __pycache__/
 # Pytest / Test cache
 .pytest_cache/
 
-# Agent / IDE config
+# Agent / IDE / OS config
 .agent/
+.claude/
+.gemini/
 .vscode/
 .idea/
+*.sublime-project
+*.sublime-workspace
+.DS_Store
+Thumbs.db
+*.log
 
 # Environment files
 .env
@@ -30,6 +37,10 @@ env/
 # Secrets and local configurations
 alarm/telegram_config.json
 !alarm/telegram_config.json.example
+alarm/.api_key
+alarm/.webhook_secret
+.api_key
+.webhook_secret
 
 # Runtime data (contains internal host/network info, regenerated at runtime)
 alarm/infrawatch.db*

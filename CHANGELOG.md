@@ -6,6 +6,24 @@ Format changelog ini mengacu pada standar [Keep a Changelog](https://keepachange
 
 ---
 
+## [3.4.0] - 2026-08-24
+
+### 🚀 Provisioning Otomatis Kredensial (Automatic First-Run Provisioning)
+- **Zero-Setup First Run**:
+  - InfraWatch kini secara otomatis men-generate kredensial API key dan webhook secret 64-karakter hex yang aman menggunakan `secrets.token_hex(32)` pada startup pertama jika environment variable belum diset.
+  - Menghilangkan ketergantungan pada OpenSSL host (`openssl rand -hex 32`) dan manual editing `.env`.
+- **Persistensi & Hak Akses Aman**:
+  - Kredensial yang di-generate disimpan ke file terisolasi (`alarm/.api_key` dan `alarm/.webhook_secret`) dengan izin akses `0600` (owner-only).
+  - Kredensial bertahan melewati restart aplikasi, restart container, dan reboot mesin melalui mount volume `./alarm:/app`.
+- **Presedensi Konfigurasi**:
+  - Environment variable eksplisit (`INFRAWATCH_API_KEY`, `API_KEY`, `WEBHOOK_SECRET`) tetap memiliki prioritas tertinggi dan tidak akan pernah ditimpa secara diam-diam.
+- **Docker Compose Zero-Config**:
+  - `docker-compose.yml` disesuaikan agar `docker compose up -d` langsung dapat berjalan tanpa error variabel kosong pada fresh clone.
+- **Pengujian Lengkap**:
+  - Menambahkan modul `alarm/test_auth_provisioning.py` (10 test case) mencakup pengujian token generation, persistensi, env override, toleransi restart, proteksi 401/200, dan keamanan log.
+
+---
+
 ## [3.3.0] - 2026-08-24
 
 ### 🛡️ Peningkatan Keamanan (Security)

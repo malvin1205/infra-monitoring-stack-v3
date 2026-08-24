@@ -1,9 +1,13 @@
+import os
+import sys
 import urllib.request
 import urllib.parse
 import json
 
-def fetch_job_avail(job_name, minutes=1440):
-    base = 'http://192.168.40.228:5000/api/availability'
+DEFAULT_BASE_URL = os.environ.get('INFRAWATCH_URL', 'http://127.0.0.1:5000').rstrip('/')
+
+def fetch_job_avail(job_name, minutes=1440, base_url=None):
+    base = f"{base_url or DEFAULT_BASE_URL}/api/availability"
     params = urllib.parse.urlencode({'minutes': minutes, 'job': job_name})
     url = f"{base}?{params}"
     try:

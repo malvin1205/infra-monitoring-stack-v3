@@ -31,16 +31,16 @@ class PerformanceCachingTests(unittest.TestCase):
         alarm_app.DEPENDENCIES_FILE = os.path.join(self.tmpdir, "dependencies.json")
         alarm_app.DELETED_TARGETS_FILE = os.path.join(self.tmpdir, "deleted_targets.json")
         self.db_path = os.path.join(self.tmpdir, "test_infrawatch.db")
-        from storage import init_db
-        init_db(self.db_path)
         self._orig_db_env = os.environ.get("INFRAWATCH_DB_PATH")
         os.environ["INFRAWATCH_DB_PATH"] = self.db_path
+        from storage import init_db
+        init_db(self.db_path)
 
         with PROMETHEUS_CACHE_LOCK:
             PROMETHEUS_CACHE.clear()
         with _FAILED_CANDIDATES_LOCK:
             _FAILED_CANDIDATES.clear()
-        alarm_app.clear_availability_cache()
+        alarm_app.clear_availability_cache(clear_db=True)
 
     def tearDown(self):
         if self._orig_db_env is not None:

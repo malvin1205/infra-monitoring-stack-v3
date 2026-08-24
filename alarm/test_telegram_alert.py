@@ -6,10 +6,25 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from telegram_notifier import (
     get_telegram_config,
-    test_telegram_connection,
+    test_telegram_connection as verify_telegram_connection,
     send_telegram_raw,
     build_alert_message,
 )
+
+def test_telegram_message_builder():
+    """Unit test for Telegram HTML message generation (runs in pytest)."""
+    msg = build_alert_message(
+        name="TargetDown",
+        severity="critical",
+        instance="192.168.1.100:9100",
+        summary="Service unreachable",
+        job="node_exporter",
+        event_time=1700000000,
+        is_now_firing=True,
+        latency_ms=15.2
+    )
+    assert "INFRAWATCH ALERT: CRITICAL" in msg
+    assert "192.168.1.100:9100" in msg
 
 def run_tests():
     print("=" * 60)
@@ -32,7 +47,7 @@ def run_tests():
 
     # 1. Test Connection Message
     print("\n[1] Mengirim Pesan Uji Koneksi...")
-    ok, msg = test_telegram_connection(bot_token, chat_id)
+    ok, msg = verify_telegram_connection(bot_token, chat_id)
     if ok:
         print("  [OK] Sukses: Pesan uji koneksi terkirim!")
     else:

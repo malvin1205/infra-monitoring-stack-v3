@@ -204,17 +204,16 @@ newgrp docker
 ```bash
 git clone https://github.com/malvin1205/infra-monitoring-stack-v3.git
 cd infra-monitoring-stack-v3
-cp .env.example .env
-# isi INFRAWATCH_API_KEY dan WEBHOOK_SECRET di .env (generate: openssl rand -hex 32)
 docker compose up -d
 ```
 
-> `INFRAWATCH_API_KEY` melindungi seluruh endpoint `POST`/`DELETE` di `/api/*`
-> (dashboard mengirimkannya otomatis lewat header `X-API-Key`).
-> `WEBHOOK_SECRET` melindungi `POST /webhook` — set Alertmanager's
-> `webhook_configs.url` ke `http://<host>:5000/webhook?secret=<WEBHOOK_SECRET>`.
-> Tanpa kedua variabel ini, container tetap jalan tapi endpoint terkait akan
-> menolak semua request dengan `401`.
+> **Zero Manual Key Setup**:
+> Pada startup pertama, InfraWatch secara otomatis men-generate kredensial 64-karakter hex yang aman (`secrets.token_hex(32)`) dan menyimpannya ke `alarm/.api_key` serta `alarm/.webhook_secret`. Anda **tidak perlu menginstal OpenSSL** atau membuat API key secara manual.
+>
+> - **Otomatis di Dashboard**: Dashboard web secara otomatis memuat API key untuk request mutasi (`POST`/`DELETE` di `/api/*`).
+> - **Melihat Kredensial**: Jalankan `cat alarm/.api_key` atau `cat alarm/.webhook_secret`.
+> - **Override Kustom (Opsional)**: Jika ingin menggunakan key khusus, salin `.env.example` ke `.env` dan tentukan `INFRAWATCH_API_KEY` atau `WEBHOOK_SECRET`.
+> - **Rotasi Key**: Hapus file `alarm/.api_key` dan restart service untuk men-generate key baru.
 
 Verifikasi status container:
 

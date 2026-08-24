@@ -16,8 +16,8 @@ services:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
       - TELEGRAM_ENABLED=${TELEGRAM_ENABLED:-true}
-      - INFRAWATCH_API_KEY=${INFRAWATCH_API_KEY:?set INFRAWATCH_API_KEY in .env}
-      - WEBHOOK_SECRET=${WEBHOOK_SECRET:?set WEBHOOK_SECRET in .env}
+      - INFRAWATCH_API_KEY=${INFRAWATCH_API_KEY:-}
+      - WEBHOOK_SECRET=${WEBHOOK_SECRET:-}
     volumes:
       - ./alarm:/app
       - ./alarm/targets:/app/targets

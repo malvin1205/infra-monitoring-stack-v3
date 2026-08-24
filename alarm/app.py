@@ -1,4 +1,4 @@
-﻿from flask import Flask, request, jsonify, render_template
+from flask import Flask, request, jsonify, render_template
 import json
 import time
 import os
@@ -59,9 +59,9 @@ except ImportError:
     )
 
 try:
-    from auth import API_KEY, require_api_key, require_webhook_secret
+    from auth import API_KEY, require_api_key, require_webhook_secret, get_api_key, get_webhook_secret
 except ImportError:
-    from alarm.auth import API_KEY, require_api_key, require_webhook_secret
+    from alarm.auth import API_KEY, require_api_key, require_webhook_secret, get_api_key, get_webhook_secret
 
 init_db()
 
@@ -685,7 +685,7 @@ def fetch_prometheus_json(path, use_cache=True, cache_ttl=None, timeout=None):
 
 @app.route('/')
 def index():
-    return render_template('alarm.html', api_key=API_KEY)
+    return render_template('alarm.html', api_key=get_api_key())
 
 # Set whenever /webhook receives a real Alertmanager delivery — the poller
 # fallback below checks this and backs off, since Alertmanager (when present)
