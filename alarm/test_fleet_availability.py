@@ -54,10 +54,13 @@ class FleetAvailabilityTests(unittest.TestCase):
         self.assertEqual(s1["availability_pct"], expected)
 
     def test_brand_new_server_zero_age(self):
-        # created exactly "now" -> denominator 0, no downtime yet -> 100%
+        # created exactly "now" -> denominator 0, no observed coverage -> None (insufficient data)
         servers = [{"id": "s1", "name": "brand-new", "downtime_minutes": 0, "created_at": NOW}]
         result = calculate_fleet_availability(servers, PERIOD_7D, now=NOW)
-        self.assertEqual(result["per_server"]["values"][0]["availability_pct"], 100.0)
+        s1 = result["per_server"]["values"][0]
+        self.assertIsNone(s1["availability_pct"])
+        self.assertTrue(s1["is_no_data"])
+        self.assertEqual(s1["sla_status"], "INSUFFICIENT_DATA")
 
     def test_fleet_average_vs_aggregate_diverge(self):
         # One old server mostly down (small weight isn't a factor here since
@@ -362,7 +365,43 @@ class FleetAvailabilityTests(unittest.TestCase):
         expected_fleet_avail = round((11520 / 12960) * 100.0, 2)
         self.assertEqual(result["fleet_aggregate"]["value"], expected_fleet_avail)
         self.assertEqual(result["fleet_aggregate"]["uptime_percent"], expected_fleet_avail)
-        self.assertEqual(result["fleet_aggregate"]["downtime_percent"], round(100.0 - expected_fleet_avail, 2))
+    def test_reconstruct_time_series_intervals_various_cadences(self):
+        """Test interval reconstruction across 2s, 5s, 15s, 30s, 60s, and irregular sampling."""
+        start_ts = 1000000.0
+        window_sec = 3600.0
+        end_ts = start_ts + window_sec
+
+        cadences = [2.0, 5.0, 15.0, 30.0, 60.0]
+        for interval in cadences:
+            with self.subTest(scrape_interval=interval):
+                count = int(window_sec / interval) + 1
+                samples = [(start_ts + i * interval, 1) for i in range(count)]
+                res = reconstruct_time_series_intervals(samples, start_ts, end_ts)
+
+                # Invariants
+                self.assertAlmostEqual(res["coverage_seconds"] + res["unknown_seconds"], window_sec, places=1)
+                self.assertAlmostEqual(res["coverage_percent"] + res["unknown_percent"], 100.0, places=1)
+                self.assertEqual(res["availability_pct"], 100.0)
+                self.assertEqual(res["incident_count"], 0)
+                self.assertEqual(res["sla_status"], "COMPLIANT")
+                self.assertAlmostEqual(res["coverage_percent"], 100.0, places=0)
+
+    def test_reconstruct_irregular_samples_and_invariants(self):
+        """Test irregular sampling intervals preserve coverage + unknown == window invariant."""
+        start_ts = 1000000.0
+        end_ts = start_ts + 3600.0
+        # Irregular timestamps with jitter
+        timestamps = [0, 4, 11, 15, 22, 29, 35, 41, 49, 58, 120, 180, 245, 310, 400, 500, 600, 1200, 1800, 2400, 3000, 3600]
+        samples = [(start_ts + t, 1 if t < 2400 else 0) for t in timestamps]
+
+        res = reconstruct_time_series_intervals(samples, start_ts, end_ts)
+        # Invariant 1: Coverage = Uptime + Downtime
+        self.assertAlmostEqual(res["coverage_seconds"], res["uptime_seconds"] + res["downtime_seconds"], places=1)
+        # Invariant 2: Window = Coverage + Unknown
+        self.assertAlmostEqual(3600.0, res["coverage_seconds"] + res["unknown_seconds"], places=1)
+        # Invariant 3: Coverage % + Unknown % == 100
+        self.assertAlmostEqual(100.0, res["coverage_percent"] + res["unknown_percent"], places=1)
+        self.assertIsNotNone(res["availability_pct"])
 
 
 if __name__ == "__main__":

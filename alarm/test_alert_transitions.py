@@ -16,29 +16,51 @@ except ImportError:
 
 class ComputeStateTransitionsTests(unittest.TestCase):
     """Pure-function tests for the poller's transition detector — no network,
-    no files. Covers the fallback path used when no Alertmanager is present."""
+    no files. Covers all cold-start and steady-state transition cases:
+      - Case A: Target first observed UP -> baseline established, no false alert.
+      - Case B: Target first observed DOWN -> active outage transition emitted.
+      - Case C: Restart while DOWN -> prior seeded state prevents duplicate incident.
+      - Case D: Target remains DOWN across multiple cycles -> exactly one active incident.
+      - Case E: Target recovers -> resolves incident with accurate duration.
+      - Case F: Target goes DOWN again after recovery -> creates new distinct incident.
+    """
 
-    def test_first_observation_seeds_baseline_without_firing(self):
+    def test_case_a_first_observed_up_seeds_baseline_without_firing(self):
         transitions, state = alarm_app.compute_state_transitions({"host-a": "1"}, {})
         self.assertEqual(transitions, [])
         self.assertEqual(state, {"host-a": "up"})
 
-    def test_up_to_down_transition_detected(self):
-        transitions, state = alarm_app.compute_state_transitions(
-            {"host-a": "0"}, {"host-a": "up"})
+    def test_case_b_first_observed_down_emits_cold_start_outage(self):
+        transitions, state = alarm_app.compute_state_transitions({"host-a": "0"}, {})
         self.assertEqual(transitions, [("host-a", False)])
+        self.assertEqual(state, {"host-a": "down"})
+
+    def test_case_c_restart_while_target_down_with_seeded_state_emits_no_duplicate(self):
+        # When seeded as 'down' from status.json at restart, next poll sees is_up=False
+        # and emits no duplicate transition
+        transitions, state = alarm_app.compute_state_transitions({"host-a": "0"}, {"host-a": "down"})
+        self.assertEqual(transitions, [])
         self.assertEqual(state["host-a"], "down")
 
-    def test_down_to_up_transition_detected(self):
-        transitions, state = alarm_app.compute_state_transitions(
-            {"host-a": "1"}, {"host-a": "down"})
+    def test_case_d_repeated_down_across_cycles_emits_no_transition(self):
+        transitions, state = alarm_app.compute_state_transitions({"host-a": "0"}, {"host-a": "down"})
+        self.assertEqual(transitions, [])
+        self.assertEqual(state["host-a"], "down")
+
+    def test_case_e_down_to_up_transition_detected_for_recovery(self):
+        transitions, state = alarm_app.compute_state_transitions({"host-a": "1"}, {"host-a": "down"})
         self.assertEqual(transitions, [("host-a", True)])
         self.assertEqual(state["host-a"], "up")
 
-    def test_no_change_yields_no_transition(self):
-        transitions, state = alarm_app.compute_state_transitions(
-            {"host-a": "1"}, {"host-a": "up"})
+    def test_case_f_target_goes_down_again_after_recovery(self):
+        transitions, state = alarm_app.compute_state_transitions({"host-a": "0"}, {"host-a": "up"})
+        self.assertEqual(transitions, [("host-a", False)])
+        self.assertEqual(state["host-a"], "down")
+
+    def test_no_change_when_up_yields_no_transition(self):
+        transitions, state = alarm_app.compute_state_transitions({"host-a": "1"}, {"host-a": "up"})
         self.assertEqual(transitions, [])
+        self.assertEqual(state["host-a"], "up")
 
     def test_missing_instance_this_tick_keeps_prior_state(self):
         # Prometheus temporarily has no series for an instance — must not be
@@ -210,9 +232,18 @@ class MaintenanceApiTests(unittest.TestCase):
         self.tmpdir = tempfile.mkdtemp()
         self._orig = alarm_app.MAINTENANCE_FILE
         alarm_app.MAINTENANCE_FILE = os.path.join(self.tmpdir, "maintenance.json")
+        self.db_path = os.path.join(self.tmpdir, "test.db")
+        from storage import init_db
+        init_db(self.db_path)
+        self._orig_db_env = os.environ.get("INFRAWATCH_DB_PATH")
+        os.environ["INFRAWATCH_DB_PATH"] = self.db_path
         self.client = alarm_app.app.test_client()
 
     def tearDown(self):
+        if self._orig_db_env is not None:
+            os.environ["INFRAWATCH_DB_PATH"] = self._orig_db_env
+        else:
+            os.environ.pop("INFRAWATCH_DB_PATH", None)
         alarm_app.MAINTENANCE_FILE = self._orig
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
@@ -237,9 +268,11 @@ class MaintenanceApiTests(unittest.TestCase):
     def test_create_rejects_end_before_start(self):
         now = time.time()
         resp = self.client.post('/api/maintenance', json={
-            "target": "10.0.0.9", "start": now, "end": now - 10,
+            "target": "10.0.0.9", "scope": "instance", "reason": "reboot",
+            "start": now + 3600, "end": now,
         })
         self.assertEqual(resp.status_code, 400)
+        self.assertFalse(resp.get_json()['ok'])
 
 
 class CorrelationSuppressionTests(unittest.TestCase):
@@ -279,9 +312,18 @@ class DependencyApiTests(unittest.TestCase):
         self.tmpdir = tempfile.mkdtemp()
         self._orig = alarm_app.DEPENDENCIES_FILE
         alarm_app.DEPENDENCIES_FILE = os.path.join(self.tmpdir, "dependencies.json")
+        self.db_path = os.path.join(self.tmpdir, "test.db")
+        from storage import init_db
+        init_db(self.db_path)
+        self._orig_db_env = os.environ.get("INFRAWATCH_DB_PATH")
+        os.environ["INFRAWATCH_DB_PATH"] = self.db_path
         self.client = alarm_app.app.test_client()
 
     def tearDown(self):
+        if self._orig_db_env is not None:
+            os.environ["INFRAWATCH_DB_PATH"] = self._orig_db_env
+        else:
+            os.environ.pop("INFRAWATCH_DB_PATH", None)
         alarm_app.DEPENDENCIES_FILE = self._orig
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 

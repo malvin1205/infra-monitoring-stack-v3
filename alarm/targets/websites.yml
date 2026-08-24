@@ -1,4 +1,3 @@
-- targets:
+- targets: []
   labels:
-    job: "blackbox_http"
-
+    job: blackbox_http

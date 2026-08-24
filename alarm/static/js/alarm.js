@@ -14,58 +14,6 @@
 const JOB_DEFAULT_LS_KEY = 'infrawatch.defaultJob';
 
 /* ════════════════════════════════════════════════════════════════════════════
-   ROUTER
-   ════════════════════════════════════════════════════════════════════════════ */
-class Router {
-  constructor(pages) {
-    this.pages = pages;   // { pageId: PageObject }
-    this.current = null;
-  }
-
-  go(pageId) {
-    if (this.current === pageId) return;
-    this.current = pageId;
-
-    // Swap visible page panels
-    document.querySelectorAll('.page-content').forEach(el => {
-      el.hidden = el.id !== `page-${pageId}`;
-    });
-
-    // Swap active nav (sidebar + mobile)
-    document.querySelectorAll('.nav-item, .mobile-nav-item').forEach(btn => {
-      const active = btn.dataset.page === pageId;
-      btn.classList.toggle('nav-item-active', active && btn.classList.contains('nav-item'));
-      btn.classList.toggle('mobile-nav-active', active && btn.classList.contains('mobile-nav-item'));
-      if (active) {
-        btn.setAttribute('aria-current', 'page');
-      } else {
-        btn.removeAttribute('aria-current');
-      }
-    });
-
-    // Update topbar title
-    const titles = {
-      dashboard: 'System Status',
-      instances: 'Instances',
-      logs: 'Alert Logs',
-      history: 'Incident History',
-    };
-    const subs = {
-      dashboard: 'System monitoring active',
-      instances: 'Live scrape target status from Prometheus',
-      logs: 'Real-time alert event stream',
-      history: 'Full incident log',
-    };
-    document.getElementById('pageTitle').textContent = titles[pageId] || pageId;
-    document.getElementById('subtitle').textContent = subs[pageId] || '';
-
-    // Notify the page it was activated
-    if (this.pages[pageId]?.onActivate) this.pages[pageId].onActivate();
-  }
-}
-
-
-/* ════════════════════════════════════════════════════════════════════════════
    INSTANCES PAGE
    ════════════════════════════════════════════════════════════════════════════ */
 class InstancesPage {
@@ -85,6 +33,8 @@ class InstancesPage {
 
     this.table = document.getElementById('instancesBody');
     this.countBadge = document.getElementById('instanceCount');
+    this._downCardElements = [];
+    this._maintCardElements = [];
 
     // Pagination (TV wallboard — max 80 cards/page, see _render()/_renderCards())
     this.pageSize = 80;
@@ -145,6 +95,7 @@ class InstancesPage {
     this.availabilityDetailBtn = document.getElementById('availabilityDetailBtn');
     this.availabilityBreakdownModal = document.getElementById('availabilityBreakdownModal');
     this._showAllHostsInBreakdown = false;
+    this._breakdownSort = 'avail_asc';
 
     // In-flight request cancellation (AbortController), retry backoff state, and
     // a cheap "did the data actually change" signature to skip unnecessary
@@ -162,6 +113,10 @@ class InstancesPage {
     // the edge case where fetch resolves instead of rejecting on an aborted
     // signal (timing is browser-dependent).
     this._availRequestSeq = 0;
+    this._availLoading = false;
+    this._availCache = new Map(); // cacheKey -> { timestamp, data }
+    this._availCacheTTL = 30000;  // 30s client-side cache for instant zero-latency range switching
+    this._targetHistorySeq = 0;
 
     this._bindEvents();
   }
@@ -407,7 +362,15 @@ class InstancesPage {
         this.periodMinutes = presets[range] || 1440;
         this.periodEnd = null;
         this.periodLabel = range;
-        this.loadAvailability();
+
+        const modalRangeSelect = document.getElementById('modalRangeSelect');
+        if (modalRangeSelect) {
+          const curMins = Math.round(this.periodMinutes);
+          const opt = Array.from(modalRangeSelect.options).find(o => Math.round(parseFloat(o.value)) === curMins);
+          if (opt) modalRangeSelect.value = opt.value;
+        }
+
+        this.loadAvailability(false);
         if (this.selectedTarget) {
           this.loadTargetHistory(this.selectedTarget.instance);
         }
@@ -458,8 +421,98 @@ class InstancesPage {
           else if (mins === 43200) label = '30d';
           this.periodLabel = label;
           this._setActiveRangeChip(label);
-          this.loadAvailability();
+          this.loadAvailability(false);
         }
+      });
+    }
+
+    // Custom Dropdown for Sorting Hosts in Availability Breakdown Modal
+    const availSortTrigger = document.getElementById('availSortTrigger');
+    const availSortMenu = document.getElementById('availSortMenu');
+    
+    if (availSortTrigger && availSortMenu) {
+      const toggleSortMenu = (open) => {
+        const isHidden = typeof open === 'boolean' ? !open : !availSortMenu.classList.contains('hidden');
+        availSortMenu.classList.toggle('hidden', isHidden);
+        availSortTrigger.setAttribute('aria-expanded', String(!isHidden));
+        if (!isHidden) {
+          const activeItem = availSortMenu.querySelector('.avail-sort-item.is-active') || availSortMenu.firstElementChild;
+          activeItem?.focus();
+        }
+      };
+
+      availSortTrigger.addEventListener('click', (e) => {
+        e.stopPropagation();
+        toggleSortMenu();
+      });
+
+      availSortTrigger.addEventListener('keydown', (e) => {
+        if (e.key === 'ArrowDown' || e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          toggleSortMenu(true);
+        }
+      });
+
+      availSortMenu.addEventListener('click', (e) => {
+        const item = e.target.closest('.avail-sort-item');
+        if (!item) return;
+        const val = item.dataset.value;
+        if (val) {
+          this._breakdownSort = val;
+          toggleSortMenu(false);
+          availSortTrigger.focus();
+          this._renderAvailabilityBreakdown('sortMenu:click');
+        }
+      });
+
+      availSortMenu.addEventListener('keydown', (e) => {
+        const items = Array.from(availSortMenu.querySelectorAll('.avail-sort-item'));
+        const currentIndex = items.indexOf(document.activeElement);
+
+        if (e.key === 'ArrowDown') {
+          e.preventDefault();
+          const nextIndex = (currentIndex + 1) % items.length;
+          items[nextIndex]?.focus();
+        } else if (e.key === 'ArrowUp') {
+          e.preventDefault();
+          const prevIndex = (currentIndex - 1 + items.length) % items.length;
+          items[prevIndex]?.focus();
+        } else if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          const active = document.activeElement?.closest('.avail-sort-item');
+          if (active && active.dataset.value) {
+            this._breakdownSort = active.dataset.value;
+            toggleSortMenu(false);
+            availSortTrigger.focus();
+            this._renderAvailabilityBreakdown('sortMenu:enter');
+          }
+        } else if (e.key === 'Escape' || e.key === 'Tab') {
+          toggleSortMenu(false);
+          availSortTrigger.focus();
+        }
+      });
+
+      document.addEventListener('click', (e) => {
+        if (!availSortMenu.classList.contains('hidden') && !e.target.closest('#availSortContainer')) {
+          toggleSortMenu(false);
+        }
+      });
+    }
+
+    const tableHeaderEl = document.querySelector('.avail-table-header');
+    if (tableHeaderEl) {
+      tableHeaderEl.addEventListener('click', e => {
+        const btn = e.target.closest('.ath-sort-btn');
+        if (!btn) return;
+        const key = btn.dataset.sortKey;
+        if (key === 'name') {
+          this._breakdownSort = this._breakdownSort === 'name_asc' ? 'name_desc' : 'name_asc';
+        } else if (key === 'avail') {
+          this._breakdownSort = this._breakdownSort === 'avail_asc' ? 'avail_desc' : 'avail_asc';
+        } else if (key === 'impact') {
+          this._breakdownSort = this._breakdownSort === 'incidents_desc' ? 'downtime_desc' : 'incidents_desc';
+        }
+        this._renderAvailabilityBreakdown('tableHeader:sort');
       });
     }
 
@@ -467,9 +520,32 @@ class InstancesPage {
     if (btnViewAllHosts) {
       btnViewAllHosts.addEventListener('click', () => {
         this._showAllHostsInBreakdown = !this._showAllHostsInBreakdown;
-        const lbl = document.getElementById('viewAllHostsLabel');
-        if (lbl) lbl.textContent = this._showAllHostsInBreakdown ? 'Show top hosts' : 'View all hosts';
-        this._renderAvailabilityBreakdown();
+        this._renderAvailabilityBreakdown('btnViewAllHosts:toggle');
+      });
+    }
+
+    // Delegated event handling for host rows in breakdown table
+    const attentionListEl = document.getElementById('hostsRequiringAttentionList');
+    if (attentionListEl) {
+      const handleRowSelect = (el) => {
+        const row = el.closest('.ara-row');
+        if (!row) return;
+        const inst = row.dataset.instance;
+        if (inst) {
+          const target = this.data.find(t => t.instance === inst) || { instance: inst, job: 'blackbox' };
+          this._closeAvailabilityBreakdown();
+          this._openDrawer(target);
+        }
+      };
+      attentionListEl.addEventListener('click', e => handleRowSelect(e.target));
+      attentionListEl.addEventListener('keydown', e => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          const row = e.target.closest('.ara-row');
+          if (row) {
+            e.preventDefault();
+            handleRowSelect(row);
+          }
+        }
       });
     }
 
@@ -723,35 +799,33 @@ class InstancesPage {
     const now = Date.now();
 
     if (this.table) {
-      const cards = this.table.querySelectorAll('.host-card.hc-down');
-      cards.forEach(card => {
-        const inst = card.dataset.instance;
-        const target = this.data.find(t => t.instance === inst);
-        if (!target) return;
+      if (this._downCardElements && this._downCardElements.length > 0) {
+        this._downCardElements.forEach(({ inst, latEl }) => {
+          const target = this.data.find(t => t.instance === inst);
+          if (!target) return;
 
-        let downMs = 0;
-        if (target.downSince && target.downSince > 0) {
-          downMs = Math.max(0, now - (target.downSince * 1000));
-        } else {
-          if (!this.downStartTimes[inst]) this.downStartTimes[inst] = now;
-          downMs = Math.max(0, now - this.downStartTimes[inst]);
-        }
+          let downMs = 0;
+          if (target.downSince && target.downSince > 0) {
+            downMs = Math.max(0, now - (target.downSince * 1000));
+          } else {
+            if (!this.downStartTimes[inst]) this.downStartTimes[inst] = now;
+            downMs = Math.max(0, now - this.downStartTimes[inst]);
+          }
 
-        const latEl = card.querySelector('.hc-latency');
-        if (latEl) {
-          latEl.textContent = this._downLabel(target, this._fmtDownAging(downMs));
-        }
-      });
+          if (latEl) {
+            latEl.textContent = this._downLabel(target, this._fmtDownAging(downMs));
+          }
+        });
+      }
 
-      const maintCards = this.table.querySelectorAll('.host-card.hc-maintenance');
-      maintCards.forEach(card => {
-        const inst = card.dataset.instance;
-        const target = this.data.find(t => t.instance === inst);
-        if (!target || !target.maintenanceUntil) return;
-        const remainMs = Math.max(0, target.maintenanceUntil * 1000 - now);
-        const latEl = card.querySelector('.hc-latency');
-        if (latEl) latEl.textContent = `Maint ${this._fmtDownAging(remainMs)} left`;
-      });
+      if (this._maintCardElements && this._maintCardElements.length > 0) {
+        this._maintCardElements.forEach(({ inst, latEl }) => {
+          const target = this.data.find(t => t.instance === inst);
+          if (!target || !target.maintenanceUntil) return;
+          const remainMs = Math.max(0, target.maintenanceUntil * 1000 - now);
+          if (latEl) latEl.textContent = `Maint ${this._fmtDownAging(remainMs)} left`;
+        });
+      }
     }
 
     if (this.selectedTarget && this.selectedTarget.health !== 'up') {
@@ -780,24 +854,11 @@ class InstancesPage {
     if (this.selectedTarget && this.selectedTarget.maintenance) {
       this._renderDrawerMaintenance(this.selectedTarget);
     }
-
-    if (this.availabilityBreakdownModal && !this.availabilityBreakdownModal.classList.contains('hidden')) {
-      this._renderAvailabilityBreakdown();
-    }
   }
 
   /* ── Historical availability (past N days) ─────── */
   startAvailabilityPolling() {
-    // Only clear the previous timer — see startPolling() above for why this
-    // must not also abort the in-flight loadAvailability() call onActivate()
-    // just made.
     if (this.availabilityPollInterval) clearInterval(this.availabilityPollInterval);
-    // Poll availability every 15s from Prometheus historical PromQL range
-    // queries. force:false — a wide range (7d/30d) can legitimately take
-    // longer than 15s to answer; forcing an abort+restart on every tick
-    // would kill the previous request before it ever lands, leaving the UI
-    // stuck on stale/loading data forever. Skip the tick instead and let
-    // the in-flight request finish.
     this.availabilityPollInterval = setInterval(() => this.loadAvailability(false), 15000);
   }
 
@@ -813,28 +874,84 @@ class InstancesPage {
     }
   }
 
-  async loadAvailability(force = true) {
+  _getAvailCacheKey(minutes = this.periodMinutes, job = this.selectedJob, end = this.periodEnd) {
+    const jobKey = (job && job !== 'all') ? job : 'all';
+    const minKey = Math.round(minutes || 1440);
+    const endKey = end ? String(end) : 'live';
+    return `${jobKey}:${minKey}:${endKey}`;
+  }
+
+  _updateAvailLoadingUI(isLoading) {
+    const updatingBadge = document.getElementById('availUpdatingBadge');
+    if (updatingBadge) updatingBadge.classList.toggle('hidden', !isLoading);
+  }
+
+  _applyAvailabilityData(data, source = 'loadAvailability') {
+    if (!data) return;
+    this.availabilityBreakdown = data;
+    this.availabilityMap = data.targets || {};
+
+    // Availability card (Card 5): Updated to reflect the requested historical window
+    const overall = (typeof data.overall === 'number') ? data.overall : null;
+    if (this.statUptime) {
+      this.statUptime.textContent = overall !== null ? `${overall.toFixed(2)}%` : '—';
+    }
+
+    // Ensure range label is synchronized with the response data
+    const respMinutes = Math.round(data.period_minutes || this.periodMinutes);
+    let label = '24h';
+    if (respMinutes === 60) label = '1h';
+    else if (respMinutes === 4320) label = '3d';
+    else if (respMinutes === 10080) label = '7d';
+    else if (respMinutes === 43200) label = '30d';
+    else if (this.periodLabel === 'custom') label = 'custom';
+
+    if (this.availabilityLabel) this.availabilityLabel.textContent = `Availability (${label})`;
+
+    // Refresh drawer uptime figure if a host is currently open
+    if (this.selectedTarget) this._updateDrawerUptime(this.selectedTarget);
+
+    // Refresh breakdown modal content if it's currently open
+    if (this.availabilityBreakdownModal && !this.availabilityBreakdownModal.classList.contains('hidden')) {
+      this._renderAvailabilityBreakdown(`_applyAvailabilityData:${source}`);
+    }
+  }
+
+  async loadAvailability(force = false) {
     // Realtime mode is driven entirely by the live /instances poll (see
     // _updateStats()) — no historical Prometheus aggregate to fetch here.
     if (this.isRealtime) return;
 
-    // force=true (range/job/custom-range change, manual refresh, initial
-    // load): a newer, more relevant request supersedes whatever's in
-    // flight — cancel it and start fresh.
-    // force=false (the 15s background poll tick): only start a new request
-    // if the previous one has already finished. Never abort a still-valid
-    // in-flight request just because a poll tick fired.
+    const cacheKey = this._getAvailCacheKey();
+    const now = Date.now();
+    const cached = this._availCache.get(cacheKey);
+    const hasFreshCache = cached && (now - cached.timestamp < this._availCacheTTL);
+
+    // 1. Instant Cache Render: If valid cached data exists, apply immediately with 0ms delay!
+    if (cached && cached.data) {
+      this._applyAvailabilityData(cached.data, 'cache_hit');
+      if (!force && hasFreshCache) {
+        this._updateAvailLoadingUI(false);
+        return;
+      }
+    }
+
+    // force=true (manual refresh, custom range submit) supersedes in-flight requests.
+    // Switching presets aborts stale in-flight requests to save network/backend bandwidth.
     if (this._availAbortController) {
-      if (!force) return;
+      if (!force && this._availLoading) {
+        return;
+      }
       this._availAbortController.abort();
     }
     const controller = new AbortController();
     this._availAbortController = controller;
-    // Belt-and-suspenders stale guard: even if a response resolves instead
-    // of rejecting after its controller was aborted (timing edge case), a
-    // mismatched sequence number means a newer request owns the UI now.
     const seq = ++this._availRequestSeq;
     const isStale = () => seq !== this._availRequestSeq;
+
+    this._availLoading = true;
+    const hasMatchingData = this.availabilityBreakdown && Math.round(this.availabilityBreakdown.period_minutes || 0) === Math.round(this.periodMinutes);
+    this._updateAvailLoadingUI(!hasMatchingData);
 
     const rangeText = this.periodLabel === 'custom' ? 'Custom' : this.periodLabel;
 
@@ -855,55 +972,52 @@ class InstancesPage {
 
       const res = await fetch(url, { signal: controller.signal });
       const data = await res.json();
-      if (isStale()) return;
+
+      if (isStale()) {
+        return;
+      }
 
       if (!data.ok) {
         this._availFailCount = Math.min(this._availFailCount + 1, 6);
         this._scheduleRetry('availability');
-        // Non-blocking: this.availabilityBreakdown (last-good SLA data) and
-        // live monitoring are left exactly as they were — never zeroed out.
         return;
       }
       this._availFailCount = 0;
       this._clearRetry('availability');
 
-      this.availabilityBreakdown = data;
-      this.availabilityMap = data.targets || {};
-
-      // Summary row: Total / Online / Warning / Offline / Availability — all
-      // scoped to the selected period (owned exclusively by this call; live
-      // /instances polling no longer writes to these DOM nodes).
-      const counts = data.counts || {};
-      if (this.statTotal) this.statTotal.textContent = counts.total ?? '—';
-      if (this.statUp) this.statUp.textContent = counts.online ?? '—';
-      const statSlow = document.getElementById('instSlow');
-      if (statSlow) statSlow.textContent = counts.warning ?? '—';
-      if (this.statDown) this.statDown.textContent = counts.offline ?? '—';
-
-      const overall = (typeof data.overall === 'number') ? data.overall : null;
-      if (this.statUptime) {
-        this.statUptime.textContent = overall !== null ? `${overall.toFixed(2)}%` : '—';
-      }
-
-      // Refresh drawer uptime figure if a host is currently open
-      if (this.selectedTarget) this._updateDrawerUptime(this.selectedTarget);
-
-      // Refresh breakdown modal content if it's currently open
-      if (this.availabilityBreakdownModal && !this.availabilityBreakdownModal.classList.contains('hidden')) {
-        this._renderAvailabilityBreakdown();
-      }
+      // Store response in client-side memory cache
+      this._availCache.set(cacheKey, { timestamp: Date.now(), data });
+      this._applyAvailabilityData(data, 'network_response');
     } catch (e) {
-      if (e.name === 'AbortError' || isStale()) return;
-      // Keep last known values; availability is a secondary, best-effort metric
+      if (e.name === 'AbortError' || isStale()) {
+        return;
+      }
       console.warn('[InfraWatch] Availability fetch failed:', e);
       this._availFailCount = Math.min(this._availFailCount + 1, 6);
       this._scheduleRetry('availability');
     } finally {
-      if (this._availAbortController === controller) this._availAbortController = null;
+      if (this._availAbortController === controller) {
+        this._availAbortController = null;
+        this._availLoading = false;
+        this._updateAvailLoadingUI(false);
+      }
     }
   }
 
   _updateDrawerUptime(target) {
+    const sinceEl = document.getElementById('drawerUptimeSince');
+    if (sinceEl) {
+      if (this.isRealtime) {
+        sinceEl.textContent = 'Live snapshot';
+      } else {
+        const totalMin = Math.max(0, Math.round(this.periodMinutes));
+        const d = Math.floor(totalMin / 1440);
+        const h = Math.floor((totalMin % 1440) / 60);
+        const m = totalMin % 60;
+        sinceEl.textContent = `Since ${d}d ${h}h ${m}m`;
+      }
+    }
+
     const uptimeEl = document.getElementById('drawerUptimeVal');
     if (!uptimeEl) return;
     if (this.isRealtime) {
@@ -966,7 +1080,7 @@ class InstancesPage {
     };
 
     if (!fromVal || !toVal) {
-      showError('Pilih tanggal & waktu mulai dan akhir');
+      showError('Please select start and end date & time');
       return;
     }
 
@@ -974,22 +1088,22 @@ class InstancesPage {
     const toDate = new Date(toVal);
 
     if (isNaN(fromDate.getTime()) || isNaN(toDate.getTime())) {
-      showError('Pilih tanggal & waktu yang valid');
+      showError('Please select a valid date & time');
       return;
     }
 
     const minutes = (toDate.getTime() - fromDate.getTime()) / 60000;
 
     if (!(minutes > 0)) {
-      showError('Rentang "Sampai" harus setelah "Dari"');
+      showError('"To" date must be after "From" date');
       return;
     }
     if (minutes > 90 * 1440) {
-      showError('Rentang maksimum 90 hari');
+      showError('Maximum range is 90 days');
       return;
     }
     if (toDate.getTime() > Date.now() + 60000) {
-      showError('Rentang tidak boleh di masa depan');
+      showError('Range cannot be in the future');
       return;
     }
 
@@ -1011,6 +1125,7 @@ class InstancesPage {
   _openAvailabilityBreakdown() {
     if (!this.availabilityBreakdownModal) return;
     this.availabilityBreakdownModal.classList.remove('hidden');
+    document.body.classList.add('modal-open');
     if (this._untrapBreakdown) this._untrapBreakdown();
     this._untrapBreakdown = window.trapModalFocus(this.availabilityBreakdownModal);
 
@@ -1024,16 +1139,31 @@ class InstancesPage {
     }
     
     const currentMins = Math.round(this.periodMinutes);
-    if (!this.availabilityBreakdown || Math.round(this.availabilityBreakdown.period_minutes || 0) !== currentMins) {
-      this.loadAvailability();
+    const cacheKey = this._getAvailCacheKey();
+    const cached = this._availCache.get(cacheKey);
+
+    if (cached && cached.data && Math.round(cached.data.period_minutes || 0) === currentMins) {
+      // Modal is already unhidden above, so _applyAvailabilityData's own
+      // modal-open check already triggers a render — a second explicit call
+      // here just re-renders the same data.
+      this._applyAvailabilityData(cached.data, '_openAvailabilityBreakdown');
     } else {
-      this._renderAvailabilityBreakdown();
+      this.loadAvailability(false);
     }
   }
 
   _closeAvailabilityBreakdown() {
     if (this._untrapBreakdown) { this._untrapBreakdown(); this._untrapBreakdown = null; }
     if (this.availabilityBreakdownModal) this.availabilityBreakdownModal.classList.add('hidden');
+    
+    const availSortMenu = document.getElementById('availSortMenu');
+    const availSortTrigger = document.getElementById('availSortTrigger');
+    availSortMenu?.classList.add('hidden');
+    availSortTrigger?.setAttribute('aria-expanded', 'false');
+
+    if (!document.querySelector('.modal-backdrop:not(.hidden):not(#availabilityBreakdownModal)')) {
+      document.body.classList.remove('modal-open');
+    }
   }
 
   // Format downtime in seconds to human-readable format: "12h 18m downtime", "4m 20s downtime", "0s downtime"
@@ -1075,15 +1205,17 @@ class InstancesPage {
     return avail >= 99.9 ? { cls: 'alt-ok', label: 'COMPLIANT' } : { cls: 'alt-warning', label: 'NON-COMPLIANT' };
   }
 
-  _renderAvailabilityBreakdown() {
+  _renderAvailabilityBreakdown(source = 'direct') {
     const data = this.availabilityBreakdown;
     const expectedMins = Math.round(this.periodMinutes);
     const isMatchingData = data && Math.round(data.period_minutes || 0) === expectedMins;
 
+    this._updateAvailLoadingUI(this._availLoading && !isMatchingData);
+
     // 1. Fleet Availability (Card 1)
-    const fleetAvail = (isMatchingData && data?.fleet_aggregate && typeof data.fleet_aggregate.value === 'number')
+    const fleetAvail = (data?.fleet_aggregate && typeof data.fleet_aggregate.value === 'number')
       ? data.fleet_aggregate.value
-      : ((isMatchingData && typeof data?.overall === 'number') ? data.overall : null);
+      : (typeof data?.overall === 'number' ? data.overall : null);
 
     const aggEl = document.getElementById('metricFleetAggregate');
     const splitUpEl = document.getElementById('splitBarUptime');
@@ -1091,6 +1223,13 @@ class InstancesPage {
     const legendUpEl = document.getElementById('legendUptimePct');
     const legendDownEl = document.getElementById('legendDowntimePct');
     const gaugeCircleEl = document.getElementById('fleetGaugeCircle');
+
+    // Data-driven refresh should update the gauge/split-bar instantly, not
+    // animate through their 0.4-0.6s hover-style CSS transitions on every
+    // range switch. Suspend the transition just for this write, then let it
+    // resume next frame.
+    const transitionedEls = [splitUpEl, splitDownEl, gaugeCircleEl].filter(Boolean);
+    transitionedEls.forEach(el => el.classList.add('no-transition'));
 
     if (fleetAvail !== null) {
       const upPctStr = `${fleetAvail.toFixed(2)}%`;
@@ -1117,8 +1256,30 @@ class InstancesPage {
       if (gaugeCircleEl) gaugeCircleEl.style.strokeDashoffset = '213.6';
     }
 
+    if (transitionedEls.length) {
+      requestAnimationFrame(() => transitionedEls.forEach(el => el.classList.remove('no-transition')));
+    }
+
+    // Fleet-level data confidence warning — the headline % is real math over
+    // whatever got observed, but for a young Prometheus/DB (retention just
+    // started, SQLite not backfilled yet) a "7d"/"30d" window can be built
+    // from a few hours of actual samples. Surface that instead of letting
+    // the big number imply full-window confidence it doesn't have.
+    const warnEl = document.getElementById('metricFleetDataWarning');
+    if (warnEl) {
+      const covPct = typeof data?.coverage_percent === 'number' ? data.coverage_percent : null;
+      const status = data?.data_status;
+      const isLimited = status === 'INSUFFICIENT_DATA' || status === 'PARTIAL' || (covPct !== null && covPct < 50);
+      if (fleetAvail !== null && isLimited && covPct !== null) {
+        warnEl.textContent = `⚠ Limited data — only ${covPct.toFixed(1)}% of this window observed`;
+        warnEl.hidden = false;
+      } else {
+        warnEl.hidden = true;
+      }
+    }
+
     // 2. Healthy Hosts (Card 2)
-    const healthRatio = (isMatchingData && data?.health_ratio && typeof data.health_ratio.value === 'number')
+    const healthRatio = (data?.health_ratio && typeof data.health_ratio.value === 'number')
       ? data.health_ratio.value
       : null;
     const healthyCount = data?.health_ratio?.healthy_count ?? data?.healthy_hosts_count ?? null;
@@ -1141,18 +1302,18 @@ class InstancesPage {
 
     // Keep hidden secondary metrics updated for test/DOM compatibility
     const avgEl = document.getElementById('metricFleetAverage');
-    if (avgEl) avgEl.textContent = (isMatchingData && data?.fleet_average?.value !== null) ? `${data.fleet_average.value.toFixed(2)}%` : '—';
+    if (avgEl) avgEl.textContent = (data?.fleet_average?.value !== null && typeof data?.fleet_average?.value === 'number') ? `${data.fleet_average.value.toFixed(2)}%` : '—';
     const slaEl = document.getElementById('metricSlaCompliance');
-    if (slaEl) slaEl.textContent = (isMatchingData && data?.sla_compliance_ratio?.value !== null) ? `${data.sla_compliance_ratio.value.toFixed(2)}%` : '—';
+    if (slaEl) slaEl.textContent = (data?.sla_compliance_ratio?.value !== null && typeof data?.sla_compliance_ratio?.value === 'number') ? `${data.sla_compliance_ratio.value.toFixed(2)}%` : '—';
     const covRatioEl = document.getElementById('metricCoverageRatio');
-    if (covRatioEl) covRatioEl.textContent = (isMatchingData && data?.coverage_ratio?.value !== null) ? `${data.coverage_ratio.value.toFixed(2)}%` : '—';
+    if (covRatioEl) covRatioEl.textContent = (data?.coverage_ratio?.value !== null && typeof data?.coverage_ratio?.value === 'number') ? `${data.coverage_ratio.value.toFixed(2)}%` : '—';
 
     // 3. Hosts Requiring Attention
     const listEl = document.getElementById('hostsRequiringAttentionList');
     if (!listEl) return;
 
-    if (!isMatchingData) {
-      listEl.innerHTML = '<div class="de-empty" style="padding: 24px; text-align: center; color: var(--text-secondary);">Loading host availability data...</div>';
+    if (!data && this._availLoading) {
+      listEl.innerHTML = '<div class="de-empty" style="padding: 24px; text-align: center; color: var(--text-secondary);"><span class="avail-updating-spinner" style="margin-right:8px;"></span> Loading host availability data...</div>';
       return;
     }
 
@@ -1191,11 +1352,100 @@ class InstancesPage {
       };
     });
 
-    // 3-level priority sorting:
-    // 1. Availability ascending (lowest availability first)
-    // 2. Downtime duration descending (longest downtime first)
-    // 3. Incident count descending (most incidents first)
+    const sortMode = this._breakdownSort || 'avail_asc';
+
+    // Synchronize custom dropdown trigger label & active items
+    const sortLabels = {
+      avail_asc: 'Lowest Availability',
+      incidents_desc: 'Most Incidents',
+      downtime_desc: 'Longest Downtime',
+      avail_desc: 'Highest Availability',
+      name_asc: 'Host Name (A-Z)',
+      name_desc: 'Host Name (Z-A)'
+    };
+
+    const triggerTextEl = document.getElementById('availSortTriggerText');
+    if (triggerTextEl) {
+      triggerTextEl.textContent = sortLabels[sortMode] || 'Lowest Availability';
+    }
+
+    const sortMenuEl = document.getElementById('availSortMenu');
+    if (sortMenuEl) {
+      sortMenuEl.querySelectorAll('.avail-sort-item').forEach(item => {
+        const isSelected = item.dataset.value === sortMode;
+        item.classList.toggle('is-active', isSelected);
+        item.setAttribute('aria-selected', String(isSelected));
+      });
+    }
+
+    const subtitleEl = document.getElementById('availAttentionSubtitle');
+    if (subtitleEl) {
+      const subtitleMap = {
+        avail_asc: 'Sorted by lowest availability (ascending)',
+        avail_desc: 'Sorted by highest availability (descending)',
+        incidents_desc: 'Sorted by most incidents (descending)',
+        downtime_desc: 'Sorted by longest downtime (descending)',
+        name_asc: 'Sorted by host name (A to Z)',
+        name_desc: 'Sorted by host name (Z to A)'
+      };
+      subtitleEl.textContent = subtitleMap[sortMode] || 'Sorted by availability (ascending)';
+    }
+
+    const arrowName = document.getElementById('sortArrowName');
+    const arrowAvail = document.getElementById('sortArrowAvail');
+    const arrowImpact = document.getElementById('sortArrowImpact');
+    const btnName = document.querySelector('.ath-sort-btn[data-sort-key="name"]');
+    const btnAvail = document.querySelector('.ath-sort-btn[data-sort-key="avail"]');
+    const btnImpact = document.querySelector('.ath-sort-btn[data-sort-key="impact"]');
+
+    if (arrowName) arrowName.textContent = '';
+    if (arrowAvail) arrowAvail.textContent = '';
+    if (arrowImpact) arrowImpact.textContent = '';
+    btnName?.classList.remove('ath-sorted');
+    btnAvail?.classList.remove('ath-sorted');
+    btnImpact?.classList.remove('ath-sorted');
+
+    if (sortMode === 'name_asc' || sortMode === 'name_desc') {
+      btnName?.classList.add('ath-sorted');
+      if (arrowName) arrowName.textContent = sortMode === 'name_asc' ? '▲' : '▼';
+    } else if (sortMode === 'avail_asc' || sortMode === 'avail_desc') {
+      btnAvail?.classList.add('ath-sorted');
+      if (arrowAvail) arrowAvail.textContent = sortMode === 'avail_asc' ? '▲' : '▼';
+    } else if (sortMode === 'incidents_desc' || sortMode === 'downtime_desc') {
+      btnImpact?.classList.add('ath-sorted');
+      if (arrowImpact) arrowImpact.textContent = '▼';
+    }
+
+    // Dynamic Multi-criteria Sorting
     processedHosts.sort((a, b) => {
+      if (sortMode === 'incidents_desc') {
+        if (b.incidentCount !== a.incidentCount) return b.incidentCount - a.incidentCount;
+        if (b.downtimeDurationSeconds !== a.downtimeDurationSeconds) return b.downtimeDurationSeconds - a.downtimeDurationSeconds;
+        const availA = a.availability !== null ? a.availability : 999;
+        const availB = b.availability !== null ? b.availability : 999;
+        return availA - availB;
+      }
+      if (sortMode === 'downtime_desc') {
+        if (b.downtimeDurationSeconds !== a.downtimeDurationSeconds) return b.downtimeDurationSeconds - a.downtimeDurationSeconds;
+        if (b.incidentCount !== a.incidentCount) return b.incidentCount - a.incidentCount;
+        const availA = a.availability !== null ? a.availability : 999;
+        const availB = b.availability !== null ? b.availability : 999;
+        return availA - availB;
+      }
+      if (sortMode === 'avail_desc') {
+        const availA = a.availability !== null ? a.availability : -1;
+        const availB = b.availability !== null ? b.availability : -1;
+        if (availA !== availB) return availB - availA;
+        if (a.downtimeDurationSeconds !== b.downtimeDurationSeconds) return a.downtimeDurationSeconds - b.downtimeDurationSeconds;
+        return a.incidentCount - b.incidentCount;
+      }
+      if (sortMode === 'name_asc') {
+        return (a.name || '').localeCompare(b.name || '', undefined, { numeric: true, sensitivity: 'base' });
+      }
+      if (sortMode === 'name_desc') {
+        return (b.name || '').localeCompare(a.name || '', undefined, { numeric: true, sensitivity: 'base' });
+      }
+      // Default: 'avail_asc' (Lowest availability first)
       const availA = a.availability !== null ? a.availability : 999;
       const availB = b.availability !== null ? b.availability : 999;
       if (availA !== availB) return availA - availB;
@@ -1203,25 +1453,47 @@ class InstancesPage {
       return b.incidentCount - a.incidentCount;
     });
 
-    // Find hosts needing attention
-    const hostsNeedingAttention = processedHosts.filter(h => (h.availability !== null && h.availability < 100) || h.downtimeDurationSeconds > 0 || h.incidentCount > 0 || h.isNoData);
+    // Update toggle button text with host counts
+    const lbl = document.getElementById('viewAllHostsLabel');
+    if (lbl) {
+      lbl.textContent = this._showAllHostsInBreakdown ? 'Show top hosts' : `View all (${processedHosts.length})`;
+    }
+
+    // Filter priority hosts if not viewing all
+    let priorityHosts = processedHosts;
+    if (sortMode === 'incidents_desc') {
+      const withIncidents = processedHosts.filter(h => h.incidentCount > 0);
+      if (withIncidents.length > 0) priorityHosts = withIncidents;
+    } else if (sortMode === 'downtime_desc') {
+      const withDowntime = processedHosts.filter(h => h.downtimeDurationSeconds > 0);
+      if (withDowntime.length > 0) priorityHosts = withDowntime;
+    } else if (sortMode === 'avail_asc') {
+      const needAttention = processedHosts.filter(h => (h.availability !== null && h.availability < 100) || h.downtimeDurationSeconds > 0 || h.incidentCount > 0 || h.isNoData);
+      if (needAttention.length > 0) priorityHosts = needAttention;
+    }
 
     const displayList = this._showAllHostsInBreakdown
       ? processedHosts
-      : (hostsNeedingAttention.length > 0 ? hostsNeedingAttention.slice(0, 5) : processedHosts.slice(0, 5));
+      : priorityHosts.slice(0, 5);
 
     if (displayList.length === 0) {
-      listEl.innerHTML = '<div class="de-empty" style="padding: 24px; text-align: center; color: var(--text-secondary);">All monitored hosts currently have 100% availability with zero recorded downtime.</div>';
+      const allNoData = processedHosts.length > 0 && processedHosts.every(h => h.isNoData);
+      const emptyMsg = allNoData
+        ? 'No telemetry data recorded for monitored hosts in this time range.'
+        : 'All monitored hosts currently have 100% availability with zero recorded downtime.';
+      listEl.innerHTML = `<div class="de-empty" style="padding: 24px; text-align: center; color: var(--text-secondary);">${emptyMsg}</div>`;
       return;
     }
 
-    listEl.innerHTML = displayList.map(h => {
-      const target = this.data.find(t => t.instance === h.id || t.instance === h.name);
+    // O(1) lookup instead of an O(N) find() per host
+    const dataByInstance = new Map(this.data.map(t => [t.instance, t]));
+    const rowsHtml = displayList.map(h => {
+      const target = dataByInstance.get(h.id) || dataByInstance.get(h.name);
       const roleLabel = this._getHostRoleLabel(target, h);
 
       // Severity styling & icon
       let sevClass = 'ara-sev-good';
-      let sevIcon = '<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="3.5 8 6.5 11 12.5 5"></polyline></svg>';
+      let sevIcon = '<svg viewBox="0 0 16 16" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="3.5 8 6.5 11 12.5 5"></polyline></svg>';
       let pctClass = 'pct-good';
       let barClass = 'bar-fill-good';
 
@@ -1306,22 +1578,7 @@ class InstancesPage {
         </div>`;
     }).join('');
 
-    // Attach click listeners to rows to open drawer
-    listEl.querySelectorAll('.ara-row').forEach(row => {
-      const inst = row.dataset.instance;
-      const onSelect = () => {
-        const target = this.data.find(t => t.instance === inst) || { instance: inst, job: 'blackbox' };
-        this._closeAvailabilityBreakdown();
-        this._openDrawer(target);
-      };
-      row.addEventListener('click', onSelect);
-      row.addEventListener('keydown', e => {
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.preventDefault();
-          onSelect();
-        }
-      });
-    });
+    listEl.innerHTML = rowsHtml;
   }
 
   startPolling(ms) {
@@ -1381,7 +1638,16 @@ class InstancesPage {
     let sig = `${this.activeSort || 'default'}|${this.selectedJob || 'all'}|${this.activeStatus || 'all'}|${this.searchQ || ''};`;
     for (let i = 0; i < targets.length; i++) {
       const t = targets[i];
-      sig += t.instance + '|' + t.job + '|' + t.health + '|' + t.responseTimeMs + '|' + t.downSince + '|' + t.maintenance + '|' + t.suppressedBy + '|' + t.failureCategory + ';';
+      // is_alarmable/effective_status/active_alerts are backend-derived from
+      // Alertmanager alerts, not just probe health — an alert can fire/clear
+      // (e.g. a warning-severity CPU alert) with health/downSince/etc all
+      // unchanged, which used to leave the signature identical and skip
+      // _render(), so the top-level alarm banner could flip while every
+      // per-target card silently stayed stale.
+      const alertsSig = Array.isArray(t.active_alerts)
+        ? t.active_alerts.map(a => `${a.name}:${a.severity}`).join(',')
+        : '';
+      sig += t.instance + '|' + t.job + '|' + t.health + '|' + t.responseTimeMs + '|' + t.downSince + '|' + t.maintenance + '|' + t.suppressedBy + '|' + t.failureCategory + '|' + t.is_alarmable + '|' + t.effective_status + '|' + alertsSig + ';';
     }
     return sig;
   }
@@ -1431,6 +1697,7 @@ class InstancesPage {
       }
 
       const newTargets = data.targets || [];
+      this.serverPayload = data;
       this._checkStateTransitions(newTargets);
       this.data = newTargets;
       this._updateStats();
@@ -1443,7 +1710,6 @@ class InstancesPage {
         this._lastDataSignature = sig;
         this._render();
       }
-      if (this.metaEl) this.metaEl.textContent = `Updated ${new Date().toLocaleTimeString()}`;
     } catch (e) {
       if (e.name === 'AbortError') return;
       this._showError(e.message);
@@ -1774,13 +2040,15 @@ class InstancesPage {
 
   _showError(msg) {
     if (this.errorEl) this.errorEl.classList.remove('hidden');
-    if (this.errorMsg) this.errorMsg.textContent = msg || 'Engine Prometheus tidak dapat dijangkau';
+    if (this.errorMsg) this.errorMsg.textContent = msg || 'Prometheus engine is unreachable';
     // Preserve existing table layout and host cards so previously loaded data remains visible!
     if (this.table && (!this.data || this.data.length === 0)) {
+      this._downCardElements = [];
+      this._maintCardElements = [];
       this.table.innerHTML = `
         <div class="empty-state">
           <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
-          <span>Menunggu data Prometheus — ${this._esc(msg)}</span>
+          <span>Waiting for Prometheus data — ${this._esc(msg)}</span>
         </div>`;
     }
   }
@@ -1799,31 +2067,31 @@ class InstancesPage {
     const down = total - up;
     const slow = this.data.filter(t => t.health === 'up' && t.responseTimeMs > 500).length;
 
-    // Alarm-eligible downs — excludes hosts under an active maintenance
-    // window (Phase 9). `down`/`statDown` above stay factual (a maintenance
-    // host that's actually down still counts there); this narrower list
-    // drives everything that would otherwise page/annoy an operator for
-    // planned work: the ack button, the "NEW outage" toast, the health
-    // pill, and the audio alarm.
-    const alarmableDown = this.data.filter(t => t.health !== 'up' && !t.maintenance);
+    // Backend authoritative state (Phase 2 canonical monitoring model)
+    const serverSummary = this.serverPayload ? this.serverPayload.summary : null;
+    const serverStatus = this.serverPayload ? this.serverPayload.system_status : null;
 
-    // Realtime mode OR initial fast fill (eliminates '—' skeleton lines on page load)
-    if (this.isRealtime || (this.statTotal && (this.statTotal.textContent === '—' || !this.statTotal.textContent.trim()))) {
-      const onlineHealthy = up - slow;
-      if (this.statTotal) this.statTotal.textContent = total;
-      if (this.statUp) this.statUp.textContent = onlineHealthy;
-      const statSlow = document.getElementById('instSlow');
-      if (statSlow) statSlow.textContent = slow;
-      if (this.statDown) this.statDown.textContent = down;
-      if (this.statUptime && (this.statUptime.textContent === '—' || !this.statUptime.textContent.trim())) {
-        const pct = total > 0 ? (up / total) * 100 : 0;
-        this.statUptime.textContent = `${pct.toFixed(2)}%`;
-      }
-      // Keep an open drawer's uptime figure live too.
-      if (this.selectedTarget) {
-        const fresh = this.data.find(t => t.instance === this.selectedTarget.instance) || this.selectedTarget;
-        this._updateDrawerUptime(fresh);
-      }
+    // Alarm-eligible downs — respect backend's authoritative is_alarmable flag if available,
+    // otherwise fallback to non-maintenance, non-suppressed down targets.
+    const alarmableDown = this.data.filter(t => t.is_alarmable !== undefined ? (t.is_alarmable && t.health !== 'up') : (t.health !== 'up' && !t.maintenance && !t.suppressedBy));
+    const hasAlarm = serverSummary ? serverSummary.has_alarm : (alarmableDown.length > 0 || this.data.some(t => t.is_alarmable));
+
+    // Live snapshot summary cards: Total Hosts, Online, Warning, Offline
+    const onlineHealthy = Math.max(0, up - slow);
+    if (this.statTotal) this.statTotal.textContent = total;
+    if (this.statUp) this.statUp.textContent = onlineHealthy;
+    const statSlow = document.getElementById('instSlow');
+    if (statSlow) statSlow.textContent = slow;
+    if (this.statDown) this.statDown.textContent = down;
+
+    if (this.isRealtime || (this.statUptime && (this.statUptime.textContent === '—' || !this.statUptime.textContent.trim()))) {
+      const pct = total > 0 ? (up / total) * 100 : 0;
+      this.statUptime.textContent = `${pct.toFixed(2)}%`;
+    }
+    // Keep an open drawer's uptime figure live too.
+    if (this.selectedTarget) {
+      const fresh = this.data.find(t => t.instance === this.selectedTarget.instance) || this.selectedTarget;
+      this._updateDrawerUptime(fresh);
     }
 
     // Last probe time
@@ -1860,7 +2128,7 @@ class InstancesPage {
       this._triggerEventToast(`NEW outage detected on ${ipStr}! Alarm re-triggered.`);
     }
 
-    if (alarmableDown.length > 0 || slow > 0) {
+    if (hasAlarm || alarmableDown.length > 0 || slow > 0) {
       if (ackBtn) {
         ackBtn.classList.remove('hidden');
         if (this.isAcknowledged) {
@@ -1881,8 +2149,11 @@ class InstancesPage {
       if (ackBtn) ackBtn.classList.add('hidden');
     }
 
-    // Global health badge & Alarm Trigger
-    if (alarmableDown.length > 0) {
+    // Authoritative Global health badge & Alarm Trigger
+    const isCritical = serverStatus === 'CRITICAL' || alarmableDown.length > 0;
+    const isDegraded = serverStatus === 'WARNING' || slow > 0;
+
+    if (isCritical) {
       if (this.healthBadge) {
         this.healthBadge.className = 'status-pill pill-critical';
         this.healthBadge.innerHTML = '<span class="pill-dot"></span><span class="pill-label">Critical</span>';
@@ -1892,7 +2163,7 @@ class InstancesPage {
       }
     } else {
       if (this.healthBadge) {
-        if (slow > 0) {
+        if (isDegraded) {
           this.healthBadge.className = 'status-pill pill-degraded';
           this.healthBadge.innerHTML = '<span class="pill-dot"></span><span class="pill-label">Degraded</span>';
         } else {
@@ -1907,7 +2178,7 @@ class InstancesPage {
 
     // Live indicator
     const liveDot = document.getElementById('liveDot');
-    if (liveDot) liveDot.style.background = alarmableDown.length > 0 ? 'var(--critical)' : 'var(--success)';
+    if (liveDot) liveDot.style.background = isCritical ? 'var(--critical)' : (isDegraded ? 'var(--warning, #f59e0b)' : 'var(--success)');
 
     // statusMeta (topnav)
     const meta = document.getElementById('statusMeta');
@@ -1944,6 +2215,8 @@ class InstancesPage {
     if (!this.table) return;
 
     if (rows.length === 0) {
+      this._downCardElements = [];
+      this._maintCardElements = [];
       this.table.innerHTML = `
         <div class="empty-state">
           <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
@@ -2054,14 +2327,23 @@ class InstancesPage {
 
         const latEl = card.querySelector('.hc-latency') || card.children[1];
         if (latEl && latEl.textContent !== latencyText) latEl.textContent = latencyText;
-
-        const jobEl = card.querySelector('.hc-job');
-        if (jobEl) {
-          const jobText = t.job || 'blackbox';
-          if (jobEl.textContent !== jobText) jobEl.textContent = jobText;
-        }
       });
     } else {
+      if (rows.length === 0) {
+        let msg = 'No monitored hosts found.';
+        if (this.searchQ) {
+          msg = `No hosts matching "${this._esc(this.searchQ)}".`;
+        } else if (this.activeStatus && this.activeStatus !== 'all') {
+          msg = `No hosts currently with status "${this._esc(this.activeStatus)}".`;
+        }
+        this.table.innerHTML = `<div class="empty-state" style="grid-column: 1 / -1; padding: 40px 20px; text-align: center; color: var(--text-secondary);">
+          <div style="font-size: 14px; font-weight: 500;">${msg}</div>
+        </div>`;
+        this._downCardElements = [];
+        this._maintCardElements = [];
+        return;
+      }
+
       const focusedCard = document.activeElement ? document.activeElement.closest('.host-card') : null;
       const focusedInst = focusedCard ? focusedCard.dataset.instance : null;
 
@@ -2106,6 +2388,16 @@ class InstancesPage {
         if (newFocusedCard) newFocusedCard.focus();
       }
     }
+
+    // Cache down and maintenance card DOM references to avoid periodic querySelectorAll in _tickDownCounters
+    this._downCardElements = Array.from(this.table.querySelectorAll('.host-card.hc-down')).map(card => ({
+      inst: card.dataset.instance,
+      latEl: card.querySelector('.hc-latency')
+    }));
+    this._maintCardElements = Array.from(this.table.querySelectorAll('.host-card.hc-maintenance')).map(card => ({
+      inst: card.dataset.instance,
+      latEl: card.querySelector('.hc-latency')
+    }));
   }
 
   // Delegated D-pad/keyboard navigation for host cards — bound once on
@@ -2160,13 +2452,22 @@ class InstancesPage {
     });
   }
 
-  _renderDrawerAvailabilityBars(target, points = [], events = []) {
+  _renderDrawerAvailabilityBars(target, points = [], events = [], fetchedRangeStart = null) {
     const container = document.getElementById('drawerAvailabilityBars');
     const timeLabelsEl = document.getElementById('drawerAvailabilityTimeLabels');
     if (!container) return;
 
     const now_ts = Math.floor(Date.now() / 1000);
     const isUp = target?.health === 'up';
+    // Bootstrap-only estimate (drawer opened, history fetch not back yet). Once
+    // real per-slot events for the selected range are in (fetchedRangeStart is
+    // set), each hour is judged on its OWN data — never smeared with whatever
+    // aggregate % happens to belong to the currently selected range, which is
+    // what made switching 1h/24h/7d/30d repaint the same 24 real hours with a
+    // different, unrelated number.
+    const targetAvail = (fetchedRangeStart === null && target && target.instance && typeof this.availabilityMap[target.instance] === 'number')
+      ? this.availabilityMap[target.instance]
+      : null;
 
     let barsHtml = '';
     const slotsCount = 24;
@@ -2176,7 +2477,9 @@ class InstancesPage {
       const slotEnd = now_ts - (23 - i) * 3600;
 
       let slotDownSec = 0;
-      if (Array.isArray(events)) {
+      let hasEventCoverage = false;
+
+      if (Array.isArray(events) && events.length > 0) {
         events.forEach(ev => {
           if (ev.status === 'OFFLINE') {
             const evStart = ev.start_ts;
@@ -2185,16 +2488,35 @@ class InstancesPage {
             const oEnd = Math.min(slotEnd, evEnd);
             if (oEnd > oStart) {
               slotDownSec += (oEnd - oStart);
+              hasEventCoverage = true;
             }
           }
         });
       }
 
-      if (!isUp && i === 23 && slotDownSec === 0) {
-        slotDownSec = 3600;
-      }
+      // A slot the selected range never actually queried (e.g. a 1h range
+      // leaves the other 23 of these 24 real hours unfetched) has no evidence
+      // either way — mark it unknown instead of guessing from an aggregate
+      // that belongs to a different window.
+      const isOutsideFetchedRange = fetchedRangeStart !== null && slotEnd <= fetchedRangeStart;
+      const haveRealData = fetchedRangeStart !== null;
 
-      let uptimePct = 100;
+      if (!hasEventCoverage && !haveRealData) {
+        // Bootstrap-only guess (drawer just opened, real events not back yet).
+        if (targetAvail === 0.0 || (!isUp && (!target?.downSince || target.downSince <= slotStart))) {
+          slotDownSec = 3600;
+        } else if (!isUp && target?.downSince && target.downSince < slotEnd) {
+          slotDownSec = Math.max(0, slotEnd - Math.max(slotStart, target.downSince));
+        } else if (targetAvail !== null && targetAvail < 100.0) {
+          slotDownSec = Math.round(3600 * (1.0 - targetAvail / 100.0));
+        }
+      }
+      // else if haveRealData: the query already covered this slot and found
+      // no OFFLINE event in it — that silence is itself proof of uptime, so
+      // it stays at the default 100%, never repainted by a different range's
+      // aggregate percentage.
+
+      let uptimePct = isOutsideFetchedRange ? null : 100;
       if (slotDownSec > 0) {
         uptimePct = Math.max(0, Math.min(100, Math.round(((3600 - slotDownSec) / 3600) * 100)));
       }
@@ -2206,7 +2528,11 @@ class InstancesPage {
       let barHeight = '100%';
       let statusText = `${uptimePct}% Up`;
 
-      if (uptimePct < 10) {
+      if (uptimePct === null) {
+        barColor = 'var(--border)';
+        barHeight = '15%';
+        statusText = 'No data (outside selected range)';
+      } else if (uptimePct < 10) {
         barColor = '#EF4444';
         barHeight = '25%';
         statusText = 'Down (0% Up)';
@@ -2243,7 +2569,7 @@ class InstancesPage {
     if (!container) return;
 
     if (!Array.isArray(events) || events.length === 0) {
-      container.innerHTML = '<div class="de-empty" style="font-size:12px; color:var(--text-secondary);">Tidak ada log event insiden</div>';
+      container.innerHTML = '<div class="de-empty" style="font-size:12px; color:var(--text-secondary);">No incident event logs</div>';
       return;
     }
 
@@ -2356,15 +2682,61 @@ class InstancesPage {
 
     this._switchModalTab('overview');
 
+    // Abort any in-flight history request from previously selected target
+    if (this._historyAbortController) {
+      this._historyAbortController.abort();
+      this._historyAbortController = null;
+    }
+
+    // Reset drawer state & zoom range to prevent data bleed across targets
+    this._sparklineZoomRange = null;
+    this._rawSparklinePoints = [];
+
     // IP + job
     const titleEl = document.getElementById('drawerTargetTitle');
     if (titleEl) titleEl.textContent = target.instance;
     const infoIpEl = document.getElementById('drawerInfoIp');
     if (infoIpEl) infoIpEl.textContent = target.instance;
     const jobEl = document.getElementById('drawerJobBadge');
-    if (jobEl) jobEl.textContent = target.job || 'blackbox-ping-internal';
+    if (jobEl) jobEl.textContent = target.job || '—';
     const infoJobEl = document.getElementById('drawerInfoJob');
-    if (infoJobEl) infoJobEl.textContent = target.job || 'blackbox-ping-internal';
+    if (infoJobEl) infoJobEl.textContent = target.job || '—';
+
+    // Protocol / Module — prefer the real blackbox module label if Prometheus
+    // reports one, else derive dynamically from target labels or job name
+    const protocolEl = document.getElementById('drawerInfoProtocol');
+    const moduleEl = document.getElementById('drawerInfoModule');
+    const realModule = target.labels?.module;
+    const jobLower = (target.job || '').toLowerCase();
+    let protocolLabel = '—';
+    let moduleLabel = realModule || '—';
+
+    if (realModule) {
+      if (realModule.includes('icmp') || realModule.includes('ping')) {
+        protocolLabel = 'ICMP';
+      } else if (realModule.includes('http') || realModule.includes('https')) {
+        protocolLabel = 'HTTP';
+      } else if (realModule.includes('tcp')) {
+        protocolLabel = 'TCP';
+      } else if (realModule.includes('dns')) {
+        protocolLabel = 'DNS';
+      } else {
+        protocolLabel = realModule.toUpperCase();
+      }
+    } else if (jobLower.includes('ping') || jobLower === 'icmp') {
+      protocolLabel = 'ICMP';
+      moduleLabel = 'icmp';
+    } else if (jobLower.includes('http') || jobLower === 'custom' || target.isWeb) {
+      protocolLabel = 'HTTP';
+      moduleLabel = 'http_2xx';
+    } else if (jobLower.includes('node') || jobLower.includes('exporter')) {
+      protocolLabel = 'HTTP (Metrics)';
+      moduleLabel = 'node_exporter';
+    } else if (target.job) {
+      protocolLabel = target.job;
+    }
+    if (protocolEl) protocolEl.textContent = protocolLabel;
+    if (moduleEl) moduleEl.textContent = moduleLabel;
 
     // Status dot
     const dot = document.getElementById('drawerStatusDot');
@@ -2440,8 +2812,19 @@ class InstancesPage {
 
     this._updateDrawerUptime(target);
 
-    const lossEl = document.getElementById('drawerPacketLoss');
-    if (lossEl) lossEl.textContent = isDown ? '100%' : '0%';
+    const probeStateEl = document.getElementById('drawerProbeState');
+    const probeDetailEl = document.getElementById('drawerProbeDetail');
+    if (probeStateEl) {
+      probeStateEl.textContent = isDown ? 'FAILED' : 'OK';
+      probeStateEl.style.color = isDown ? '#EF4444' : '#22C55E';
+    }
+    if (probeDetailEl) {
+      if (isDown) {
+        probeDetailEl.textContent = target.scrapeFailureCategory || (target.lastError ? 'Scrape Error' : 'No response');
+      } else {
+        probeDetailEl.textContent = target.httpStatusCode ? `HTTP ${target.httpStatusCode}` : 'Probe successful';
+      }
+    }
 
     // Scrape URL (Rec #5)
     const linkEl = document.getElementById('drawerTargetUrlLink');
@@ -2451,6 +2834,22 @@ class InstancesPage {
       linkEl.textContent = u;
       linkEl.href = hrefUrl;
       linkEl.target = '_blank';
+    }
+
+    // Last/Next Scrape — real timestamp from Prometheus, "next" is an
+    // estimate off this dashboard's own poll cadence (this.currentInterval),
+    // not a fabricated Prometheus schedule.
+    const lastScrapeEl = document.getElementById('drawerLastScrape');
+    if (lastScrapeEl) lastScrapeEl.textContent = target.lastScrape ? this._relTime(target.lastScrape) : '—';
+    const nextScrapeEl = document.getElementById('drawerNextScrape');
+    if (nextScrapeEl) {
+      if (target.lastScrape) {
+        const nextMs = new Date(target.lastScrape).getTime() + this.currentInterval;
+        const diffSec = Math.round((nextMs - Date.now()) / 1000);
+        nextScrapeEl.textContent = diffSec > 0 ? `~${diffSec}s from now` : 'Due now';
+      } else {
+        nextScrapeEl.textContent = '—';
+      }
     }
 
     // Fetch real-time Uptime & Downtime event history from Prometheus
@@ -2784,7 +3183,7 @@ class InstancesPage {
       if (statMax) statMax.textContent = '—';
       if (badge) badge.style.display = 'none';
       if (resetBtn) resetBtn.style.display = 'none';
-      wrap.innerHTML = '<div class="de-empty" style="padding:15px; font-size:12px; color:var(--text-secondary); text-align:center;">Tidak ada data tren response time untuk rentang ini</div>';
+      wrap.innerHTML = '<div class="de-empty" style="padding:15px; font-size:12px; color:var(--text-secondary); text-align:center;">No response time trend data for this range</div>';
       return;
     }
 
@@ -3093,8 +3492,8 @@ class InstancesPage {
       if (elAvg) elAvg.textContent = '—';
       if (elP95) elP95.textContent = '—';
       if (elMax) elMax.textContent = '—';
-      if (elList) elList.innerHTML = '<div class="de-empty" style="padding:10px; font-size:12px;">Tidak ada data poin latensi</div>';
-      wrap.innerHTML = '<div class="de-empty" style="padding:25px; font-size:12px; color:var(--text-secondary); text-align:center;">Tidak ada histori latensi untuk rentang ini</div>';
+      if (elList) elList.innerHTML = '<div class="de-empty" style="padding:10px; font-size:12px;">No latency datapoints</div>';
+      wrap.innerHTML = '<div class="de-empty" style="padding:25px; font-size:12px; color:var(--text-secondary); text-align:center;">No latency history for this range</div>';
       return;
     }
 
@@ -3301,24 +3700,29 @@ class InstancesPage {
     if (this._historyAbortController) this._historyAbortController.abort();
     const controller = new AbortController();
     this._historyAbortController = controller;
+    const seq = ++this._targetHistorySeq;
+    const isStale = () => seq !== this._targetHistorySeq || this.selectedTarget?.instance !== targetInstance;
 
     const rangeText = this.periodLabel === 'custom' ? 'Custom' : (this.periodLabel || '24h');
     const drawerSparklineRangeEl = document.getElementById('drawerSparklineRange');
     if (drawerSparklineRangeEl) drawerSparklineRangeEl.textContent = `(${rangeText})`;
     const historyRangeTag = document.getElementById('historyRangeTag');
-    if (historyRangeTag) historyRangeTag.textContent = `Histori (${rangeText})`;
+    if (historyRangeTag) historyRangeTag.textContent = `History (${rangeText})`;
 
     const logsList = document.getElementById('drawerLogsList');
     const eventsBadge = document.getElementById('eventsCountBadge');
     if (!logsList) return;
-    logsList.innerHTML = '<div class="de-empty" style="padding:10px; font-size:12px; color:var(--text-secondary);">Memuat log histori Prometheus...</div>';
+    logsList.innerHTML = '<div class="de-empty" style="padding:10px; font-size:12px; color:var(--text-secondary);"><span class="avail-updating-spinner" style="margin-right:6px;"></span> Loading Prometheus history logs...</div>';
 
     try {
       const minutes = Math.round(this.periodMinutes || 1440);
+      const fetchedRangeEnd = this.periodEnd || Math.floor(Date.now() / 1000);
+      const fetchedRangeStart = fetchedRangeEnd - minutes * 60;
       let historyUrl = `/api/target-history?target=${encodeURIComponent(targetInstance)}&minutes=${minutes}`;
       if (this.periodEnd) historyUrl += `&end=${this.periodEnd}`;
       const res = await fetch(historyUrl, { signal: controller.signal });
       const data = await res.json();
+      if (isStale()) return;
       
       if (data.ok && Array.isArray(data.latency_points) && data.latency_points.length > 1) {
         this._renderSparkline(data.latency_points);
@@ -3328,10 +3732,19 @@ class InstancesPage {
         this._renderHistoryChart([]);
       }
 
-      this._renderDrawerAvailabilityBars(this.selectedTarget, data.latency_points || [], data.events || []);
+      this._renderDrawerAvailabilityBars(this.selectedTarget, data.latency_points || [], data.events || [], fetchedRangeStart);
 
       if (!data.ok || !Array.isArray(data.events) || data.events.length === 0) {
-        logsList.innerHTML = '<div style="padding: 12px; background: rgba(34, 197, 94, 0.1); border: 1px solid rgba(34, 197, 94, 0.2); border-radius: 8px; font-size: 12px; color: #22C55E; display: flex; align-items: center; gap: 8px;"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg> <span>Target 100% Online — Tidak ada insiden downtime pada rentang ini</span></div>';
+        const isTargetDown = this.selectedTarget?.health === 'down' || this.selectedTarget?.effective_status === 'down';
+        const hasNoPoints = !Array.isArray(data.latency_points) || data.latency_points.length === 0;
+
+        if (isTargetDown) {
+          logsList.innerHTML = '<div style="padding: 12px; background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.25); border-radius: 8px; font-size: 12px; color: #EF4444; display: flex; align-items: center; gap: 8px;"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg> <span>Target is currently OFFLINE / Unreachable</span></div>';
+        } else if (hasNoPoints) {
+          logsList.innerHTML = '<div style="padding: 12px; background: rgba(148, 163, 184, 0.08); border: 1px solid rgba(148, 163, 184, 0.2); border-radius: 8px; font-size: 12px; color: var(--text-secondary); display: flex; align-items: center; gap: 8px;"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="8"/></svg> <span>No telemetry data recorded in this range</span></div>';
+        } else {
+          logsList.innerHTML = '<div style="padding: 12px; background: rgba(34, 197, 94, 0.1); border: 1px solid rgba(34, 197, 94, 0.2); border-radius: 8px; font-size: 12px; color: #22C55E; display: flex; align-items: center; gap: 8px;"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg> <span>Target Online — No downtime incidents in this range</span></div>';
+        }
         if (eventsBadge) eventsBadge.textContent = '0 events';
         this._renderDrawerRecentEvents([]);
         this._renderDrawerProbeSummary(this.selectedTarget, []);
@@ -3349,9 +3762,9 @@ class InstancesPage {
         const statusColor = isOnline ? '#22C55E' : '#EF4444';
         
         const dateObj = new Date(ev.start_ts * 1000);
-        const dateStr = dateObj.toLocaleDateString('id-ID', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        const dateStr = dateObj.toLocaleDateString(undefined, { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', second: '2-digit' });
         const durationStr = this._fmtDownAging(ev.duration_seconds * 1000);
-        const ongoingBadge = ev.ongoing ? '<span style="font-size:10px; background:rgba(56,189,248,0.15); color:#38BDF8; padding:1px 5px; border-radius:3px; margin-left:6px; font-weight:500;">Berjalan</span>' : '';
+        const ongoingBadge = ev.ongoing ? '<span style="font-size:10px; background:rgba(56,189,248,0.15); color:#38BDF8; padding:1px 5px; border-radius:3px; margin-left:6px; font-weight:500;">Ongoing</span>' : '';
 
         const summaryText = ev.summary && !ev.summary.startsWith('Target ONLINE') && !ev.summary.startsWith('Target OFFLINE')
           ? `<div style="font-size:10px; color:var(--text-muted); margin-top:1px;">${ev.summary}</div>`
@@ -3371,14 +3784,14 @@ class InstancesPage {
             </div>
             <div style="text-align:right;">
               <span class="ongoing-duration-val" data-start-ts="${ev.start_ts}" data-ongoing="${ev.ongoing ? 'true' : 'false'}" style="font-family:var(--font-mono); font-weight:600; color:var(--text-primary); font-size:12px;">${durationStr}</span>
-              <div style="font-size:10px; color:var(--text-muted);">Durasi Status</div>
+              <div style="font-size:10px; color:var(--text-muted);">Status Duration</div>
             </div>
           </div>
         `;
       }).join('');
     } catch (e) {
       if (e.name === 'AbortError') return;
-      logsList.innerHTML = '<div class="de-empty" style="padding:10px; font-size:12px; color:#EF4444;">Gagal memuat log histori</div>';
+      logsList.innerHTML = '<div class="de-empty" style="padding:10px; font-size:12px; color:#EF4444;">Failed to load history logs</div>';
     } finally {
       if (this._historyAbortController === controller) this._historyAbortController = null;
     }
@@ -3416,29 +3829,29 @@ class InstancesPage {
     }
 
     if (select) {
-      select.innerHTML = '<option value="" disabled selected>Memuat daftar target Prometheus...</option>';
+      select.innerHTML = '<option value="" disabled selected>Loading Prometheus target list...</option>';
       try {
         const res = await fetch('/api/prometheus-targets');
         const data = await res.json();
         if (data.ok && Array.isArray(data.targets)) {
           if (data.targets.length === 0) {
-            select.innerHTML = '<option value="" disabled selected>Tidak ada target Prometheus yang ditemukan</option>';
+            select.innerHTML = '<option value="" disabled selected>No Prometheus targets found</option>';
             return;
           }
 
           select.innerHTML = `
-            <option value="" disabled selected>-- Pilih Target Prometheus (${data.targets.length} Target) --</option>
+            <option value="" disabled selected>-- Select Prometheus Target (${data.targets.length} Targets) --</option>
             ${data.targets.map(t => {
-            const statusTag = t.isDeleted ? '[Di-hapus / Non-aktif]' : '[Aktif]';
+            const statusTag = t.isDeleted ? '[Deleted / Inactive]' : '[Active]';
             return `<option value="${this._esc(t.instance)}">${this._esc(t.instance)} ${statusTag}</option>`;
           }).join('')}
           `;
           setTimeout(() => select.focus(), 50);
         } else {
-          select.innerHTML = '<option value="" disabled selected>Gagal memuat target Prometheus</option>';
+          select.innerHTML = '<option value="" disabled selected>Failed to load Prometheus targets</option>';
         }
       } catch (ex) {
-        select.innerHTML = '<option value="" disabled selected>Gagal terhubung ke Prometheus API</option>';
+        select.innerHTML = '<option value="" disabled selected>Failed to connect to Prometheus API</option>';
       }
     }
   }
@@ -3458,7 +3871,7 @@ class InstancesPage {
 
     if (!url) {
       if (err) {
-        err.textContent = 'Silakan pilih target dari daftar Prometheus';
+        err.textContent = 'Please select a target from the Prometheus list';
         err.classList.remove('hidden');
       }
       return;
@@ -3495,10 +3908,10 @@ class InstancesPage {
 
   async _deleteTarget(url) {
     const confirmed = await window.showConfirmDialog({
-      title: 'Hapus Target Monitoring',
-      message: `Apakah Anda yakin ingin menghapus target "${url}" dari daftar monitoring?`,
-      confirmText: 'Ya, Hapus',
-      cancelText: 'Batal',
+      title: 'Delete Monitoring Target',
+      message: `Are you sure you want to remove target "${url}" from monitoring?`,
+      confirmText: 'Delete Target',
+      cancelText: 'Cancel',
       isDanger: true
     });
 
@@ -3515,11 +3928,11 @@ class InstancesPage {
         this.load();
         return true;
       }
-      this._triggerEventToast(data.error || `Gagal menghapus target "${url}"`);
+      this._triggerEventToast(data.error || `Failed to delete target "${url}"`);
       return false;
     } catch (ex) {
       console.warn('[InfraWatch] Failed to delete target:', ex);
-      this._triggerEventToast(`Gagal menghapus target "${url}"`);
+      this._triggerEventToast(`Failed to delete target "${url}"`);
       return false;
     }
   }
@@ -4015,52 +4428,14 @@ class ServerMonitor {
   constructor() {
     this.isMuted = false;
     this.isInitialized = false;
-    this.statusCheckInterval = null;
-    this.historyCheckInterval = null;
 
     // ── DOM refs ──────────────────────────────────
-    this.dashboard = document.getElementById('dashboard');
-
-    this.heroCard = document.getElementById('heroCard');
-    this.beaconRing = document.getElementById('beaconRing');
-    this.beaconCore = document.getElementById('beaconCore');
-    this.statusText = document.getElementById('statusText');
-    this.heroDesc = document.getElementById('heroDesc');
-    this.statusMeta = document.getElementById('statusMeta');
-
-    this.alertCount = document.getElementById('alertCount');
-    this.uptimeDays = document.getElementById('uptimeDays');
-    this.incidentCount = document.getElementById('incidentCount');
-    this.alertBar = document.getElementById('alertBar');
-    this.incidentBar = document.getElementById('incidentBar');
-    this.uptimeBar = document.getElementById('uptimeBar');
-
-    this.alertsList = document.getElementById('alertsList');
-    this.alertBadge = document.getElementById('alertBadge');
-
-    this.historyTable = document.getElementById('historyTable');
-    this.historyCount = document.getElementById('historyCount');
-
-    this.soundToggle = document.getElementById('soundToggle');
-    this.soundLabel = document.getElementById('soundLabel');
-    this.testBtn = document.getElementById('testBtn');
-    this.audioWarning = document.getElementById('audioWarning');
     this.alarmAudio = document.getElementById('alarmAudio');
-
-    this.netIndicator = document.getElementById('netIndicator');
-    this.healthIndicator = document.getElementById('healthIndicator');
-    this.subtitle = document.getElementById('subtitle');
 
     // ── Sub-pages ─────────────────────────────────
     this.instancesPage = new InstancesPage(this);
     this.logsPage = new LogsPage(this);
     this.historyPage = new HistoryPage(this);
-
-    // ── Router ────────────────────────────────────
-    this.router = new Router({
-      dashboard: this.instancesPage,
-      instances: this.instancesPage,
-    });
 
     this._bindLogsModal();
     this._bindSelfHealthModal();
@@ -4116,10 +4491,6 @@ class ServerMonitor {
 
     this.initEndpointManager();
     this.instancesPage.onActivate();
-    this.checkStatus();
-    if (!this.statusCheckInterval) {
-      this.statusCheckInterval = setInterval(() => this.checkStatus(), 6000);
-    }
 
     // Poll logs continuously (not just while the modal is open) so the
     // "+N new" nav badge can fire even when the operator is elsewhere —
@@ -4133,7 +4504,6 @@ class ServerMonitor {
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'visible') {
         // Immediate clean sync on wake without timer accumulation
-        this.checkStatus();
         this.instancesPage.load();
         this.instancesPage.loadAvailability();
         this._checkSelfHealth();
@@ -4313,8 +4683,8 @@ class ServerMonitor {
                 ${activeBadge}
               </div>
               <div style="display:flex; gap:6px; flex-shrink:0; margin-left:10px; flex-wrap:wrap; justify-content:flex-end;">
-                ${!ep.active ? `<button class="btn btn-secondary btn-sm select-ep-btn" data-url="${ep.url}" style="padding:2px 8px; font-size:11px;">Pilih</button>` : ''}
-                ${data.endpoints.length > 1 ? `<button class="btn btn-danger btn-sm del-ep-btn" data-url="${ep.url}" style="padding:2px 8px; font-size:11px; background:rgba(239,68,68,0.15); color:#EF4444; border:1px solid rgba(239,68,68,0.3);">Hapus</button>` : ''}
+                ${!ep.active ? `<button class="btn btn-secondary btn-sm select-ep-btn" data-url="${ep.url}" style="padding:2px 8px; font-size:11px;">Select</button>` : ''}
+                ${data.endpoints.length > 1 ? `<button class="btn btn-danger btn-sm del-ep-btn" data-url="${ep.url}" style="padding:2px 8px; font-size:11px; background:rgba(239,68,68,0.15); color:#EF4444; border:1px solid rgba(239,68,68,0.3);">Delete</button>` : ''}
               </div>
             `;
             listContainer.appendChild(row);
@@ -4333,10 +4703,10 @@ class ServerMonitor {
             btn.addEventListener('click', async (e) => {
               const targetUrl = e.currentTarget.dataset.url;
               const confirmed = await window.showConfirmDialog({
-                title: 'Hapus Endpoint Prometheus',
-                message: `Apakah Anda yakin ingin menghapus endpoint "${targetUrl}"?`,
-                confirmText: 'Hapus Endpoint',
-                cancelText: 'Batal',
+                title: 'Delete Prometheus Endpoint',
+                message: `Are you sure you want to delete endpoint "${targetUrl}"?`,
+                confirmText: 'Delete Endpoint',
+                cancelText: 'Cancel',
                 isDanger: true
               });
               if (confirmed) {
@@ -4378,7 +4748,7 @@ class ServerMonitor {
           await fetchEndpoints();
           this.instancesPage.load();
         } else if (errorEl) {
-          errorEl.textContent = data.error || 'Gagal menghapus endpoint';
+          errorEl.textContent = data.error || 'Failed to delete endpoint';
           errorEl.classList.remove('hidden');
         }
       } catch (e) { }
@@ -4428,12 +4798,12 @@ class ServerMonitor {
             this.instancesPage.load();
             this.instancesPage.loadAvailability();
           } else if (errorEl) {
-            errorEl.textContent = data.error || 'Gagal menambah endpoint';
+            errorEl.textContent = data.error || 'Failed to add endpoint';
             errorEl.classList.remove('hidden');
           }
         } catch (e) {
           if (errorEl) {
-            errorEl.textContent = 'Gagal terhubung ke server';
+            errorEl.textContent = 'Failed to connect to server';
             errorEl.classList.remove('hidden');
           }
         }
@@ -4465,211 +4835,6 @@ class ServerMonitor {
     const dd = String(d.getDate()).padStart(2, '0');
     const mo = String(d.getMonth() + 1).padStart(2, '0');
     return `${hh}:${mm} · ${dd}/${mo}`;
-  }
-
-  /* ── Status fetch ──────────────────────────────── */
-  async checkStatus() {
-    try {
-      const res = await fetch('/status');
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      const statusState = data.status || 'NORMAL';
-      // Alarm trigger is exclusively handled by InstancesPage._updateStats to avoid double playback
-    } catch (err) {
-      console.warn('[InfraWatch] Status check failed:', err);
-    }
-  }
-
-  /* ── Hero section update ───────────────────────── */
-  _updateHero(statusState, alerts) {
-    const isCritical = statusState === 'CRITICAL';
-    const isWarning = statusState === 'WARNING';
-    const label = isCritical ? 'CRITICAL' : (isWarning ? 'WARNING' : 'NORMAL');
-
-    if (this.statusText) {
-      this.statusText.textContent = label;
-      this.statusText.classList.toggle('critical', isCritical);
-      this.statusText.classList.toggle('warning', isWarning);
-    }
-
-    if (this.heroCard) {
-      this.heroCard.classList.toggle('critical', isCritical);
-      this.heroCard.classList.toggle('warning', isWarning);
-    }
-
-    if (this.beaconCore) {
-      this.beaconCore.classList.toggle('critical', isCritical);
-      this.beaconCore.classList.toggle('warning', isWarning);
-    }
-
-    if (this.beaconRing) {
-      this.beaconRing.classList.toggle('critical', isCritical);
-      this.beaconRing.classList.toggle('warning', isWarning);
-    }
-
-    if (this.heroDesc) {
-      this.heroDesc.textContent = isCritical
-        ? `${alerts.length} active critical alert${alerts.length !== 1 ? 's' : ''} — immediate attention required`
-        : (isWarning
-          ? `${alerts.length} warning alert${alerts.length !== 1 ? 's' : ''} — investigation recommended`
-          : 'All systems operational');
-    }
-
-    if (this.alertsList) this._renderAlerts(alerts);
-    if (this.alertCount) this.alertCount.textContent = String(alerts.length).padStart(2, '0');
-    if (this.alertBadge) {
-      this.alertBadge.textContent = alerts.length;
-      this.alertBadge.classList.toggle('badge-hidden', alerts.length === 0);
-    }
-
-    // Sound control: Sound alarm on Critical alerts
-    if (isCritical && !this.isMuted) {
-      this.playAlarm();
-    } else {
-      this.stopAlarm();
-    }
-  }
-
-  /* ── Alert rendering ───────────────────────────── */
-  _renderAlerts(alerts) {
-    if (!this.alertsList) return;
-    if (alerts.length === 0) {
-      this.alertsList.innerHTML = `
-        <div class="empty-state">
-          <div class="es-icon" aria-hidden="true">
-            <svg width="32" height="32" viewBox="0 0 32 32" fill="none">
-              <circle cx="16" cy="16" r="13" stroke="currentColor" stroke-width="1.5"/>
-              <path d="M11 16l4 4 6-7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-            </svg>
-          </div>
-          <div class="es-text">No active alerts — everything is quiet</div>
-        </div>`;
-      return;
-    }
-
-    this.alertsList.innerHTML = alerts.map((a) => {
-      const name = this._esc(a.name || 'Unknown Alert');
-      const inst = this._esc(a.instance || '');
-      const summary = this._esc(a.summary || '');
-      const sev = (a.severity || 'critical').toLowerCase();
-      const timeStr = a.time ? `Triggered ${this.formatTimeAgo(a.time)}` : '';
-
-      return `
-        <div class="alert-item">
-          <div class="alert-icon" aria-hidden="true">▲</div>
-          <div class="alert-content">
-            <div class="alert-title">${name}${inst ? ` · <span style="font-weight:400;color:var(--text-2)">${inst}</span>` : ''}</div>
-            ${summary ? `<div class="alert-desc">${summary}</div>` : ''}
-            <div class="alert-meta">
-              ${timeStr ? `<span class="alert-time">${timeStr}</span>` : ''}
-              <span class="alert-sev ${sev}">${sev}</span>
-            </div>
-          </div>
-        </div>`;
-    }).join('');
-  }
-
-  /* ── History fetch (for dashboard mini-panel) ── */
-  async loadHistory() {
-    try {
-      const res = await fetch('/history');
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const incidents = await res.json();
-
-      const uptimeDays = this._calcUptimeDays(incidents);
-      if (this.uptimeDays) {
-        this.uptimeDays.textContent = uptimeDays !== null ? String(uptimeDays).padStart(3, '0') : '—';
-      }
-      if (this.uptimeBar) {
-        this.uptimeBar.style.width = uptimeDays !== null ? `${Math.min(100, (uptimeDays / 30) * 100)}%` : '0%';
-      }
-
-      const monthCount = this._countMonthIncidents(incidents);
-      if (this.incidentCount) {
-        this.incidentCount.textContent = String(monthCount).padStart(2, '0');
-      }
-
-      if (this.incidentBar) {
-        this.incidentBar.style.width = `${Math.min(100, (monthCount / 20) * 100)}%`;
-      }
-
-      if (this.historyCount) this.historyCount.textContent = incidents.length;
-      if (this.historyTable) this._renderMiniHistory(incidents);
-
-      if (this.historyPage) {
-        this.historyPage.data = incidents;
-        if (typeof this.historyPage._updateStats === 'function') this.historyPage._updateStats();
-      }
-    } catch (err) {
-      console.error('[InfraWatch] History load failed:', err);
-    }
-  }
-
-  /* ── Mini history (dashboard) ─────────────────── */
-  _renderMiniHistory(incidents) {
-    if (incidents.length === 0) {
-      this.historyTable.innerHTML = `
-        <div class="empty-state">
-          <div class="es-icon" aria-hidden="true">
-            <svg width="28" height="28" viewBox="0 0 28 28" fill="none">
-              <path d="M6 22V8a2 2 0 012-2h12a2 2 0 012 2v14" stroke="currentColor" stroke-width="1.5"/>
-              <path d="M3 22h22M10 11h8M10 15h5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
-            </svg>
-          </div>
-          <div class="es-text">No incidents recorded yet</div>
-        </div>`;
-      return;
-    }
-
-    this.historyTable.innerHTML = incidents.slice(0, 10).map((inc) => {
-      const sev = (inc.severity || 'critical').toLowerCase();
-      return `
-        <div class="history-row">
-          <div class="history-time">${this.formatTime(inc.time)}</div>
-          <div class="history-name">${this._esc(inc.name || 'Unknown')}</div>
-          <div class="history-instance">${this._esc(inc.instance || '—')}</div>
-          <div><span class="history-sev ${sev}">${sev}</span></div>
-        </div>`;
-    }).join('');
-  }
-
-  /* ── Metric helpers ────────────────────────────── */
-  _updateMetricAlerts(count) {
-    if (this.alertBar) {
-      this.alertBar.style.width = `${Math.min(100, (count / 10) * 100)}%`;
-    }
-  }
-
-  _calcUptimeDays(incidents) {
-    if (!incidents || incidents.length === 0) return null;
-    const newest = incidents[0];
-    if (!newest?.time) return null;
-    return Math.floor((Date.now() / 1000 - newest.time) / 86400);
-  }
-
-  _countMonthIncidents(incidents) {
-    if (!incidents) return 0;
-    const now = new Date();
-    return incidents.filter((i) => {
-      const d = new Date(i.time * 1000);
-      return d.getMonth() === now.getMonth() && d.getFullYear() === now.getFullYear();
-    }).length;
-  }
-
-  /* ── Indicators ────────────────────────────────── */
-  _setNetIndicator(ok) {
-    this.netIndicator.classList.toggle('success', ok);
-    this.netIndicator.classList.toggle('error', !ok);
-    this.netIndicator.setAttribute('aria-label', `Network: ${ok ? 'connected' : 'disconnected'}`);
-  }
-
-  _setHealthIndicator(statusState) {
-    const isNormal = statusState === 'NORMAL' || statusState === true;
-    const isWarning = statusState === 'WARNING';
-    this.healthIndicator.classList.toggle('success', isNormal);
-    this.healthIndicator.classList.toggle('warning', isWarning);
-    this.healthIndicator.classList.toggle('error', !isNormal && !isWarning);
-    this.healthIndicator.setAttribute('aria-label', `Health: ${statusState}`);
   }
 
   /* ── Sound control ─────────────────────────────── */
@@ -4857,8 +5022,6 @@ class ServerMonitor {
 
   /* ── Cleanup ───────────────────────────────────── */
   destroy() {
-    clearInterval(this.statusCheckInterval);
-    clearInterval(this.historyCheckInterval);
     this.instancesPage.onDeactivate();
   }
 }
@@ -4928,7 +5091,7 @@ window.trapModalFocus = function(modalEl) {
 };
 
 /* ── Modern Confirmation Dialog Helper ─────────────── */
-window.showConfirmDialog = function({ title, message, confirmText = 'Ya, Hapus', cancelText = 'Batal', isDanger = true }) {
+window.showConfirmDialog = function({ title, message, confirmText = 'Yes, Delete', cancelText = 'Cancel', isDanger = true }) {
   return new Promise((resolve) => {
     const modal = document.getElementById('confirmModal');
     const titleEl = document.getElementById('confirmModalTitle');
@@ -4942,8 +5105,8 @@ window.showConfirmDialog = function({ title, message, confirmText = 'Ya, Hapus',
       return;
     }
 
-    if (titleEl) titleEl.textContent = title || 'Konfirmasi Action';
-    if (msgEl) msgEl.textContent = message || 'Apakah Anda yakin?';
+    if (titleEl) titleEl.textContent = title || 'Confirm Action';
+    if (msgEl) msgEl.textContent = message || 'Are you sure?';
     if (cancelBtn) cancelBtn.textContent = cancelText;
     if (actionBtn) {
       actionBtn.textContent = confirmText;

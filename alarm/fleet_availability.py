@@ -20,7 +20,17 @@ ServerRecord = Dict[str, Union[str, int, float, datetime]]
 
 DEFAULT_MIN_SLA_COVERAGE_PERCENT = 50.0
 SLA_COMPLIANCE_THRESHOLD = 99.9
-DEFAULT_SCRAPE_INTERVAL_SEC = 2.0
+def _default_scrape_interval_sec() -> float:
+    """Fallback expected_interval_sec when a caller doesn't pass one explicitly.
+    Mirrors app.py's SCRAPE_INTERVAL_SECONDS so both stay in sync with
+    prometheus.yml's global.scrape_interval without a second config knob."""
+    try:
+        return float(os.environ.get("SCRAPE_INTERVAL_SECONDS", "2.0"))
+    except (TypeError, ValueError):
+        return 2.0
+
+
+DEFAULT_SCRAPE_INTERVAL_SEC = _default_scrape_interval_sec()
 DEFAULT_GAP_TOLERANCE = 3.0  # Gap > 3x scrape interval is classified as UNKNOWN
 
 
@@ -72,6 +82,462 @@ def calculate_percentile(values: List[float], percentile: float) -> Optional[flo
     return round(float(d0 + d1), 2)
 
 
+def clip_hourly_bucket(bucket: Dict[str, Any], clip_start: float, clip_end: float) -> Optional[Dict[str, Any]]:
+    """
+    Proportionally clips an hourly or aggregated SQLite bucket to [clip_start, clip_end].
+    Enforces bucket invariants and rejects corrupted / non-chronological records.
+    """
+    try:
+        b_start = float(bucket.get("bucket_start") if bucket.get("bucket_start") is not None else bucket.get("earliest_bucket_start", 0))
+        b_end = float(bucket.get("bucket_end") if bucket.get("bucket_end") is not None else bucket.get("latest_bucket_end", 0))
+    except (ValueError, TypeError):
+        return None
+
+    if b_end <= b_start:
+        return None
+
+    inter_start = max(b_start, clip_start)
+    inter_end = min(b_end, clip_end)
+    inter_dur = max(0.0, inter_end - inter_start)
+    if inter_dur <= 0.0:
+        return None
+
+    b_dur = max(1.0, b_end - b_start)
+    ratio = min(1.0, max(0.0, inter_dur / b_dur))
+
+    raw_up = max(0.0, float(bucket.get("total_uptime_sec", bucket.get("uptime_seconds", 0.0)) or 0.0))
+    raw_down = max(0.0, float(bucket.get("total_downtime_sec", bucket.get("downtime_seconds", 0.0)) or 0.0))
+    raw_cov = max(0.0, float(bucket.get("total_coverage_sec", bucket.get("coverage_seconds", 0.0)) or (raw_up + raw_down)))
+    raw_cov = min(b_dur, raw_cov)
+
+    cov_sec = max(0.0, min(inter_dur, round(raw_cov * ratio, 2)))
+    up_sec = max(0.0, min(cov_sec, round(raw_up * ratio, 2)))
+    down_sec = max(0.0, min(round(cov_sec - up_sec, 2), round(raw_down * ratio, 2)))
+    # Ensure uptime + downtime == coverage
+    cov_sec = round(up_sec + down_sec, 2)
+    unk_sec = max(0.0, round(inter_dur - cov_sec, 2))
+
+    samples = int(round(float(bucket.get("total_samples", bucket.get("sample_count", 0)) or 0) * ratio))
+    incidents = int(bucket.get("total_incidents", bucket.get("incident_count", 0)) or 0) if ratio >= 0.5 else (1 if down_sec > 0 else 0)
+    latency = float(bucket.get("mean_latency_ms", bucket.get("avg_latency_ms", 0.0)) or 0.0)
+
+    avail_pct = round(_clamp_pct((up_sec / cov_sec) * 100.0), 2) if cov_sec > 0 else None
+
+    return {
+        "instance": bucket.get("instance"),
+        "job": bucket.get("job", "blackbox"),
+        "bucket_start": inter_start,
+        "bucket_end": inter_end,
+        "duration_seconds": inter_dur,
+        "uptime_seconds": up_sec,
+        "downtime_seconds": down_sec,
+        "coverage_seconds": cov_sec,
+        "unknown_seconds": unk_sec,
+        "sample_count": samples,
+        "incident_count": incidents,
+        "avg_latency_ms": latency,
+        "availability_pct": avail_pct,
+        "source": "sqlite",
+    }
+
+
+def merge_hybrid_target_availability(
+    req_start: float,
+    req_end: float,
+    target_id: str,
+    target_name: str,
+    job: str,
+    sqlite_buckets: List[Dict[str, Any]],
+    prom_metrics: Dict[str, Any],
+    expected_interval_sec: float = DEFAULT_SCRAPE_INTERVAL_SEC,
+    gap_tolerance: float = DEFAULT_GAP_TOLERANCE,
+    min_sla_coverage_pct: Optional[float] = None,
+    sla_threshold: float = SLA_COMPLIANCE_THRESHOLD,
+) -> Dict[str, Any]:
+    """
+    Computes per-target hybrid availability by merging authoritative Prometheus telemetry
+    with historical SQLite hourly buckets without overlap or double counting.
+    """
+    if min_sla_coverage_pct is None:
+        min_sla_coverage_pct = get_min_sla_coverage_percent()
+
+    window_sec = max(0.0, float(req_end - req_start))
+    if window_sec <= 0.0:
+        return {
+            "id": target_id,
+            "name": target_name,
+            "job": job,
+            "availability_pct": None,
+            "coverage_minutes": 0.0,
+            "denominator_minutes": 0.0,
+            "observed_minutes": 0.0,
+            "observed_seconds": 0.0,
+            "uptime_minutes": 0.0,
+            "uptime_seconds": 0.0,
+            "downtime_minutes": 0.0,
+            "downtime_seconds": 0.0,
+            "unknown_minutes": 0.0,
+            "unknown_seconds": 0.0,
+            "sqlite_seconds": 0.0,
+            "prometheus_seconds": 0.0,
+            "overlap_removed_seconds": 0.0,
+            "coverage_pct": 0.0,
+            "coverage_percent": 0.0,
+            "unknown_pct": 100.0,
+            "unknown_percent": 100.0,
+            "is_limited_data": False,
+            "is_no_data": True,
+            "sla_eligible": False,
+            "sla_compliant": False,
+            "sla_status": "INSUFFICIENT_DATA",
+            "sla_eligibility_reason": "Zero window duration",
+            "data_status": "NO_DATA",
+            "source": "nodata",
+            "incidents": 0,
+            "incident_count": 0,
+            "sample_count": 0,
+            "avg_latency_ms": 0.0,
+        }
+
+    # 1. Inspect Prometheus telemetry for this specific target
+    raw_first_ts = prom_metrics.get("first_ts")
+    raw_last_ts = prom_metrics.get("last_ts")
+    raw_count = prom_metrics.get("count")
+    raw_avail = prom_metrics.get("avail")
+    raw_incidents = prom_metrics.get("incidents")
+    raw_duration = prom_metrics.get("duration")
+
+    f_ts = float(raw_first_ts) if raw_first_ts is not None else 0.0
+    l_ts = float(raw_last_ts) if raw_last_ts is not None else 0.0
+    s_count = None
+    if raw_count is not None:
+        try:
+            s_count = int(float(raw_count))
+        except (ValueError, TypeError):
+            s_count = None
+
+    has_prom = (s_count is not None and s_count > 0) or (raw_avail is not None) or (f_ts > 0 and l_ts >= f_ts)
+
+    prom_cov_sec = 0.0
+    prom_up_sec = 0.0
+    prom_down_sec = 0.0
+    prom_inc = 0
+    prom_lat = float(raw_duration or 0.0) if raw_duration is not None else 0.0
+
+    if has_prom:
+        eff_cadence = expected_interval_sec if expected_interval_sec > 0 else DEFAULT_SCRAPE_INTERVAL_SEC
+
+        # Calculate Prometheus coverage seconds
+        full_window_from_avail = False
+        if s_count is not None and s_count >= 2 and l_ts > f_ts and f_ts > 0:
+            span_sec = l_ts - f_ts
+            cadence_est = span_sec / (s_count - 1)
+            if cadence_est <= gap_tolerance * eff_cadence:
+                prom_cov_sec = min(span_sec + cadence_est, window_sec)
+            else:
+                prom_cov_sec = min(float(s_count) * eff_cadence, window_sec)
+        elif s_count is not None and s_count == 1:
+            prom_cov_sec = min(eff_cadence, window_sec)
+        elif s_count is not None and s_count > 0:
+            prom_cov_sec = min(float(s_count) * eff_cadence, window_sec)
+        elif raw_avail is not None:
+            prom_cov_sec = window_sec
+            full_window_from_avail = True
+        elif f_ts > 0 and l_ts > 0 and l_ts >= f_ts:
+            prom_cov_sec = max(0.0, min(req_end, l_ts) - max(req_start, f_ts))
+        else:
+            prom_cov_sec = 0.0
+
+        # Determine P_start/P_end boundary — this bounds where SQLite is
+        # still allowed to contribute (only the non-overlapping remainder).
+        # When avg_over_time already implies the *entire* window is covered
+        # (full_window_from_avail), that must mean prom claims all of it —
+        # forcing p_start/p_end to the full window regardless of what an
+        # independent first/last-timestamp query happened to return.
+        # Otherwise f_ts can land strictly inside the window (e.g. the
+        # instance was added mid-window) while prom_cov_sec still equals the
+        # *whole* window_sec, leaving [req_start, f_ts] open for SQLite to
+        # also claim — double-counting that slice between the two sources.
+        if full_window_from_avail:
+            p_start = req_start
+            p_end = req_end
+        else:
+            if f_ts > 0 and f_ts > req_start and f_ts <= req_end:
+                p_start = f_ts
+            elif prom_cov_sec > 0:
+                p_start = max(req_start, req_end - prom_cov_sec)
+            else:
+                p_start = req_end
+
+            if l_ts > 0 and l_ts < req_end and l_ts >= req_start:
+                p_end = l_ts
+            else:
+                p_end = req_end
+
+        # Only attribute an up/down split when there's an actual rate signal
+        # (a reported avail% or a sample count) — p_start/p_end above may
+        # still use the bare first/last-timestamp fallback to bound the
+        # SQLite overlap window, but that fallback alone (no count, no
+        # avail%) carries no evidence of up vs. down, so it shouldn't default
+        # to "fully up" here; leave it unattributed and let the live status
+        # snapshot (checked elsewhere) speak for current state instead.
+        avail_rate = None
+        if raw_avail is not None:
+            try:
+                avail_rate = max(0.0, min(1.0, float(raw_avail) / 100.0))
+            except (ValueError, TypeError):
+                avail_rate = 1.0
+        elif s_count is not None:
+            avail_rate = 1.0
+
+        if avail_rate is not None:
+            prom_up_sec = round(prom_cov_sec * avail_rate, 2)
+            prom_down_sec = round(prom_cov_sec * (1.0 - avail_rate), 2)
+            prom_cov_sec = round(prom_up_sec + prom_down_sec, 2)
+        else:
+            prom_up_sec = 0.0
+            prom_down_sec = 0.0
+            prom_cov_sec = 0.0
+
+        if raw_incidents is not None:
+            try:
+                prom_inc = int(math.ceil(float(raw_incidents) / 2.0))
+            except (ValueError, TypeError):
+                prom_inc = 0
+        if prom_inc == 0 and prom_down_sec > 0:
+            prom_inc = 1
+    else:
+        p_start = req_end
+        p_end = req_end
+
+    # 2. Derive non-overlapping SQLite contribution for interval [req_start, min(req_end, p_start)]
+    sqlite_clip_start = req_start
+    sqlite_clip_end = min(req_end, p_start)
+    sqlite_up_sec = 0.0
+    sqlite_down_sec = 0.0
+    sqlite_cov_sec = 0.0
+    sqlite_samples = 0
+    sqlite_inc = 0
+    sqlite_lat_weighted = 0.0
+    overlap_removed_sec = 0.0
+
+    if sqlite_clip_end > sqlite_clip_start:
+        for b in sqlite_buckets:
+            # Overlap tracking: portion of SQLite bucket that fell into authoritative Prometheus window
+            try:
+                b_st = float(b.get("bucket_start", 0))
+                b_en = float(b.get("bucket_end", 0))
+                if b_en > p_start and b_st < req_end:
+                    overlap_dur = max(0.0, min(b_en, req_end) - max(b_st, p_start))
+                    overlap_removed_sec += overlap_dur
+            except (ValueError, TypeError):
+                pass
+
+            clipped = clip_hourly_bucket(b, sqlite_clip_start, sqlite_clip_end)
+            if clipped:
+                sqlite_up_sec += clipped["uptime_seconds"]
+                sqlite_down_sec += clipped["downtime_seconds"]
+                sqlite_cov_sec += clipped["coverage_seconds"]
+                sqlite_samples += clipped["sample_count"]
+                sqlite_inc += clipped["incident_count"]
+                sqlite_lat_weighted += clipped["avg_latency_ms"] * clipped["coverage_seconds"]
+
+    sqlite_lat = (sqlite_lat_weighted / sqlite_cov_sec) if sqlite_cov_sec > 0 else 0.0
+
+    # 3. Merge non-overlapping intervals — prom_up_sec/prom_down_sec were
+    # already computed in step 1 (identical formula there, plus a sane
+    # avail_rate=1.0 default for the raw_avail-missing-but-count-present
+    # case). Recomputing here used to zero both out whenever raw_avail was
+    # None even though prom_cov_sec (and total_cov_sec, derived from it) was
+    # still positive — producing entries with observed_seconds > 0 but
+    # availability_pct forced to None.
+    total_up_sec = round(sqlite_up_sec + prom_up_sec, 2)
+    total_down_sec = round(sqlite_down_sec + prom_down_sec, 2)
+    total_cov_sec = round(max(0.0, min(window_sec, total_up_sec + total_down_sec if (prom_cov_sec > 0 or sqlite_cov_sec > 0) else prom_cov_sec)), 2)
+    total_unk_sec = round(max(0.0, window_sec - total_cov_sec), 2)
+    total_samples = sqlite_samples + (s_count or 0)
+    total_inc = sqlite_inc + prom_inc
+
+    avg_lat = 0.0
+    if total_cov_sec > 0 and (prom_cov_sec > 0 or sqlite_cov_sec > 0):
+        avg_lat = round((sqlite_lat * sqlite_cov_sec + prom_lat * prom_cov_sec) / total_cov_sec, 1)
+        total_avail = round(_clamp_pct((total_up_sec / total_cov_sec) * 100.0), 2)
+    else:
+        total_avail = None
+
+    cov_pct = round(_clamp_pct((total_cov_sec / window_sec) * 100.0), 2) if window_sec > 0 else 0.0
+    unk_pct = round(_clamp_pct(100.0 - cov_pct), 2)
+
+    # 4. Source classification
+    if sqlite_cov_sec > 0 and prom_cov_sec > 0:
+        target_src = "hybrid"
+    elif sqlite_cov_sec > 0:
+        target_src = "materialized"
+    elif prom_cov_sec > 0:
+        target_src = "fallback"
+    else:
+        target_src = "nodata"
+
+    # 5. SLA & Data Status
+    if total_cov_sec <= 0 or total_avail is None:
+        data_status = "NO_DATA"
+        sla_status = "INSUFFICIENT_DATA"
+        is_eligible = False
+        sla_reason = "Zero observed telemetry in requested window"
+    else:
+        is_eligible = (cov_pct >= min_sla_coverage_pct)
+        if not is_eligible:
+            data_status = "INSUFFICIENT_DATA"
+            sla_status = "INSUFFICIENT_DATA"
+            sla_reason = f"Insufficient coverage ({cov_pct}% < {min_sla_coverage_pct}%)"
+        else:
+            data_status = "COMPLETE" if cov_pct >= 95.0 else "PARTIAL"
+            if total_avail >= sla_threshold:
+                sla_status = "COMPLIANT"
+                sla_reason = f"Availability ({total_avail}%) >= {sla_threshold}%"
+            else:
+                sla_status = "NON_COMPLIANT"
+                sla_reason = f"Availability ({total_avail}%) < {sla_threshold}%"
+
+    return {
+        "id": target_id,
+        "name": target_name,
+        "job": job,
+        "availability_pct": total_avail,
+        "coverage_minutes": round(total_cov_sec / 60.0, 2),
+        "denominator_minutes": round(total_cov_sec / 60.0, 2),
+        "observed_minutes": round(total_cov_sec / 60.0, 2),
+        "observed_seconds": round(total_cov_sec, 1),
+        "uptime_minutes": round(total_up_sec / 60.0, 2),
+        "uptime_seconds": round(total_up_sec, 1),
+        "downtime_minutes": round(total_down_sec / 60.0, 2),
+        "downtime_seconds": round(total_down_sec, 1),
+        "unknown_minutes": round(total_unk_sec / 60.0, 2),
+        "unknown_seconds": round(total_unk_sec, 1),
+        "sqlite_seconds": round(sqlite_cov_sec, 1),
+        "prometheus_seconds": round(prom_cov_sec, 1),
+        "overlap_removed_seconds": round(overlap_removed_sec, 1),
+        "coverage_pct": cov_pct,
+        "coverage_percent": cov_pct,
+        "unknown_pct": unk_pct,
+        "unknown_percent": unk_pct,
+        "is_limited_data": (cov_pct < min_sla_coverage_pct and total_cov_sec > 0),
+        "is_no_data": (total_cov_sec <= 0 or total_avail is None),
+        "sla_eligible": is_eligible,
+        "sla_compliant": (sla_status == "COMPLIANT"),
+        "sla_status": sla_status,
+        "sla_eligibility_reason": sla_reason,
+        "data_status": data_status,
+        "source": target_src,
+        "incidents": total_inc,
+        "incident_count": total_inc,
+        "sample_count": total_samples,
+        "avg_latency_ms": round(avg_lat, 1),
+    }
+
+
+def merge_hybrid_fleet_availability(
+    req_start: float,
+    req_end: float,
+    monitored_instances: List[str],
+    sqlite_buckets: List[Dict[str, Any]],
+    prom_results_map: Dict[str, Any],
+    expected_interval_sec: float = DEFAULT_SCRAPE_INTERVAL_SEC,
+    gap_tolerance: float = DEFAULT_GAP_TOLERANCE,
+    min_sla_coverage_pct: Optional[float] = None,
+    sla_threshold: float = SLA_COMPLIANCE_THRESHOLD,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Merges per-target availability for all monitored instances and calculates fleet metrics.
+    """
+    period_minutes = max(0.0, (req_end - req_start) / 60.0)
+    buckets_by_instance: Dict[str, List[Dict[str, Any]]] = {}
+    for b in sqlite_buckets:
+        inst = b.get("instance")
+        if inst:
+            buckets_by_instance.setdefault(inst, []).append(b)
+
+    entries = []
+    tot_sqlite_sec = 0.0
+    tot_prom_sec = 0.0
+    tot_overlap_removed = 0.0
+    tot_cov_sec = 0.0
+    tot_unk_sec = 0.0
+
+    for inst in monitored_instances:
+        target_prom = {
+            "first_ts": prom_results_map.get("first_ts", {}).get(inst),
+            "last_ts": prom_results_map.get("last_ts", {}).get(inst),
+            "count": prom_results_map.get("count", {}).get(inst),
+            "avail": prom_results_map.get("avail", {}).get(inst),
+            "incidents": prom_results_map.get("incidents", {}).get(inst),
+            "duration": prom_results_map.get("duration", {}).get(inst),
+        }
+        inst_buckets = buckets_by_instance.get(inst, [])
+        entry = merge_hybrid_target_availability(
+            req_start=req_start,
+            req_end=req_end,
+            target_id=inst,
+            target_name=inst,
+            job="blackbox",
+            sqlite_buckets=inst_buckets,
+            prom_metrics=target_prom,
+            expected_interval_sec=expected_interval_sec,
+            gap_tolerance=gap_tolerance,
+            min_sla_coverage_pct=min_sla_coverage_pct,
+            sla_threshold=sla_threshold,
+        )
+        entries.append(entry)
+        tot_sqlite_sec += entry.get("sqlite_seconds", 0.0)
+        tot_prom_sec += entry.get("prometheus_seconds", 0.0)
+        tot_overlap_removed += entry.get("overlap_removed_seconds", 0.0)
+        tot_cov_sec += entry.get("observed_seconds", 0.0)
+        tot_unk_sec += entry.get("unknown_seconds", 0.0)
+
+    summary = summarize_entries(
+        entries,
+        period_minutes=period_minutes,
+        min_sla_coverage_pct=min_sla_coverage_pct,
+        sla_threshold=sla_threshold,
+    )
+
+    fleet_window_sec = float(len(monitored_instances) * period_minutes * 60.0) if monitored_instances else 0.0
+    fleet_cov_pct = round(_clamp_pct((tot_cov_sec / fleet_window_sec) * 100.0), 2) if fleet_window_sec > 0 else 0.0
+
+    if tot_cov_sec <= 0:
+        fleet_data_status = "NO_DATA"
+    elif fleet_cov_pct >= 95.0:
+        fleet_data_status = "COMPLETE"
+    elif fleet_cov_pct >= (min_sla_coverage_pct or DEFAULT_MIN_SLA_COVERAGE_PERCENT):
+        fleet_data_status = "PARTIAL"
+    else:
+        fleet_data_status = "INSUFFICIENT_DATA"
+
+    if tot_sqlite_sec > 0 and tot_prom_sec > 0:
+        fleet_source = "hybrid"
+    elif tot_sqlite_sec > 0:
+        fleet_source = "materialized"
+    elif tot_prom_sec > 0:
+        fleet_source = "fallback"
+    else:
+        fleet_source = "nodata"
+
+    hybrid_metadata = {
+        "requested_window_seconds": round(period_minutes * 60.0, 1),
+        "coverage_seconds": round(tot_cov_sec / max(1, len(monitored_instances)), 1) if monitored_instances else 0.0,
+        "unknown_seconds": round(tot_unk_sec / max(1, len(monitored_instances)), 1) if monitored_instances else 0.0,
+        "sqlite_seconds": round(tot_sqlite_sec / max(1, len(monitored_instances)), 1) if monitored_instances else 0.0,
+        "prometheus_seconds": round(tot_prom_sec / max(1, len(monitored_instances)), 1) if monitored_instances else 0.0,
+        "overlap_removed_seconds": round(tot_overlap_removed / max(1, len(monitored_instances)), 1) if monitored_instances else 0.0,
+        "coverage_percent": fleet_cov_pct,
+        "availability_percent": summary.get("fleet_aggregate", {}).get("value"),
+        "data_status": fleet_data_status,
+        "source": fleet_source,
+    }
+
+    return entries, {**summary, "hybrid": hybrid_metadata}
+
+
 def reconstruct_time_series_intervals(
     samples: List[Tuple[float, Union[int, float, str]]],
     window_start_ts: float,
@@ -95,9 +561,7 @@ def reconstruct_time_series_intervals(
     if min_sla_coverage_pct is None:
         min_sla_coverage_pct = get_min_sla_coverage_percent()
     window_sec = max(0.0, float(window_end_ts - window_start_ts))
-    max_gap_sec = expected_interval_sec * gap_tolerance
-
-    # Clean and filter samples within window
+    # Determine effective expected interval from sample deltas if not explicitly overridden to a matching cadence
     cleaned: List[Tuple[float, int]] = []
     for ts_raw, val_raw in samples:
         try:
@@ -109,6 +573,15 @@ def reconstruct_time_series_intervals(
             continue
 
     cleaned.sort(key=lambda x: x[0])
+
+    if len(cleaned) >= 2:
+        deltas = [cleaned[i+1][0] - cleaned[i][0] for i in range(len(cleaned)-1) if cleaned[i+1][0] > cleaned[i][0]]
+        if deltas:
+            median_delta = sorted(deltas)[len(deltas) // 2]
+            if median_delta > expected_interval_sec:
+                expected_interval_sec = median_delta
+
+    max_gap_sec = expected_interval_sec * gap_tolerance
 
     if not cleaned or window_sec <= 0.0:
         return {
@@ -556,14 +1029,14 @@ def calculate_fleet_availability(
         coverage_minutes = min(age_minutes, period_minutes)
 
         if coverage_minutes <= 0:
-            availability = 100.0 if downtime_minutes <= 0 else 0.0
+            availability = None
         else:
-            availability = _clamp_pct(((coverage_minutes - downtime_minutes) / coverage_minutes) * 100.0)
+            availability = round(_clamp_pct(((coverage_minutes - downtime_minutes) / coverage_minutes) * 100.0), 2)
 
         entries.append({
             "id": server.get("id"),
             "name": server.get("name") or server.get("id"),
-            "availability_pct": round(availability, 2),
+            "availability_pct": availability,
             "denominator_minutes": coverage_minutes,
             "coverage_minutes": coverage_minutes,
             "downtime_minutes": downtime_minutes,

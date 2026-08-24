@@ -1,19 +1,78 @@
 from flask import Flask, request, jsonify, render_template
-import json, time, os, math, re, shutil, gzip, threading, sys
+import json
+import time
+import os
+import math
+import re
+import gzip
+import threading
+import sys
+import uuid
+import ipaddress
+import logging
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from urllib.request import urlopen, Request
 from urllib.error import URLError
+from urllib.parse import urlparse, quote
+import yaml
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s'
+)
+logger = logging.getLogger("infrawatch")
 
 sys.path.insert(0, os.path.dirname(__file__))
 try:
-    from fleet_availability import summarize_entries, reconstruct_time_series_intervals, calculate_percentile
+    from fleet_availability import (
+        summarize_entries, reconstruct_time_series_intervals, calculate_percentile,
+        clip_hourly_bucket, merge_hybrid_target_availability, merge_hybrid_fleet_availability
+    )
 except ImportError:
-    from alarm.fleet_availability import summarize_entries, reconstruct_time_series_intervals, calculate_percentile
+    from alarm.fleet_availability import (
+        summarize_entries, reconstruct_time_series_intervals, calculate_percentile,
+        clip_hourly_bucket, merge_hybrid_target_availability, merge_hybrid_fleet_availability
+    )
+
+try:
+    from storage import (
+        init_db, IncidentRepository, EventLogRepository,
+        MaintenanceRepository, DependencyRepository, EndpointRepository, DeletedTargetRepository,
+        AvailabilityBucketRepository, AggregationLeaseRepository
+    )
+except ImportError:
+    from alarm.storage import (
+        init_db, IncidentRepository, EventLogRepository,
+        MaintenanceRepository, DependencyRepository, EndpointRepository, DeletedTargetRepository,
+        AvailabilityBucketRepository, AggregationLeaseRepository
+    )
+
+init_db()
 
 # Matches prometheus/prometheus.yml `global.scrape_interval`. Used to turn a
 # Prometheus `count_over_time(...)` sample count back into a monitored-duration
-# estimate for weighted (fleet_aggregate) availability math.
-SCRAPE_INTERVAL_SECONDS = 2
+# estimate for weighted (fleet_aggregate) availability math. Override via
+# SCRAPE_INTERVAL_SECONDS if prometheus.yml's scrape_interval is ever changed.
+try:
+    SCRAPE_INTERVAL_SECONDS = float(os.environ.get("SCRAPE_INTERVAL_SECONDS", "2.0"))
+except (TypeError, ValueError):
+    SCRAPE_INTERVAL_SECONDS = 2.0
+
+# How stale the latest SQLite availability bucket may be, for a *live* window
+# (no ?end=), before /api/availability's "is this range fully materialized?"
+# check gives up on the fast path and falls back to a live Prometheus query.
+# The background aggregator (AVAIL_AGGREGATE_INTERVAL_SECONDS, defined lower
+# in this file) only refreshes the in-progress hour's bucket once every 60s,
+# and that cycle itself takes real time (Prometheus queries, up to 15s
+# timeout). The frontend polls this endpoint every 15s regardless of user
+# action — with zero slack between the two 60s numbers, a live range would
+# drift past a bare 60s tolerance partway through most aggregation cycles,
+# flip-flopping between the SQLite-materialized path and the live-hybrid
+# path (two different estimation methods) on its own, with the UI number
+# visibly changing every ~15s with no user action. 2.5x mirrors the same
+# slack multiplier already used for the aggregator's leader-election lease.
+_AVAIL_FRESHNESS_TOLERANCE_SEC = 150.0  # 60.0 * 2.5
 
 app = Flask(__name__)
 # Static assets (JS/CSS/mp3) are safe to let browsers cache briefly — only the
@@ -42,6 +101,9 @@ def add_header(response):
     response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
     response.headers['Pragma'] = 'no-cache'
     response.headers['Expires'] = '-1'
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'SAMEORIGIN'
+    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
 
     # Compress larger JSON payloads — matters once a fleet reaches hundreds/
     # thousands of targets — without touching response content.
@@ -60,6 +122,21 @@ def add_header(response):
             response.headers['Vary'] = 'Accept-Encoding'
 
     return response
+
+@app.errorhandler(404)
+def handle_404(e):
+    if request.path.startswith('/api/') or request.path in ('/instances', '/status', '/logs', '/history', '/webhook', '/health', '/health/live', '/health/ready'):
+        return jsonify({"ok": False, "error": "Resource not found"}), 404
+    return render_template('alarm.html'), 404
+
+@app.errorhandler(405)
+def handle_405(e):
+    return jsonify({"ok": False, "error": "Method not allowed"}), 405
+
+@app.errorhandler(500)
+def handle_500(e):
+    logger.error(f"Internal server error: {e}", exc_info=True)
+    return jsonify({"ok": False, "error": "Internal server error"}), 500
 
 STATUS_FILE  = os.path.join(os.path.dirname(__file__), "status.json")
 HISTORY_FILE = os.path.join(os.path.dirname(__file__), "history.json")
@@ -104,11 +181,13 @@ def parse_alert_timestamp(value, fallback):
 def alert_key(a, labels):
     return a.get('fingerprint') or f"{labels.get('alertname', 'Unknown')}|{labels.get('instance', '-')}"
 
+MAX_ARCHIVE_HISTORY = 5000
+
 def save_with_retention(main_path, archive_path, data, limit):
     if len(data) > limit:
         overflow = data[limit:]
         archive = load_json(archive_path, [])
-        archive = overflow + archive
+        archive = (overflow + archive)[:MAX_ARCHIVE_HISTORY]
         save_json(archive_path, archive)
         data = data[:limit]
     save_json(main_path, data)
@@ -130,21 +209,30 @@ def load_json(path, default=None):
             return default
     return default
 
-import logging
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s'
-)
-logger = logging.getLogger("infrawatch")
-
 def save_json(path, data):
     try:
-        tmp_path = path + ".tmp"
+        tmp_path = path + f".tmp.{os.getpid()}.{threading.get_ident()}"
         os.makedirs(os.path.dirname(os.path.abspath(tmp_path)), exist_ok=True)
         with open(tmp_path, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2)
-        os.replace(tmp_path, path)
+        for attempt in range(5):
+            try:
+                os.replace(tmp_path, path)
+                break
+            except (OSError, PermissionError):
+                if attempt == 4:
+                    try:
+                        with open(path, 'w', encoding='utf-8') as f:
+                            json.dump(data, f, indent=2)
+                    except Exception:
+                        pass
+                    try:
+                        if os.path.exists(tmp_path):
+                            os.remove(tmp_path)
+                    except Exception:
+                        pass
+                else:
+                    time.sleep(0.01 * (attempt + 1))
     except Exception as e:
         logger.error(f"Error saving {path}: {e}")
 
@@ -157,6 +245,44 @@ PROMETHEUS_CANDIDATES = [
     "http://127.0.0.1:9090"
 ]
 
+def is_safe_endpoint_url(url: str):
+    try:
+        parsed = urlparse(url.strip())
+        if parsed.scheme not in ('http', 'https'):
+            return False, "Invalid scheme; only http and https are allowed"
+        if not parsed.netloc or '@' in parsed.netloc:
+            return False, "Invalid URL format or credentials not allowed"
+        hostname = (parsed.hostname or '').lower().strip('[]')
+        if not hostname:
+            return False, "Host missing in URL"
+
+        blocked_hosts = {
+            'metadata.google.internal',
+            '169.254.169.254',
+            '100.100.100.200',
+            'instance-data',
+            'fd00:ec2::254',
+            'localhost',
+        }
+        if hostname in blocked_hosts or hostname.startswith("169.254."):
+            return False, "Endpoint URL is not allowed (restricted network)"
+
+        try:
+            ip = ipaddress.ip_address(hostname)
+            if (ip.is_link_local or
+                ip.is_multicast or
+                ip.is_reserved or
+                ip.is_loopback or
+                (isinstance(ip, ipaddress.IPv4Address) and str(ip).startswith('169.254.')) or
+                (isinstance(ip, ipaddress.IPv6Address) and (ip.is_site_local or ip.ipv4_mapped))):
+                return False, "Endpoint URL is not allowed (restricted network)"
+        except ValueError:
+            pass
+
+        return True, ""
+    except Exception as e:
+        return False, f"Invalid URL: {e}"
+
 _ENDPOINTS_CACHE = {"ts": 0.0, "data": None}
 _ENDPOINTS_CACHE_TTL = 2.0  # endpoints.json rarely changes; avoid a disk read on every hot-path call
 
@@ -167,13 +293,16 @@ def load_endpoints():
         return cached
 
     default_url = _DEFAULT_PROM_URL
-    default_data = {
-        "active": default_url,
-        "endpoints": [default_url]
-    }
-    data = load_json(ENDPOINTS_FILE, default_data)
-    if not isinstance(data, dict) or "endpoints" not in data:
-        data = default_data
+    data = load_json(ENDPOINTS_FILE, None)
+    if not (isinstance(data, dict) and "endpoints" in data and isinstance(data.get("endpoints"), list)):
+        try:
+            data = EndpointRepository.load_endpoints_state(default_url)
+        except Exception:
+            data = {
+                "active": default_url,
+                "endpoints": [default_url]
+            }
+
     if not isinstance(data.get("endpoints"), list) or not data["endpoints"]:
         data["endpoints"] = [default_url]
     if not data.get("active") or data["active"] not in data["endpoints"]:
@@ -236,40 +365,65 @@ def get_targets_file():
     os.makedirs(os.path.dirname(local_target), exist_ok=True)
     return local_target
 
+# websites.yml is a Prometheus file_sd YAML doc: a list of {targets, labels}
+# groups. This app only owns the group labeled job: "blackbox_http" — other
+# groups (e.g. a hand-written blackbox_ping group) are read straight through
+# to save() untouched, so structure, custom labels, and multi-group targets
+# survive an Add/Delete Target round-trip instead of getting flattened.
+WEBSITES_JOB_LABEL = "blackbox_http"
+
 def load_website_targets():
     target_file = get_targets_file()
+    if not os.path.exists(target_file):
+        return []
+    try:
+        with open(target_file, 'r', encoding='utf-8') as f:
+            doc = yaml.safe_load(f)
+    except Exception as e:
+        print(f"Error loading targets: {e}", flush=True)
+        return []
+
+    if not isinstance(doc, list):
+        return []
+
     urls = []
-    if os.path.exists(target_file):
-        try:
-            with open(target_file, 'r') as f:
-                content = f.read()
-                matches = re.findall(r'-\s*"([^"]+)"', content)
-                if not matches:
-                    matches = re.findall(r"-\s*'([^']+)'", content)
-                if not matches:
-                    matches = re.findall(r'-\s*([^\s#]+)', content)
-                for u in matches:
-                    u = u.strip()
-                    if u and u != 'targets:' and u != 'blackbox_http' and u not in urls:
-                        urls.append(u)
-        except Exception as e:
-            print(f"Error loading targets: {e}", flush=True)
+    for group in doc:
+        if not isinstance(group, dict):
+            continue
+        labels = group.get('labels') or {}
+        if labels.get('job') != WEBSITES_JOB_LABEL:
+            continue
+        for u in (group.get('targets') or []):
+            u = str(u).strip()
+            if u and u not in urls:
+                urls.append(u)
     return urls
 
 def save_website_targets(urls):
     target_file = get_targets_file()
     try:
         os.makedirs(os.path.dirname(target_file), exist_ok=True)
-        yaml_lines = ["- targets:"]
-        for u in urls:
-            yaml_lines.append(f'    - "{u}"')
-        yaml_lines.append('  labels:')
-        yaml_lines.append('    job: "blackbox_http"')
-        yaml_lines.append('')
-        
+
+        doc = []
+        if os.path.exists(target_file):
+            try:
+                with open(target_file, 'r', encoding='utf-8') as f:
+                    loaded = yaml.safe_load(f)
+                if isinstance(loaded, list):
+                    doc = loaded
+            except Exception:
+                doc = []
+
+        for group in doc:
+            if isinstance(group, dict) and (group.get('labels') or {}).get('job') == WEBSITES_JOB_LABEL:
+                group['targets'] = list(urls)
+                break
+        else:
+            doc.append({"targets": list(urls), "labels": {"job": WEBSITES_JOB_LABEL}})
+
         tmp_file = target_file + ".tmp"
-        with open(tmp_file, 'w') as f:
-            f.write("\n".join(yaml_lines))
+        with open(tmp_file, 'w', encoding='utf-8') as f:
+            yaml.safe_dump(doc, f, default_flow_style=False, sort_keys=False)
         os.replace(tmp_file, target_file)
     except Exception as e:
         print(f"Error saving targets {target_file}: {e}", flush=True)
@@ -278,6 +432,14 @@ LAST_WORKING_PROMETHEUS_URL = None
 PROMETHEUS_CACHE = {}
 PROMETHEUS_CACHE_LOCK = threading.Lock()
 PROMETHEUS_CACHE_TTL_DEFAULT = 8.0  # backend cache window for identical PromQL responses (5-15s band)
+
+# Shared thread pool executor to prevent continuous thread creation/destruction
+_SHARED_EXECUTOR = ThreadPoolExecutor(max_workers=16, thread_name_prefix="infrawatch-worker")
+
+# Cooldown circuit-breaker for unreachable candidate endpoints (prevents timeout cascades)
+_FAILED_CANDIDATES = {}
+_FAILED_CANDIDATES_LOCK = threading.Lock()
+_FAILED_CANDIDATE_TTL = 5.0
 
 # Single-flight locks: when several requests need the same (endpoint, PromQL)
 # result at once (e.g. /instances and /api/availability both polling
@@ -294,6 +456,12 @@ _CACHE_LAST_PRUNE = [0.0]
 _CACHE_PRUNE_INTERVAL = 30.0
 _CACHE_MAX_AGE = 120.0
 
+# Availability result cache & single-flight coalescing
+_AVAILABILITY_CACHE = {}
+_AVAILABILITY_CACHE_LOCK = threading.Lock()
+_AVAILABILITY_FLIGHT_LOCKS = {}
+_AVAILABILITY_FLIGHT_LOCKS_GUARD = threading.Lock()
+
 def _fetch_lock_for(key):
     with _FETCH_LOCKS_GUARD:
         lock = _FETCH_LOCKS.get(key)
@@ -301,6 +469,25 @@ def _fetch_lock_for(key):
             lock = threading.Lock()
             _FETCH_LOCKS[key] = lock
         return lock
+
+def _avail_flight_lock_for(key):
+    with _AVAILABILITY_FLIGHT_LOCKS_GUARD:
+        lock = _AVAILABILITY_FLIGHT_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _AVAILABILITY_FLIGHT_LOCKS[key] = lock
+        return lock
+
+def clear_availability_cache(clear_db=True):
+    with _AVAILABILITY_CACHE_LOCK:
+        _AVAILABILITY_CACHE.clear()
+    with _AVAILABILITY_FLIGHT_LOCKS_GUARD:
+        _AVAILABILITY_FLIGHT_LOCKS.clear()
+    if clear_db:
+        try:
+            AvailabilityBucketRepository.clear_all_buckets()
+        except Exception:
+            pass
 
 def _maybe_prune_cache(now):
     if now - _CACHE_LAST_PRUNE[0] < _CACHE_PRUNE_INTERVAL:
@@ -317,6 +504,17 @@ def _maybe_prune_cache(now):
             unlocked = [k for k, lock in list(_FETCH_LOCKS.items()) if not lock.locked() and k not in PROMETHEUS_CACHE]
             for k in unlocked:
                 _FETCH_LOCKS.pop(k, None)
+    with _AVAILABILITY_CACHE_LOCK:
+        stale_avail = [k for k, (ts, _d) in _AVAILABILITY_CACHE.items() if now - ts > _CACHE_MAX_AGE]
+        for k in stale_avail:
+            _AVAILABILITY_CACHE.pop(k, None)
+    with _AVAILABILITY_FLIGHT_LOCKS_GUARD:
+        for k in stale_avail:
+            _AVAILABILITY_FLIGHT_LOCKS.pop(k, None)
+        if len(_AVAILABILITY_FLIGHT_LOCKS) > 500:
+            unlocked_avail = [k for k, lock in list(_AVAILABILITY_FLIGHT_LOCKS.items()) if not lock.locked() and k not in _AVAILABILITY_CACHE]
+            for k in unlocked_avail:
+                _AVAILABILITY_FLIGHT_LOCKS.pop(k, None)
 
 def fetch_url(url, timeout=1.5):
     try:
@@ -324,6 +522,12 @@ def fetch_url(url, timeout=1.5):
         with urlopen(req, timeout=timeout) as resp:
             if resp.status == 200:
                 return resp.read().decode('utf-8', errors='ignore')
+    except URLError as e:
+        if hasattr(e, 'read'):
+            try:
+                return e.read().decode('utf-8', errors='ignore')
+            except Exception:
+                pass
     except Exception:
         pass
     return None
@@ -355,35 +559,83 @@ def fetch_prometheus_json(path, use_cache=True, cache_ttl=None, timeout=None):
                     if time.time() - cached_ts < cache_ttl:
                         return cached_data, cached_base
 
-        candidates = []
+        # Primary candidates: active endpoint + last known working endpoint
+        primary_candidates = []
         if active_url:
-            candidates.append(active_url)
-        if LAST_WORKING_PROMETHEUS_URL and LAST_WORKING_PROMETHEUS_URL not in candidates:
-            candidates.append(LAST_WORKING_PROMETHEUS_URL)
-        for ep in endpoints_data.get("endpoints", []):
-            if ep not in candidates:
-                candidates.append(ep)
-        for base_url in PROMETHEUS_CANDIDATES:
-            if base_url not in candidates:
-                candidates.append(base_url)
+            primary_candidates.append(active_url)
+        if LAST_WORKING_PROMETHEUS_URL and LAST_WORKING_PROMETHEUS_URL not in primary_candidates:
+            primary_candidates.append(LAST_WORKING_PROMETHEUS_URL)
 
-        for base_url in candidates:
-            if timeout is None:
-                req_timeout = 2.5 if (base_url == active_url or base_url == LAST_WORKING_PROMETHEUS_URL) else 0.8
-            else:
-                req_timeout = timeout
+        # Try primary candidates first (2.5s default timeout)
+        for base_url in primary_candidates:
+            with _FAILED_CANDIDATES_LOCK:
+                failed_at = _FAILED_CANDIDATES.get(base_url, 0)
+                if now - failed_at < _FAILED_CANDIDATE_TTL and base_url != LAST_WORKING_PROMETHEUS_URL:
+                    continue
+
+            req_timeout = 2.5 if timeout is None else timeout
             raw = fetch_url(f"{base_url.rstrip('/')}{path}", timeout=req_timeout)
             if raw:
                 try:
                     data = json.loads(raw)
+                    # Even if status is error (e.g. invalid query syntax), the server is alive
+                    LAST_WORKING_PROMETHEUS_URL = base_url
+                    with _FAILED_CANDIDATES_LOCK:
+                        _FAILED_CANDIDATES.pop(base_url, None)
                     if data.get('status') == 'success' or 'data' in data:
-                        LAST_WORKING_PROMETHEUS_URL = base_url
                         if use_cache:
                             with PROMETHEUS_CACHE_LOCK:
                                 PROMETHEUS_CACHE[cache_key] = (time.time(), data, base_url)
-                        return data, base_url
+                    return data, base_url
                 except Exception:
+                    with _FAILED_CANDIDATES_LOCK:
+                        _FAILED_CANDIDATES[base_url] = time.time()
                     continue
+            else:
+                with _FAILED_CANDIDATES_LOCK:
+                    _FAILED_CANDIDATES[base_url] = time.time()
+
+        # If primary candidates fail (or none exist), fallback to other registered
+        # endpoints and candidates. _DEFAULT_PROM_URL (PROMETHEUS_URL env, or the
+        # prometheus:9090 compose default) goes first — it's the one an operator
+        # actually configured for this deployment, ahead of the other saved
+        # endpoints and the generic localhost/host.docker.internal guesses.
+        fallback_candidates = []
+        if _DEFAULT_PROM_URL not in primary_candidates:
+            fallback_candidates.append(_DEFAULT_PROM_URL)
+        for ep in endpoints_data.get("endpoints", []):
+            if ep not in primary_candidates and ep not in fallback_candidates:
+                fallback_candidates.append(ep)
+        for base_url in PROMETHEUS_CANDIDATES:
+            if base_url not in primary_candidates and base_url not in fallback_candidates:
+                fallback_candidates.append(base_url)
+
+        for base_url in fallback_candidates:
+            with _FAILED_CANDIDATES_LOCK:
+                failed_at = _FAILED_CANDIDATES.get(base_url, 0)
+                if now - failed_at < _FAILED_CANDIDATE_TTL:
+                    continue
+
+            req_timeout = 0.8 if timeout is None else timeout
+            raw = fetch_url(f"{base_url.rstrip('/')}{path}", timeout=req_timeout)
+            if raw:
+                try:
+                    data = json.loads(raw)
+                    LAST_WORKING_PROMETHEUS_URL = base_url
+                    with _FAILED_CANDIDATES_LOCK:
+                        _FAILED_CANDIDATES.pop(base_url, None)
+                    if data.get('status') == 'success' or 'data' in data:
+                        if use_cache:
+                            with PROMETHEUS_CACHE_LOCK:
+                                PROMETHEUS_CACHE[cache_key] = (time.time(), data, base_url)
+                    return data, base_url
+                except Exception:
+                    with _FAILED_CANDIDATES_LOCK:
+                        _FAILED_CANDIDATES[base_url] = time.time()
+                    continue
+            else:
+                with _FAILED_CANDIDATES_LOCK:
+                    _FAILED_CANDIDATES[base_url] = time.time()
         return None, None
 
 @app.route('/')
@@ -401,8 +653,38 @@ _LAST_WEBHOOK_AT = [0.0]
 # funnel through — so a maintenance window suppresses alerts/alarms without a
 # second alert pipeline.
 def load_maintenance_windows():
-    data = load_json(MAINTENANCE_FILE, [])
-    return data if isinstance(data, list) else []
+    # create_maintenance_api() writes SQLite then JSON as two separate,
+    # non-transactional steps. Preferring the JSON file wholesale (old
+    # behavior) meant a DB-created window whose JSON write failed/lagged
+    # was invisible here forever — merge by id instead so a window that
+    # made it into either store still counts as active.
+    try:
+        db_windows = MaintenanceRepository.list_windows()
+    except Exception:
+        db_windows = []
+    file_windows = load_json(MAINTENANCE_FILE, [])
+    if not isinstance(file_windows, list):
+        file_windows = []
+    # Windows without an 'id' (hand-written JSON, older records) have no key
+    # to merge on — keep them all rather than collapsing them together.
+    by_id = {}
+    for i, w in enumerate(file_windows):
+        by_id[w.get('id') or f'_file_{i}'] = w
+    for i, w in enumerate(db_windows):
+        by_id[w.get('id') or f'_db_{i}'] = w
+    return list(by_id.values())
+
+def _parse_epoch_ts(val):
+    if val is None:
+        return 0.0
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        try:
+            dt = datetime.fromisoformat(str(val).replace('Z', '+00:00'))
+            return dt.timestamp()
+        except Exception:
+            return 0.0
 
 def get_active_maintenance(instance, job=None, windows=None):
     """First maintenance window currently covering this instance/job, or None."""
@@ -410,34 +692,35 @@ def get_active_maintenance(instance, job=None, windows=None):
         windows = load_maintenance_windows()
     now = time.time()
     for w in windows:
-        if not (w.get('start', 0) <= now <= w.get('end', 0)):
+        start_raw = w.get('start_epoch') if w.get('start_epoch') is not None else w.get('start', 0)
+        end_raw = w.get('end_epoch') if w.get('end_epoch') is not None else w.get('end', 0)
+        start_ts = _parse_epoch_ts(start_raw)
+        end_ts = _parse_epoch_ts(end_raw)
+        if not (start_ts <= now <= end_ts):
             continue
-        if w.get('scope') == 'job':
-            if job and w.get('target') == job:
+        scope = w.get('scope') or w.get('scope_type')
+        target = w.get('target') or w.get('scope_target')
+        if scope == 'job':
+            if job and target == job:
                 return w
-        elif w.get('target') == instance:
+        elif target == instance:
             return w
     return None
 
 def record_alert_event(name, severity, instance, summary, job, event_time, is_now_firing,
                         receiver='', generatorURL='', key=None, latency_ms=None):
     """Applies one alert firing/resolved transition to status.json/logs.json/
-    history.json. Shared by the Alertmanager webhook and the Prometheus-poller
-    fallback (see start_alert_poller below) so both get identical
-    transition-only dedupe and incident-history reconciliation.
+    history.json and SQLite database. Shared by the Alertmanager webhook and the Prometheus-poller
+    fallback so both get identical transition-only dedupe and incident-history reconciliation.
     Returns False if this was a repeat notification with no actual state
-    change (already firing, or already resolved) — the caller should treat
-    that as a no-op, matching Alertmanager's own re-notify behavior.
+    change (already firing, or already resolved).
     """
     key = key or f"{name}|{instance}"
 
-    if is_now_firing and get_active_maintenance(instance, job):
-        return False  # suppressed: instance/job is under an active maintenance window.
-        # A recovery for the same key naturally no-ops too — it was never
-        # added to active_alerts, so the existing was_firing==is_now_firing
-        # dedupe below already treats it as "no transition".
-
     with _WEBHOOK_LOCK:
+        if is_now_firing and get_active_maintenance(instance, job):
+            return False  # suppressed: instance/job is under an active maintenance window.
+
         status_data = load_json(STATUS_FILE, {"status": "NORMAL", "alerts": [], "updated": event_time})
         active_alerts = {}
         for a in status_data.get('alerts', []):
@@ -447,6 +730,29 @@ def record_alert_event(name, severity, instance, summary, job, event_time, is_no
         was_firing = key in active_alerts
         if was_firing == is_now_firing:
             return False  # no state transition — dedupe repeat notifications
+
+        # SQLite keeps its own was_firing/is_now_firing dedup (needed so two
+        # worker processes racing on the same transition still land exactly
+        # once — see test_persistence_concurrency.py). That means a failed
+        # write here isn't just a missed record: it leaves SQLite's row on
+        # stale status, so the *next* real transition for this key can look
+        # like a no-op to SQLite's own dedup and get silently dropped too —
+        # permanently desyncing /history from /status. One retry closes the
+        # common transient case (lock contention, disk hiccup) cheaply.
+        # ponytail: not a full reconciliation job; a periodic sweep that
+        # reconciles SQLite incident status against status.json would close
+        # the rest, add if repeated failures show up in the error log.
+        for attempt in (1, 2):
+            try:
+                IncidentRepository.record_alert_event(
+                    name=name, severity=severity, instance=instance, summary=summary,
+                    job=job, event_time=event_time, is_now_firing=is_now_firing,
+                    receiver=receiver, generatorURL=generatorURL, key=key, latency_ms=latency_ms
+                )
+                break
+            except Exception as e:
+                if attempt == 2:
+                    logger.error(f"Error updating SQLite incident repository (gave up after retry): {e}")
 
         duration_seconds = None
         if is_now_firing:
@@ -560,12 +866,23 @@ def webhook():
 # ── Status / History / Logs ───────────────────────────────────────────────────
 @app.route('/status')
 def status():
-    return jsonify(load_json(STATUS_FILE, {
-        "status": "NORMAL", "alerts": [], "updated": time.time()
-    }))
+    state = build_canonical_monitoring_state()
+    return jsonify({
+        "status": state.get("system_status", "NORMAL"),
+        "system_status": state.get("system_status", "NORMAL"),
+        "alerts": state.get("active_alerts", []),
+        "summary": state.get("summary", {}),
+        "updated": state.get("updated", time.time())
+    })
 
 @app.route('/history')
 def history():
+    try:
+        data = IncidentRepository.get_history(limit=MAX_HISTORY)
+        if data:
+            return jsonify(data)
+    except Exception:
+        pass
     return jsonify(load_json(HISTORY_FILE, []))
 
 @app.route('/logs')
@@ -575,13 +892,35 @@ def logs():
     except (TypeError, ValueError):
         limit = 50
     limit = max(1, min(limit, MAX_LOGS))
-    data  = load_json(LOGS_FILE, [])
+    try:
+        data = EventLogRepository.get_logs(limit=limit)
+        if data:
+            return jsonify(data)
+    except Exception:
+        pass
+    data = load_json(LOGS_FILE, [])
     return jsonify(data[:limit])
 
 def load_deleted_targets():
-    return load_json(DELETED_TARGETS_FILE, [])
+    file_data = load_json(DELETED_TARGETS_FILE, None)
+    if file_data is not None and isinstance(file_data, list):
+        return file_data
+    try:
+        return DeletedTargetRepository.list_deleted()
+    except Exception:
+        return []
 
 def save_deleted_targets(deleted_list):
+    try:
+        current_deleted = set(DeletedTargetRepository.list_deleted())
+        for d in deleted_list:
+            if d not in current_deleted:
+                DeletedTargetRepository.add_deleted(d)
+        for d in current_deleted:
+            if d not in deleted_list:
+                DeletedTargetRepository.restore_target(d)
+    except Exception:
+        pass
     save_json(DELETED_TARGETS_FILE, deleted_list)
 
 _EP_STATUS_CACHE = {"ts": 0.0, "key": "", "data": None}
@@ -589,12 +928,11 @@ _EP_STATUS_CACHE = {"ts": 0.0, "key": "", "data": None}
 # ── Prometheus Endpoint Management API ───────────────────────────────────────
 @app.route('/api/endpoints', methods=['GET'])
 def get_endpoints_api():
-    from concurrent.futures import ThreadPoolExecutor
     now = time.time()
     data = load_endpoints()
     active = data.get("active")
     endpoints = data.get("endpoints", [])
-    
+
     cache_key = f"{active}:" + ",".join(endpoints)
     if _EP_STATUS_CACHE["data"] is not None and (now - _EP_STATUS_CACHE["ts"] < 10.0) and _EP_STATUS_CACHE.get("key") == cache_key:
         return jsonify(_EP_STATUS_CACHE["data"])
@@ -626,33 +964,41 @@ def add_endpoint_api():
     body = request.json or {}
     url = body.get('url', '').strip()
     if not url:
-        return jsonify({"ok": False, "error": "URL Endpoint Prometheus wajib diisi"}), 400
+        return jsonify({"ok": False, "error": "Prometheus Endpoint URL is required"}), 400
 
-    if not url.startswith("http://") and not url.startswith("https://"):
+    if "://" in url:
+        scheme = url.split("://", 1)[0].lower()
+        if scheme not in ("http", "https"):
+            return jsonify({"ok": False, "error": f"Invalid scheme: '{scheme}'. Only http and https are allowed."}), 400
+    else:
         url = f"http://{url}"
     url = url.rstrip('/')
 
-    from urllib.parse import urlparse
-    parsed = urlparse(url)
-    if parsed.scheme not in ('http', 'https') or not parsed.netloc:
-        return jsonify({"ok": False, "error": "Format URL Endpoint Prometheus tidak valid"}), 400
+    is_safe, err_msg = is_safe_endpoint_url(url)
+    if not is_safe:
+        return jsonify({"ok": False, "error": err_msg or "Invalid endpoint URL"}), 400
 
-    hostname = (parsed.hostname or '').lower()
-    if hostname.startswith("169.254.") or hostname in ('100.100.100.200', 'metadata.google.internal'):
-        return jsonify({"ok": False, "error": "Endpoint URL tidak diizinkan (restricted network)"}), 400
+    with _WEBHOOK_LOCK:
+        set_active = bool(body.get('set_active', True))
+        try:
+            EndpointRepository.create_endpoint(name=url, url=url, is_active=set_active)
+            if set_active:
+                EndpointRepository.select_endpoint(url)
+        except Exception:
+            pass
 
-    data = load_endpoints()
-    if url not in data["endpoints"]:
-        data["endpoints"].append(url)
-    
-    if body.get('set_active', True):
-        data["active"] = url
-        LAST_WORKING_PROMETHEUS_URL = url
-        with PROMETHEUS_CACHE_LOCK:
-            PROMETHEUS_CACHE.clear()
+        data = load_endpoints()
+        if url not in data["endpoints"]:
+            data["endpoints"].append(url)
 
-    save_endpoints(data)
-    _EP_STATUS_CACHE["data"] = None
+        if set_active:
+            data["active"] = url
+            LAST_WORKING_PROMETHEUS_URL = url
+            with PROMETHEUS_CACHE_LOCK:
+                PROMETHEUS_CACHE.clear()
+
+        save_endpoints(data)
+        _EP_STATUS_CACHE["data"] = None
     return jsonify({"ok": True, "active": data["active"], "endpoints": data["endpoints"]})
 
 @app.route('/api/endpoints/select', methods=['POST'])
@@ -661,20 +1007,26 @@ def select_endpoint_api():
     body = request.json or {}
     url = body.get('url', '').strip()
     if not url:
-        return jsonify({"ok": False, "error": "URL Endpoint Prometheus wajib diisi"}), 400
+        return jsonify({"ok": False, "error": "Prometheus Endpoint URL is required"}), 400
 
-    data = load_endpoints()
-    if url not in data["endpoints"]:
-        data["endpoints"].append(url)
+    with _WEBHOOK_LOCK:
+        try:
+            EndpointRepository.select_endpoint(url)
+        except Exception:
+            pass
 
-    data["active"] = url
-    save_endpoints(data)
-    _EP_STATUS_CACHE["data"] = None
+        data = load_endpoints()
+        if url not in data["endpoints"]:
+            data["endpoints"].append(url)
 
-    # Immediately clear cache and force selected URL as primary
-    LAST_WORKING_PROMETHEUS_URL = url
-    with PROMETHEUS_CACHE_LOCK:
-        PROMETHEUS_CACHE.clear()
+        data["active"] = url
+        save_endpoints(data)
+        _EP_STATUS_CACHE["data"] = None
+
+        # Immediately clear cache and force selected URL as primary
+        LAST_WORKING_PROMETHEUS_URL = url
+        with PROMETHEUS_CACHE_LOCK:
+            PROMETHEUS_CACHE.clear()
 
     return jsonify({"ok": True, "active": url})
 
@@ -683,24 +1035,35 @@ def delete_endpoint_api():
     global LAST_WORKING_PROMETHEUS_URL
     body = request.json or {}
     url = body.get('url', '').strip()
-    data = load_endpoints()
-    
-    if url not in data["endpoints"]:
-        return jsonify({"ok": False, "error": "Endpoint Prometheus tidak ditemukan"}), 404
 
-    if len(data["endpoints"]) <= 1:
-        return jsonify({"ok": False, "error": "Tidak bisa menghapus endpoint terakhir"}), 400
-    data["endpoints"].remove(url)
-    if data["active"] == url:
-        data["active"] = data["endpoints"][0]
-        LAST_WORKING_PROMETHEUS_URL = data["active"]
-        with PROMETHEUS_CACHE_LOCK:
-            PROMETHEUS_CACHE.clear()
-    save_endpoints(data)
-    _EP_STATUS_CACHE["data"] = None
+    with _WEBHOOK_LOCK:
+        data = load_endpoints()
+
+        if url not in data["endpoints"]:
+            return jsonify({"ok": False, "error": "Prometheus Endpoint not found"}), 404
+
+        if len(data["endpoints"]) <= 1:
+            return jsonify({"ok": False, "error": "Cannot delete the last remaining endpoint"}), 400
+
+        try:
+            EndpointRepository.delete_endpoint(url)
+        except Exception:
+            pass
+
+        data["endpoints"].remove(url)
+        if data["active"] == url:
+            data["active"] = data["endpoints"][0]
+            LAST_WORKING_PROMETHEUS_URL = data["active"]
+            with PROMETHEUS_CACHE_LOCK:
+                PROMETHEUS_CACHE.clear()
+        save_endpoints(data)
+        _EP_STATUS_CACHE["data"] = None
 
     return jsonify({"ok": True, "active": data["active"], "endpoints": data["endpoints"]})
 
+# Standalone diagnostic utility — lists Prometheus job names for curl/ops use.
+# Not called by the frontend (instances()/get_prometheus_available_targets()
+# derive available_jobs inline); kept as a manual debugging endpoint.
 @app.route('/api/jobs', methods=['GET'])
 def get_jobs_api():
     raw_targets, _ = fetch_prometheus_json('/api/v1/targets')
@@ -762,18 +1125,19 @@ def add_target_api():
     if not url:
         return jsonify({"ok": False, "error": "IP / Target host is required"}), 400
     if not is_valid_target(url):
-        return jsonify({"ok": False, "error": "Target tidak valid — gunakan hostname, IP, atau URL yang valid"}), 400
+        return jsonify({"ok": False, "error": "Invalid target — please use a valid hostname, IP, or URL"}), 400
 
-    # Remove from deleted_targets if previously deleted
-    deleted = load_deleted_targets()
-    if url in deleted:
-        deleted.remove(url)
-        save_deleted_targets(deleted)
+    with _WEBHOOK_LOCK:
+        # Remove from deleted_targets if previously deleted
+        deleted = load_deleted_targets()
+        if url in deleted:
+            deleted.remove(url)
+            save_deleted_targets(deleted)
 
-    current = load_website_targets()
-    if url not in current:
-        current.append(url)
-        save_website_targets(current)
+        current = load_website_targets()
+        if url not in current:
+            current.append(url)
+            save_website_targets(current)
 
     return jsonify({"ok": True, "targets": current})
 
@@ -784,15 +1148,16 @@ def delete_target_api():
     if not url:
         return jsonify({"ok": False, "error": "IP / Target host is required"}), 400
     
-    current = load_website_targets()
-    if url in current:
-        current.remove(url)
-        save_website_targets(current)
+    with _WEBHOOK_LOCK:
+        current = load_website_targets()
+        if url in current:
+            current.remove(url)
+            save_website_targets(current)
 
-    deleted = load_deleted_targets()
-    if url not in deleted:
-        deleted.append(url)
-        save_deleted_targets(deleted)
+        deleted = load_deleted_targets()
+        if url not in deleted:
+            deleted.append(url)
+            save_deleted_targets(deleted)
 
     return jsonify({"ok": True})
 
@@ -814,36 +1179,48 @@ def create_maintenance_api():
     reason = (data.get('reason') or '').strip()[:200]
 
     if not target:
-        return jsonify({"ok": False, "error": "Target wajib diisi"}), 400
+        return jsonify({"ok": False, "error": "Target is required"}), 400
     try:
         start = int(float(data.get('start')))
         end = int(float(data.get('end')))
     except (TypeError, ValueError):
-        return jsonify({"ok": False, "error": "start dan end wajib berupa epoch timestamp"}), 400
+        return jsonify({"ok": False, "error": "start and end must be epoch timestamps"}), 400
     if end <= start:
-        return jsonify({"ok": False, "error": "end harus setelah start"}), 400
+        return jsonify({"ok": False, "error": "end timestamp must be after start timestamp"}), 400
 
-    window = {
-        "id": f"mw_{int(time.time() * 1000)}",
-        "scope": scope,
-        "target": target,
-        "reason": reason,
-        "start": start,
-        "end": end,
-        "created_at": int(time.time()),
-    }
-    windows = load_maintenance_windows()
-    windows.append(window)
-    save_json(MAINTENANCE_FILE, windows)
+    with _WEBHOOK_LOCK:
+        try:
+            window = MaintenanceRepository.create_window(
+                scope=scope, target=target, reason=reason, start=float(start), end=float(end)
+            )
+        except Exception:
+            window = {
+                "id": f"mw_{int(time.time() * 1000)}",
+                "scope": scope,
+                "target": target,
+                "reason": reason,
+                "start": start,
+                "end": end,
+                "created_at": int(time.time()),
+            }
+        windows = load_json(MAINTENANCE_FILE, [])
+        windows.append(window)
+        save_json(MAINTENANCE_FILE, windows)
     return jsonify({"ok": True, "window": window})
 
 @app.route('/api/maintenance/<window_id>', methods=['DELETE'])
 def delete_maintenance_api(window_id):
-    windows = load_maintenance_windows()
-    remaining = [w for w in windows if w.get('id') != window_id]
-    if len(remaining) == len(windows):
-        return jsonify({"ok": False, "error": "Maintenance window tidak ditemukan"}), 404
-    save_json(MAINTENANCE_FILE, remaining)
+    with _WEBHOOK_LOCK:
+        deleted = False
+        try:
+            deleted = MaintenanceRepository.delete_window(window_id)
+        except Exception:
+            pass
+        windows = load_json(MAINTENANCE_FILE, [])
+        remaining = [w for w in windows if w.get('id') != window_id]
+        if not deleted and len(remaining) == len(windows):
+            return jsonify({"ok": False, "error": "Maintenance window not found"}), 404
+        save_json(MAINTENANCE_FILE, remaining)
     return jsonify({"ok": True})
 
 # ── Alert Correlation (Phase 12) ─────────────────────────────────────────────
@@ -852,8 +1229,13 @@ def delete_maintenance_api(window_id):
 # Never touches status/logs/history — the underlying alert for a suppressed
 # child still fires and is recorded exactly as if this feature didn't exist.
 def load_dependencies():
-    data = load_json(DEPENDENCIES_FILE, [])
-    return data if isinstance(data, list) else []
+    file_data = load_json(DEPENDENCIES_FILE, None)
+    if file_data is not None and isinstance(file_data, list):
+        return file_data
+    try:
+        return DependencyRepository.list_dependencies()
+    except Exception:
+        return []
 
 def apply_correlation_suppression(targets, parent_map):
     """Pure function: tags each target in-place with dependsOn/suppressedBy.
@@ -877,28 +1259,36 @@ def create_dependency_api():
     child = (data.get('child') or '').strip()
     parent = (data.get('parent') or '').strip()
     if not child or not parent:
-        return jsonify({"ok": False, "error": "child dan parent wajib diisi"}), 400
+        return jsonify({"ok": False, "error": "child and parent are required"}), 400
     if child == parent:
-        return jsonify({"ok": False, "error": "Host tidak bisa bergantung pada dirinya sendiri"}), 400
+        return jsonify({"ok": False, "error": "Host cannot depend on itself"}), 400
 
-    # One parent per child (a tree, not a general graph) — upsert.
-    deps = [d for d in load_dependencies() if d.get('child') != child]
-    dep = {"id": f"dep_{int(time.time() * 1000)}", "child": child, "parent": parent, "created_at": int(time.time())}
-    deps.append(dep)
-    save_json(DEPENDENCIES_FILE, deps)
+    with _WEBHOOK_LOCK:
+        try:
+            dep = DependencyRepository.create_dependency(parent=parent, child=child)
+        except Exception:
+            dep = {"id": f"dep_{int(time.time() * 1000)}", "child": child, "parent": parent, "created_at": int(time.time())}
+        deps = [d for d in load_json(DEPENDENCIES_FILE, []) if d.get('child') != child]
+        deps.append(dep)
+        save_json(DEPENDENCIES_FILE, deps)
     return jsonify({"ok": True, "dependency": dep})
 
 @app.route('/api/dependencies/<dep_id>', methods=['DELETE'])
 def delete_dependency_api(dep_id):
-    deps = load_dependencies()
-    remaining = [d for d in deps if d.get('id') != dep_id]
-    if len(remaining) == len(deps):
-        return jsonify({"ok": False, "error": "Dependency tidak ditemukan"}), 404
-    save_json(DEPENDENCIES_FILE, remaining)
+    with _WEBHOOK_LOCK:
+        deleted = False
+        try:
+            deleted = DependencyRepository.delete_dependency(dep_id)
+        except Exception:
+            pass
+        deps = load_json(DEPENDENCIES_FILE, [])
+        remaining = [d for d in deps if d.get('id') != dep_id and d.get('child') != dep_id]
+        if not deleted and len(remaining) == len(deps):
+            return jsonify({"ok": False, "error": "Dependency not found"}), 404
+        save_json(DEPENDENCIES_FILE, remaining)
     return jsonify({"ok": True})
 
 def fetch_prom_query_map(query_expr, cache_ttl=5.0, timeout=None):
-    from urllib.parse import quote
     raw, base = fetch_prometheus_json(f"/api/v1/query?query={quote(query_expr)}", use_cache=True, cache_ttl=cache_ttl, timeout=timeout)
     val_map = {}
     if raw and raw.get('status') == 'success':
@@ -911,16 +1301,15 @@ def fetch_prom_query_map(query_expr, cache_ttl=5.0, timeout=None):
                 val_map[inst] = val
     return val_map
 
-def fetch_down_since_prom_map():
-    from urllib.parse import quote
+def fetch_down_since_prom_map(cache_ttl=10.0):
     last_up_map = {}
 
     # 1. PromQL query for exact last UP timestamp for targets that were previously UP
     query_up = 'max_over_time(timestamp(probe_success == 1)[1d:15s])'
-    raw_up, _ = fetch_prometheus_json(f"/api/v1/query?query={quote(query_up)}", use_cache=True, cache_ttl=5.0)
+    raw_up, _ = fetch_prometheus_json(f"/api/v1/query?query={quote(query_up)}", use_cache=True, cache_ttl=cache_ttl)
     if not raw_up or not raw_up.get('data', {}).get('result'):
         query_up = 'max_over_time(timestamp(up == 1)[1d:15s])'
-        raw_up, _ = fetch_prometheus_json(f"/api/v1/query?query={quote(query_up)}", use_cache=True, cache_ttl=5.0)
+        raw_up, _ = fetch_prometheus_json(f"/api/v1/query?query={quote(query_up)}", use_cache=True, cache_ttl=cache_ttl)
 
     if raw_up and raw_up.get('status') == 'success':
         for r in raw_up.get('data', {}).get('result', []):
@@ -935,7 +1324,7 @@ def fetch_down_since_prom_map():
 
     # 2. PromQL query for initial DOWN timestamp from Prometheus log history for targets continuously DOWN
     query_down = 'min_over_time(timestamp(probe_success == 0)[1d:1m])'
-    raw_down, _ = fetch_prometheus_json(f"/api/v1/query?query={quote(query_down)}", use_cache=True, cache_ttl=5.0)
+    raw_down, _ = fetch_prometheus_json(f"/api/v1/query?query={quote(query_down)}", use_cache=True, cache_ttl=cache_ttl)
     if raw_down and raw_down.get('status') == 'success':
         for r in raw_down.get('data', {}).get('result', []):
             metric = r.get('metric', {})
@@ -954,14 +1343,6 @@ def fetch_down_since_prom_map():
 # an operator-readable category. Called from /instances, the poller's alert
 # summary, and the custom-target branch — nowhere else re-derives this. Never
 # replaces lastError/httpStatusCode/probe_success; only adds to them.
-#
-# Categories are intentionally short (fit a TV wallboard card) but unambiguous:
-# "DNS", "Refused", "Timeout", "No Route", "TLS", "HTTP <code>", "Unknown".
-#
-# ponytail: substring matching on Go's net/http error text, not a structured
-# errno — good enough for the current error strings observed live; if
-# Prometheus/Go ever changes its wording this silently falls through to
-# "Unknown" rather than mis-categorizing, so it degrades safely.
 def classify_scrape_failure(health, last_error, http_status):
     if health == 'up':
         return {"category": None, "detail": None}
@@ -981,10 +1362,6 @@ def classify_scrape_failure(health, last_error, http_status):
         if 'x509' in err or 'certificate' in err or 'tls' in err:
             return {"category": "TLS", "detail": last_error}
 
-    # No direct-scrape error text (typical for blackbox/probe jobs — Prometheus
-    # only dials blackbox_exporter, which always answers 200; the real failure
-    # reason lives in probe_* metrics instead). Fall back to the HTTP status
-    # code when one was actually returned by the probed target.
     if http_status:
         try:
             code = int(float(http_status))
@@ -998,42 +1375,60 @@ def classify_scrape_failure(health, last_error, http_status):
 
     return {"category": "Unknown", "detail": "No error detail available (probe_success=0)"}
 
-def fetch_all_probe_metrics():
-    from concurrent.futures import ThreadPoolExecutor
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        f_succ = executor.submit(fetch_prom_query_map, "probe_success")
-        f_dur = executor.submit(fetch_prom_query_map, "probe_duration_seconds")
-        f_code = executor.submit(fetch_prom_query_map, "probe_http_status_code")
-        
-        success_map = f_succ.result()
-        duration_map = f_dur.result()
-        status_code_map = f_code.result()
+def fetch_all_probe_metrics(cache_ttl=3.0, timeout=None):
+    f_succ = _SHARED_EXECUTOR.submit(fetch_prom_query_map, "probe_success", cache_ttl, timeout)
+    f_dur = _SHARED_EXECUTOR.submit(fetch_prom_query_map, "probe_duration_seconds", cache_ttl, timeout)
+    f_code = _SHARED_EXECUTOR.submit(fetch_prom_query_map, "probe_http_status_code", cache_ttl, timeout)
+
+    success_map = f_succ.result()
+    duration_map = f_dur.result()
+    status_code_map = f_code.result()
 
     if not success_map:
-        success_map = fetch_prom_query_map("up")
+        success_map = fetch_prom_query_map("up", cache_ttl=cache_ttl, timeout=timeout)
 
     return success_map, duration_map, status_code_map
 
-# ── Instances & Real-time Metrics API ─────────────────────────────────────────
-@app.route('/instances')
-def instances():
-    job_param = request.args.get('job', DEFAULT_JOB_FILTER)
-    from concurrent.futures import ThreadPoolExecutor
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        f_targets = executor.submit(fetch_prometheus_json, '/api/v1/targets')
-        f_metrics = executor.submit(fetch_all_probe_metrics)
-        f_down = executor.submit(fetch_down_since_prom_map)
-        
-        raw_targets, active_base = f_targets.result()
-        probe_success_map, probe_duration_map, probe_status_code_map = f_metrics.result()
-        down_since_prom_map = f_down.result()
+# ── Canonical Monitoring State Engine ───────────────────────────────────────
+def build_canonical_monitoring_state(job_param=None):
+    if job_param is None:
+        job_param = DEFAULT_JOB_FILTER
+
+    f_targets = _SHARED_EXECUTOR.submit(fetch_prometheus_json, '/api/v1/targets', True, 3.0)
+    f_metrics = _SHARED_EXECUTOR.submit(fetch_all_probe_metrics, 3.0)
+
+    raw_targets, active_base = f_targets.result()
+    probe_success_map, probe_duration_map, probe_status_code_map = f_metrics.result()
+
+    # Conditional query: only run heavy 1-day subqueries when down targets exist
+    has_down = False
+    if probe_success_map:
+        has_down = any(str(v) in ('0', '0.0') for v in probe_success_map.values())
+    if not has_down and raw_targets and raw_targets.get('status') == 'success':
+        has_down = any(t.get('health') != 'up' for t in raw_targets.get('data', {}).get('activeTargets', []))
+
+    if has_down:
+        down_since_prom_map = fetch_down_since_prom_map(cache_ttl=10.0)
+    else:
+        down_since_prom_map = {}
 
     config_web_targets = load_website_targets()
     deleted_targets = set(load_deleted_targets())
     now_ts = int(time.time())
 
     if raw_targets is None and not config_web_targets:
-        return jsonify({"ok": False, "error": "Engine Prometheus tidak dapat dijangkau"}), 503
+        return {
+            "ok": False,
+            "error": "Prometheus engine is unreachable",
+            "system_status": "CRITICAL",
+            "summary": {
+                "total": 0, "up": 0, "down": 0, "slow": 0, "maintenance": 0,
+                "suppressed": 0, "alarmable_down": 0, "alarmable_alerts": 0,
+                "has_alarm": True, "system_status": "CRITICAL"
+            },
+            "active_alerts": [],
+            "targets": []
+        }
 
     available_jobs = set()
     if raw_targets and raw_targets.get('status') == 'success':
@@ -1041,6 +1436,22 @@ def instances():
             j = t.get('labels', {}).get('job') or t.get('scrapePool')
             if j and j != 'prometheus':
                 available_jobs.add(j)
+
+    # Load active alerts from status.json (populated by webhook & synthetic poller) or SQLite
+    status_data = load_json(STATUS_FILE, None)
+    if status_data is not None and isinstance(status_data, dict) and "alerts" in status_data:
+        active_alerts_list = status_data.get('alerts', [])
+    else:
+        try:
+            active_alerts_list = IncidentRepository.get_active_incidents()
+        except Exception:
+            active_alerts_list = []
+
+    alerts_by_instance = {}
+    for a in active_alerts_list:
+        inst = a.get('instance')
+        if inst:
+            alerts_by_instance.setdefault(inst, []).append(a)
 
     result = []
     seen_instances = set()
@@ -1066,7 +1477,7 @@ def instances():
                 else:
                     health = t.get('health', 'unknown')
 
-                # Pure PromQL continuous downSince calculation
+                # Continuous downSince calculation
                 if health != 'up':
                     last_up = down_since_prom_map.get(inst_name) or down_since_prom_map.get(scrape_url)
                     down_since_val = int(last_up) if last_up else 0
@@ -1079,21 +1490,17 @@ def instances():
                     try:
                         response_time_ms = round(float(p_duration) * 1000, 1)
                     except ValueError:
-                        response_time_ms = 0
+                        response_time_ms = 0.0
                 else:
                     scrape_dur = t.get('lastScrapeDuration')
                     if scrape_dur is not None:
                         try:
                             response_time_ms = round(float(scrape_dur) * 1000, 1)
                         except ValueError:
-                            response_time_ms = 0
+                            response_time_ms = 0.0
                     else:
-                        response_time_ms = 0
+                        response_time_ms = 0.0
 
-                # Determine HTTP status code / ping status — only a value
-                # Prometheus actually reported; no more fabricated 200/0
-                # placeholders when there's simply no probe_http_status_code
-                # series for this instance (see AUDIT.md).
                 p_code = probe_status_code_map.get(inst_name) or probe_status_code_map.get(scrape_url)
                 if p_code is not None:
                     try:
@@ -1106,10 +1513,16 @@ def instances():
                 last_error = t.get('lastError', '')
                 classification = classify_scrape_failure(health, last_error, http_code)
 
+                matched_alerts = alerts_by_instance.get(inst_name, []) + [
+                    a for a in alerts_by_instance.get(scrape_url, [])
+                    if a not in alerts_by_instance.get(inst_name, [])
+                ]
+
                 result.append({
                     "instance":        inst_name,
                     "job":             job or "blackbox",
                     "health":          health,
+                    "probe_state":     health,
                     "responseTimeMs":  response_time_ms,
                     "httpStatusCode":  http_code,
                     "lastScrape":      t.get('lastScrape', ''),
@@ -1119,7 +1532,8 @@ def instances():
                     "failureDetail":   classification["detail"],
                     "labels":          labels,
                     "isWeb":           False,
-                    "downSince":       down_since_val
+                    "downSince":       down_since_val,
+                    "active_alerts":   matched_alerts
                 })
 
     # Merge custom user-added targets
@@ -1129,10 +1543,6 @@ def instances():
             if p_success is not None:
                 health = 'up' if str(p_success) in ('1', '1.0') else 'down'
             else:
-                # No probe_success series for this target at all yet (brand new
-                # custom target, or never picked up by Prometheus) — 'unknown',
-                # not a fabricated 'up'. A NOC alarm board should fail toward
-                # "we don't know" rather than silently reading as healthy.
                 health = 'unknown'
 
             if health != 'up':
@@ -1143,11 +1553,10 @@ def instances():
 
             p_duration = probe_duration_map.get(target_url)
             try:
-                response_time_ms = round(float(p_duration) * 1000, 1) if p_duration else 0.8
+                response_time_ms = round(float(p_duration) * 1000, 1) if p_duration else 0.0
             except ValueError:
-                response_time_ms = 0.8
+                response_time_ms = 0.0
 
-            # No fabricated 200/0 placeholder — only a real reported code.
             p_code = probe_status_code_map.get(target_url)
             try:
                 http_code = int(float(p_code)) if p_code else None
@@ -1155,11 +1564,13 @@ def instances():
                 http_code = None
 
             classification = classify_scrape_failure(health, '', http_code)
+            matched_alerts = alerts_by_instance.get(target_url, [])
 
             result.append({
                 "instance":        target_url,
                 "job":             "custom",
                 "health":          health,
+                "probe_state":     health,
                 "responseTimeMs":  response_time_ms,
                 "httpStatusCode":  http_code,
                 "lastScrape":      "—",
@@ -1169,12 +1580,39 @@ def instances():
                 "failureDetail":   classification["detail"],
                 "labels":          {"job": "custom", "instance": target_url},
                 "isWeb":           False,
-                "downSince":       down_since_val
+                "downSince":       down_since_val,
+                "active_alerts":   matched_alerts
             })
             seen_instances.add(target_url)
 
-    # Attach maintenance state — one pass, one file read, so it's not
-    # re-derived per-target inside either loop above.
+    # Merge any non-probed targets with active alerts (e.g. Host/OS-level CPU, Memory, Disk alerts)
+    for inst, inst_alerts in alerts_by_instance.items():
+        if inst not in seen_instances and inst not in deleted_targets:
+            alert_job = inst_alerts[0].get('job', 'alertmanager') if inst_alerts else 'alertmanager'
+            if matches_job_filter(alert_job, alert_job, job_param):
+                is_any_down = any(a.get('name') == ALERTNAME_TARGET_DOWN for a in inst_alerts)
+                health = 'down' if is_any_down else 'up'
+                down_since_val = inst_alerts[0].get('time', 0) if is_any_down else 0
+                result.append({
+                    "instance":        inst,
+                    "job":             alert_job,
+                    "health":          health,
+                    "probe_state":     health,
+                    "responseTimeMs":  0.0,
+                    "httpStatusCode":  None,
+                    "lastScrape":      "—",
+                    "scrapeUrl":       inst,
+                    "lastError":       "",
+                    "failureCategory": "Alertmanager" if health != 'up' else None,
+                    "failureDetail":   inst_alerts[0].get('summary', '') if inst_alerts else '',
+                    "labels":          {"job": alert_job, "instance": inst},
+                    "isWeb":           False,
+                    "downSince":       down_since_val,
+                    "active_alerts":   inst_alerts
+                })
+                seen_instances.add(inst)
+
+    # Attach maintenance state
     maintenance_windows = load_maintenance_windows()
     for item in result:
         mw = get_active_maintenance(item['instance'], item.get('job'), windows=maintenance_windows)
@@ -1183,32 +1621,133 @@ def instances():
         item['maintenanceUntil'] = mw.get('end') if mw else None
         item['maintenanceReason'] = mw.get('reason', '') if mw else ''
 
-    # Alert correlation (Phase 12) — display-only: the child's own
-    # health/downSince/alert stays exactly as computed above.
+    # Alert correlation (dependency suppression)
     deps = load_dependencies()
     parent_map = {d['child']: d['parent'] for d in deps}
     apply_correlation_suppression(result, parent_map)
     dep_id_map = {d['child']: d['id'] for d in deps}
     for item in result:
         item['dependencyId'] = dep_id_map.get(item['instance'])
+        item['is_suppressed'] = bool(item.get('suppressedBy') or item.get('maintenance'))
 
-    return jsonify({
+    # Derive authoritative target-level severity & effective_status
+    for item in result:
+        is_down = item['health'] != 'up'
+        is_maint = item['maintenance']
+        is_supp = bool(item.get('suppressedBy'))
+        is_slow = (item['health'] == 'up' and item['responseTimeMs'] > 500)
+        has_crit_alert = any(a.get('severity') == 'critical' for a in item.get('active_alerts', []))
+        has_warn_alert = any(a.get('severity') == 'warning' for a in item.get('active_alerts', []))
+
+        # Is target actionable / alarmable?
+        is_alarmable = (is_down or has_crit_alert or has_warn_alert) and not is_maint and not is_supp
+        item['is_alarmable'] = is_alarmable
+
+        # Effective severity
+        if is_maint:
+            item['severity'] = "maintenance"
+        elif is_supp:
+            item['severity'] = "suppressed"
+        elif is_down or has_crit_alert:
+            item['severity'] = "critical"
+        elif is_slow or has_warn_alert:
+            item['severity'] = "warning"
+        else:
+            item['severity'] = "ok"
+
+        # Effective status
+        if is_maint:
+            item['effective_status'] = "maintenance"
+        elif is_supp:
+            item['effective_status'] = "suppressed"
+        elif is_down:
+            item['effective_status'] = "down"
+        elif is_slow or has_warn_alert:
+            item['effective_status'] = "degraded"
+        else:
+            item['effective_status'] = "up"
+
+    # Compute authoritative global system metrics & status
+    total = len(result)
+    up_count = sum(1 for t in result if t['health'] == 'up')
+    down_count = sum(1 for t in result if t['health'] != 'up')
+    slow_count = sum(1 for t in result if t['health'] == 'up' and t['responseTimeMs'] > 500)
+    maint_count = sum(1 for t in result if t['maintenance'])
+    supp_count = sum(1 for t in result if t.get('suppressedBy'))
+    alarmable_down = sum(1 for t in result if t['is_alarmable'] and t['health'] != 'up')
+    alarmable_alerts = sum(len(t.get('active_alerts', [])) for t in result if t['is_alarmable'])
+
+    has_critical = (alarmable_down > 0 or any(
+        a.get('severity') == 'critical' for t in result if t['is_alarmable'] for a in t.get('active_alerts', [])
+    ))
+    has_warning = (slow_count > 0 or any(
+        a.get('severity') == 'warning' for t in result if t['is_alarmable'] for a in t.get('active_alerts', [])
+    ))
+
+    if has_critical:
+        system_status = "CRITICAL"
+    elif has_warning:
+        system_status = "WARNING"
+    else:
+        system_status = "NORMAL"
+
+    summary = {
+        "total": total,
+        "up": up_count,
+        "down": down_count,
+        "slow": slow_count,
+        "maintenance": maint_count,
+        "suppressed": supp_count,
+        "alarmable_down": alarmable_down,
+        "alarmable_alerts": alarmable_alerts,
+        "has_alarm": (alarmable_down > 0 or alarmable_alerts > 0),
+        "system_status": system_status
+    }
+
+    # Aggregate active alerts across fleet
+    fleet_active_alerts = []
+    seen_alert_keys = set()
+    for t in result:
+        for a in t.get('active_alerts', []):
+            k = a.get('key') or f"{a.get('name')}|{a.get('instance')}"
+            if k not in seen_alert_keys:
+                seen_alert_keys.add(k)
+                fleet_active_alerts.append(a)
+
+    return {
         "ok": True,
+        "system_status": system_status,
+        "summary": summary,
+        "active_alerts": fleet_active_alerts,
         "targets": result,
         "available_jobs": sorted(list(available_jobs)),
         "job_filter": job_param,
         "source": "prometheus" if active_base else "local",
-        "prometheus_url": active_base
-    })
+        "prometheus_url": active_base,
+        "updated": now_ts
+    }
 
-def get_monitored_instances(job_filter=None):
+# ── Instances & Real-time Metrics API ─────────────────────────────────────────
+@app.route('/instances')
+def instances():
+    job_param = request.args.get('job', DEFAULT_JOB_FILTER)
+    state = build_canonical_monitoring_state(job_param)
+    if not state.get('ok') and state.get('error'):
+        return jsonify(state), 503
+    return jsonify(state)
+
+def get_instance_job_map(job_filter=None):
+    """Instance -> real Prometheus job name for every monitored target matching
+    job_filter. Shared by get_monitored_instances() and the availability
+    aggregator so persisted buckets get tagged with the target's actual job
+    instead of a hardcoded guess."""
     if job_filter is None:
         job_filter = DEFAULT_JOB_FILTER
-    raw_targets, _ = fetch_prometheus_json('/api/v1/targets')
+    raw_targets, _ = fetch_prometheus_json('/api/v1/targets', use_cache=True, cache_ttl=3.0)
     config_web_targets = load_website_targets()
     deleted_targets = set(load_deleted_targets())
 
-    instances = set()
+    job_map = {}
     if raw_targets and raw_targets.get('status') == 'success':
         targets = raw_targets.get('data', {}).get('activeTargets', [])
         for t in targets:
@@ -1216,18 +1755,31 @@ def get_monitored_instances(job_filter=None):
             job = labels.get('job') or t.get('scrapePool') or ''
             scrape_pool = t.get('scrapePool', '')
             inst_name = labels.get('instance', t.get('scrapeUrl', '?'))
-            if job != 'prometheus' and matches_job_filter(job, scrape_pool, job_filter):
-                instances.add(inst_name)
+            if job != 'prometheus' and matches_job_filter(job, scrape_pool, job_filter) and inst_name not in deleted_targets:
+                job_map[inst_name] = job or scrape_pool or 'blackbox'
 
     for target_url in config_web_targets:
-        if matches_job_filter("custom", "custom", job_filter):
-            instances.add(target_url)
+        if matches_job_filter("custom", "custom", job_filter) and target_url not in deleted_targets:
+            job_map.setdefault(target_url, "custom")
 
-    return instances - deleted_targets
+    # Also include instances with active alerts
+    status_data = load_json(STATUS_FILE, {"alerts": []})
+    for a in status_data.get('alerts', []):
+        inst = a.get('instance')
+        if inst and inst not in deleted_targets and matches_job_filter(a.get('job', 'alertmanager'), 'alertmanager', job_filter):
+            job_map.setdefault(inst, a.get('job') or 'alertmanager')
 
+    return job_map
+
+
+def get_monitored_instances(job_filter=None):
+    return sorted(get_instance_job_map(job_filter).keys())
+
+# ── Availability (historical uptime %) ────────────────────────────────────────
 # ── Availability (historical uptime %) ────────────────────────────────────────
 @app.route('/api/availability')
 def api_availability():
+    t_req_start = time.perf_counter()
     job_filter = request.args.get('job', DEFAULT_JOB_FILTER)
     minutes_param = request.args.get('minutes')
     if minutes_param is not None:
@@ -1252,188 +1804,533 @@ def api_availability():
         except (TypeError, ValueError):
             end_ts = None
 
-    at_suffix = f" @ {end_ts}" if end_ts is not None else ""
+    avail_cache_ttl = 15.0 if minutes_int >= 1440 else 5.0
 
-    monitored_instances = get_monitored_instances(job_filter=job_filter)
+    # Derive normalized bucketed cache key
+    endpoints_data = load_endpoints()
+    active_url = endpoints_data.get("active") or _DEFAULT_PROM_URL
+    norm_job = (job_filter or DEFAULT_JOB_FILTER).strip().lower()
 
-    from concurrent.futures import ThreadPoolExecutor
+    now = time.time()
+    _maybe_prune_cache(now)
 
-    req_timeout = max(4.0, min(25.0, minutes / 1500.0))
+    if end_ts is not None:
+        norm_end = f"hist_{end_ts}"
+        effective_ttl = 60.0  # Fixed historical range is immutable
+    else:
+        bucket_sec = 15 if minutes_int >= 1440 else 5
+        bucket_ts = int(now // bucket_sec) * bucket_sec
+        norm_end = f"live_{bucket_ts}"
+        effective_ttl = avail_cache_ttl
 
-    step_suffix = ""
-    if minutes_int > 10080:
-        step_suffix = ":5m"
-    elif minutes_int > 1440:
-        step_suffix = ":30s"
+    avail_cache_key = f"avail:{active_url}:{norm_job}:{minutes_int}:{norm_end}"
 
-    queries = {
-        'probe_avail': f"avg_over_time(probe_success[{minutes_int}m{step_suffix}]{at_suffix}) * 100",
-        'up_avail': f"avg_over_time(up[{minutes_int}m{step_suffix}]{at_suffix}) * 100",
-        'probe_count': f"count_over_time(probe_success[{minutes_int}m]{at_suffix})",
-        'up_count': f"count_over_time(up[{minutes_int}m]{at_suffix})",
-        'duration': f"avg_over_time(probe_duration_seconds[{minutes_int}m{step_suffix}]{at_suffix}) * 1000",
-        'probe_incidents': f"changes(probe_success[{minutes_int}m]{at_suffix})",
-        'up_incidents': f"changes(up[{minutes_int}m]{at_suffix})",
-        'live_probe': "probe_success" if end_ts is None else None,
-        'live_up': "up" if end_ts is None else None
-    }
+    # 1. Fast path: server in-memory availability cache hit
+    t_cache_check_start = time.perf_counter()
+    with _AVAILABILITY_CACHE_LOCK:
+        if avail_cache_key in _AVAILABILITY_CACHE:
+            cached_ts, cached_payload = _AVAILABILITY_CACHE[avail_cache_key]
+            if now - cached_ts < effective_ttl:
+                return jsonify(cached_payload)
 
-    results = {}
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = {k: executor.submit(fetch_prom_query_map, q, 5.0, req_timeout) for k, q in queries.items() if q}
+    # 2. Single-flight lock: coalesces concurrent identical requests
+    t_lock_wait_start = time.perf_counter()
+    with _avail_flight_lock_for(avail_cache_key):
+        t_lock_acquired = time.perf_counter()
+        flight_wait_ms = (t_lock_acquired - t_lock_wait_start) * 1000.0
+
+        # Re-check under lock in case previous thread just computed it
+        now_under_lock = time.time()
+        with _AVAILABILITY_CACHE_LOCK:
+            if avail_cache_key in _AVAILABILITY_CACHE:
+                cached_ts, cached_payload = _AVAILABILITY_CACHE[avail_cache_key]
+                if now_under_lock - cached_ts < effective_ttl:
+                    return jsonify(cached_payload)
+
+        req_end = float(end_ts) if end_ts is not None else now
+        req_start = req_end - (minutes * 60.0)
+        monitored_instances = get_monitored_instances(job_filter=job_filter)
+
+        if not monitored_instances:
+            empty_summary = summarize_entries([], minutes)
+            payload = {
+                "ok": True,
+                "period_minutes": round(minutes, 2),
+                "requested_window_seconds": round(minutes * 60.0, 1),
+                "coverage_seconds": 0.0,
+                "unknown_seconds": round(minutes * 60.0, 1),
+                "sqlite_seconds": 0.0,
+                "prometheus_seconds": 0.0,
+                "overlap_removed_seconds": 0.0,
+                "coverage_percent": 0.0,
+                "availability_percent": None,
+                "data_status": "NO_DATA",
+                "end": end_ts,
+                "counts": {
+                    "total": 0,
+                    "scored": 0,
+                    "eligible": 0,
+                    "online": 0,
+                    "warning": 0,
+                    "offline": 0,
+                },
+                "overall": None,
+                "fleet_aggregate": empty_summary["fleet_aggregate"],
+                "fleet_average": empty_summary["fleet_average"],
+                "health_ratio": empty_summary["health_ratio"],
+                "zero_downtime_ratio": empty_summary.get("zero_downtime_ratio"),
+                "sla_compliance": empty_summary.get("sla_compliance"),
+                "sla_compliance_ratio": empty_summary.get("sla_compliance_ratio"),
+                "coverage_ratio": empty_summary.get("coverage_ratio"),
+                "per_server": empty_summary["per_server"],
+                "lowest_availability": [],
+                "hosts_requiring_attention": [],
+                "entries": [],
+                "targets": {},
+                "analytics": empty_summary.get("analytics", {}),
+                "source": "nodata"
+            }
+            with _AVAILABILITY_CACHE_LOCK:
+                _AVAILABILITY_CACHE[avail_cache_key] = (now_under_lock, payload)
+            return jsonify(payload)
+
+        # 3. Retrieve SQLite bucket records in the window [req_start, req_end]
+        t_sqlite_start = time.perf_counter()
+        db_bucket_records = AvailabilityBucketRepository.get_bucket_records(
+            job=job_filter,
+            start_time=req_start,
+            end_time=req_end,
+            instances=monitored_instances
+        )
+        t_sqlite_end = time.perf_counter()
+        sqlite_duration_ms = (t_sqlite_end - t_sqlite_start) * 1000.0
+
+        # Check if SQLite completely covers the requested window for all monitored instances
+        is_sqlite_fully_complete = False
+        if db_bucket_records and monitored_instances:
+            instances_in_db = set()
+            instance_spans = {}
+            for b in db_bucket_records:
+                inst = b.get("instance")
+                cov_sec = float(b.get("coverage_seconds", 0) or 0)
+                if inst in monitored_instances and cov_sec > 0:
+                    instances_in_db.add(inst)
+                    st = float(b.get("bucket_start", 0))
+                    en = float(b.get("bucket_end", 0))
+                    cur = instance_spans.get(inst)
+                    if cur is None:
+                        instance_spans[inst] = (st, en, 1)
+                    else:
+                        instance_spans[inst] = (min(cur[0], st), max(cur[1], en), cur[2] + 1)
+
+            if len(instances_in_db) == len(monitored_instances):
+                expected_hours = max(1, int(round((req_end - req_start) / 3600.0)))
+                all_covered = True
+                for inst in monitored_instances:
+                    sp = instance_spans.get(inst)
+                    if not sp or sp[0] > (req_start + 60.0) or sp[1] < (req_end - _AVAIL_FRESHNESS_TOLERANCE_SEC) or sp[2] < max(1, expected_hours - 1):
+                        all_covered = False
+                        break
+                if all_covered:
+                    is_sqlite_fully_complete = True
+
+        if is_sqlite_fully_complete:
+            # Full SQLite coverage fast path: compute per-target clipped intervals with 0 Prometheus queries
+            t_merge_start = time.perf_counter()
+            entries, summary_dict = merge_hybrid_fleet_availability(
+                req_start=req_start,
+                req_end=req_end,
+                monitored_instances=monitored_instances,
+                sqlite_buckets=db_bucket_records,
+                prom_results_map={},
+                expected_interval_sec=SCRAPE_INTERVAL_SECONDS,
+            )
+            t_merge_end = time.perf_counter()
+            merge_duration_ms = (t_merge_end - t_merge_start) * 1000.0
+
+            hybrid_meta = summary_dict.get("hybrid", {})
+            counts = {"online": 0, "warning": 0, "offline": 0}
+            for e in entries:
+                avail_pct = e.get("availability_pct")
+                if avail_pct is not None:
+                    if avail_pct >= 99.9:
+                        st_val = 'online'
+                    elif avail_pct >= 95.0:
+                        st_val = 'warning'
+                    else:
+                        st_val = 'offline'
+                else:
+                    st_val = 'warning'
+                counts[st_val] += 1
+
+            lowest_availability = sorted(
+                [e for e in summary_dict['per_server']['values'] if e.get('availability_pct') is not None and e['availability_pct'] < 100.0],
+                key=lambda e: (
+                    e['availability_pct'],
+                    -(e.get('downtime_minutes') or 0.0),
+                    -(e.get('incidents') or 0)
+                )
+            )
+
+            t_ser_start = time.perf_counter()
+            total_backend_ms = (t_ser_start - t_req_start) * 1000.0
+
+            trace_data = {
+                "route": "/api/availability",
+                "path": "sqlite_fast_path",
+                "minutes": minutes_int,
+                "flight_wait_ms": round(flight_wait_ms, 2),
+                "sqlite_duration_ms": round(sqlite_duration_ms, 2),
+                "sqlite_record_count": len(db_bucket_records),
+                "prom_duration_ms": 0.0,
+                "prom_query_count": 0,
+                "prom_queries": {},
+                "hybrid_merge_ms": round(merge_duration_ms, 2),
+                "materialize_ms": 0.0,
+                "total_backend_ms": round(total_backend_ms, 2),
+            }
+
+            payload = {
+                "ok": True,
+                "period_minutes": round(minutes, 2),
+                "requested_window_seconds": hybrid_meta.get("requested_window_seconds", round(minutes * 60.0, 1)),
+                "coverage_seconds": hybrid_meta.get("coverage_seconds", 0.0),
+                "unknown_seconds": hybrid_meta.get("unknown_seconds", 0.0),
+                "sqlite_seconds": hybrid_meta.get("sqlite_seconds", 0.0),
+                "prometheus_seconds": hybrid_meta.get("prometheus_seconds", 0.0),
+                "overlap_removed_seconds": hybrid_meta.get("overlap_removed_seconds", 0.0),
+                "coverage_percent": hybrid_meta.get("coverage_percent", 0.0),
+                "availability_percent": summary_dict['fleet_aggregate']['value'],
+                "data_status": hybrid_meta.get("data_status", "COMPLETE"),
+                "end": end_ts,
+                "counts": {
+                    "total": len(monitored_instances),
+                    "scored": summary_dict.get('scored_count', 0),
+                    "eligible": summary_dict.get('eligible_count', 0),
+                    "online": counts['online'],
+                    "warning": counts['warning'],
+                    "offline": counts['offline'],
+                },
+                "overall": summary_dict['fleet_aggregate']['value'],
+                "fleet_aggregate": summary_dict['fleet_aggregate'],
+                "fleet_average": summary_dict['fleet_average'],
+                "health_ratio": summary_dict['health_ratio'],
+                "zero_downtime_ratio": summary_dict.get('zero_downtime_ratio'),
+                "sla_compliance": summary_dict.get('sla_compliance'),
+                "sla_compliance_ratio": summary_dict.get('sla_compliance_ratio'),
+                "coverage_ratio": summary_dict.get('coverage_ratio'),
+                "per_server": summary_dict['per_server'],
+                "lowest_availability": lowest_availability,
+                "hosts_requiring_attention": lowest_availability,
+                "entries": summary_dict['per_server']['values'],
+                "targets": {e['id']: e['availability_pct'] for e in summary_dict['per_server']['values']},
+                "analytics": summary_dict.get('analytics', {}),
+                "source": "materialized",
+                "_trace": trace_data,
+            }
+            with _AVAILABILITY_CACHE_LOCK:
+                _AVAILABILITY_CACHE[avail_cache_key] = (now_under_lock, payload)
+
+            resp = jsonify(payload)
+            t_ser_end = time.perf_counter()
+            trace_data["serialization_ms"] = round((t_ser_end - t_ser_start) * 1000.0, 2)
+            trace_data["total_backend_ms"] = round((t_ser_end - t_req_start) * 1000.0, 2)
+            return resp
+
+        # 4. Hybrid Path: Fetch raw authoritative telemetry from Prometheus and merge with SQLite
+        at_suffix = f" @ {end_ts}" if end_ts is not None else ""
+        req_timeout = max(4.0, min(15.0, minutes / 1500.0))
+
+        queries = {
+            'probe_avail': f"avg_over_time(probe_success[{minutes_int}m]{at_suffix}) * 100",
+            'up_avail': f"avg_over_time(up[{minutes_int}m]{at_suffix}) * 100",
+            'probe_count': f"count_over_time(probe_success[{minutes_int}m]{at_suffix})",
+            'up_count': f"count_over_time(up[{minutes_int}m]{at_suffix})",
+            'duration': f"avg_over_time(probe_duration_seconds[{minutes_int}m]{at_suffix}) * 1000",
+            'probe_incidents': f"changes(probe_success[{minutes_int}m]{at_suffix})",
+            'up_incidents': f"changes(up[{minutes_int}m]{at_suffix})",
+            'live_probe': "probe_success" if end_ts is None else None,
+            'live_up': "up" if end_ts is None else None
+        }
+        if minutes_int <= 60:
+            queries['probe_first_ts'] = f"min_over_time(timestamp(probe_success)[{minutes_int}m:]{at_suffix})"
+            queries['probe_last_ts'] = f"max_over_time(timestamp(probe_success)[{minutes_int}m:]{at_suffix})"
+            queries['up_first_ts'] = f"min_over_time(timestamp(up)[{minutes_int}m:]{at_suffix})"
+            queries['up_last_ts'] = f"max_over_time(timestamp(up)[{minutes_int}m:]{at_suffix})"
+
+        def _call_query(expr, ttl, to):
+            t_q_start = time.perf_counter()
+            res = fetch_prom_query_map(expr, cache_ttl=ttl, timeout=to)
+            t_q_end = time.perf_counter()
+            return res, (t_q_end - t_q_start) * 1000.0
+
+        t_prom_start = time.perf_counter()
+        futures = {k: _SHARED_EXECUTOR.submit(_call_query, q, avail_cache_ttl, req_timeout) for k, q in queries.items() if q}
+        results = {}
+        prom_query_timings = {}
         for k, f in futures.items():
             try:
-                results[k] = f.result()
-            except Exception:
+                res, q_dur = f.result()
+                results[k] = res
+                prom_query_timings[k] = round(q_dur, 2)
+            except Exception as ex:
                 results[k] = {}
+                prom_query_timings[k] = -1.0
+        t_prom_end = time.perf_counter()
+        prom_duration_ms = (t_prom_end - t_prom_start) * 1000.0
 
-    probe_avail = results.get('probe_avail', {})
-    up_avail = results.get('up_avail', {})
-    avail_map = {**up_avail, **probe_avail}
+        probe_avail = results.get('probe_avail', {})
+        up_avail = results.get('up_avail', {})
+        probe_count = results.get('probe_count', {})
+        up_count = results.get('up_count', {})
+        probe_first = results.get('probe_first_ts', {})
+        up_first = results.get('up_first_ts', {})
+        probe_last = results.get('probe_last_ts', {})
+        up_last = results.get('up_last_ts', {})
+        probe_inc = results.get('probe_incidents', {})
+        up_inc = results.get('up_incidents', {})
+        live_probe = results.get('live_probe', {})
+        live_up = results.get('live_up', {})
 
-    probe_count = results.get('probe_count', {})
-    up_count = results.get('up_count', {})
-    count_map = {**up_count, **probe_count}
+        avail_map = {}
+        count_map = {}
+        first_ts_map = {}
+        last_ts_map = {}
+        incidents_map = {}
+        live_map = {}
 
-    probe_incidents = results.get('probe_incidents', {})
-    up_incidents = results.get('up_incidents', {})
-    incidents_map = {**up_incidents, **probe_incidents}
+        for inst in monitored_instances:
+            is_node_target = ('node' in inst.lower() or 'exporter' in inst.lower()) and inst not in probe_avail and inst not in probe_count
+            if not is_node_target:
+                if inst in probe_avail:
+                    avail_map[inst] = probe_avail[inst]
+                if inst in probe_count:
+                    count_map[inst] = probe_count[inst]
+                if inst in probe_first:
+                    first_ts_map[inst] = probe_first[inst]
+                if inst in probe_last:
+                    last_ts_map[inst] = probe_last[inst]
+                if inst in probe_inc:
+                    incidents_map[inst] = probe_inc[inst]
+                if inst in live_probe:
+                    live_map[inst] = live_probe[inst]
+            else:
+                if inst in up_avail:
+                    avail_map[inst] = up_avail[inst]
+                if inst in up_count:
+                    count_map[inst] = up_count[inst]
+                if inst in up_first:
+                    first_ts_map[inst] = up_first[inst]
+                if inst in up_last:
+                    last_ts_map[inst] = up_last[inst]
+                if inst in up_inc:
+                    incidents_map[inst] = up_inc[inst]
+                if inst in live_up:
+                    live_map[inst] = live_up[inst]
 
-    duration_map = results.get('duration', {})
+        duration_map = results.get('duration', {})
 
-    live_probe = results.get('live_probe', {})
-    live_up = results.get('live_up', {})
-    live_map = {**live_up, **live_probe}
+        # Dynamic median cadence
+        observed_cadences = []
+        for inst in monitored_instances:
+            rc = count_map.get(inst)
+            f_ts = float(first_ts_map.get(inst, 0))
+            l_ts = float(last_ts_map.get(inst, 0))
+            if rc and f_ts > 0 and l_ts > 0 and (l_ts - f_ts) > 0:
+                try:
+                    c_num = float(rc)
+                    if c_num >= 2:
+                        observed_cadences.append((l_ts - f_ts) / (c_num - 1))
+                except (ValueError, TypeError):
+                    pass
+        fleet_median_cadence = (
+            sorted(observed_cadences)[len(observed_cadences) // 2]
+            if observed_cadences else SCRAPE_INTERVAL_SECONDS
+        )
 
-    entries = []
-    counts = {"online": 0, "warning": 0, "offline": 0}
+        prom_results_map = {
+            "first_ts": first_ts_map,
+            "last_ts": last_ts_map,
+            "count": count_map,
+            "avail": avail_map,
+            "incidents": incidents_map,
+            "duration": duration_map,
+        }
 
-    for inst in monitored_instances:
-        raw_avail = avail_map.get(inst)
-        raw_count = count_map.get(inst)
-        raw_duration = duration_map.get(inst)
-        raw_incidents = incidents_map.get(inst)
+        # Perform clean hybrid per-target merge
+        t_merge_start = time.perf_counter()
+        entries, summary_dict = merge_hybrid_fleet_availability(
+            req_start=req_start,
+            req_end=req_end,
+            monitored_instances=monitored_instances,
+            sqlite_buckets=db_bucket_records,
+            prom_results_map=prom_results_map,
+            expected_interval_sec=fleet_median_cadence,
+        )
+        t_merge_end = time.perf_counter()
+        merge_duration_ms = (t_merge_end - t_merge_start) * 1000.0
+        hybrid_meta = summary_dict.get("hybrid", {})
 
-        raw_avail_float = None
-        availability_pct = None
-        if raw_avail is not None:
-            try:
-                raw_avail_float = max(0.0, min(100.0, float(raw_avail)))
-                availability_pct = round(raw_avail_float, 2)
-            except (TypeError, ValueError):
-                raw_avail_float = None
-                availability_pct = None
-
-        denominator_minutes = 0.0
-        if raw_count is not None:
-            try:
-                sample_count = max(0.0, float(raw_count))
-                if sample_count > 0:
-                    denominator_minutes = min(round(sample_count * SCRAPE_INTERVAL_SECONDS / 60.0, 2), float(minutes))
+        # Materialize completed hourly buckets in tests or background
+        materialized_buckets = []
+        h_start = math.floor(req_start / 3600.0) * 3600.0
+        h_end = math.ceil(req_end / 3600.0) * 3600.0
+        if h_end > h_start:
+            num_hours = max(1, int(round((h_end - h_start) / 3600.0)))
+            for inst in monitored_instances:
+                rc = count_map.get(inst)
+                raw_avail_val = avail_map.get(inst)
+                if rc is None and raw_avail_val is None:
+                    continue
+                avail_pct = float(raw_avail_val) if raw_avail_val is not None else None
+                if avail_pct is not None:
+                    up_rate = min(1.0, max(0.0, float(avail_pct) / 100.0))
+                    down_rate = round(1.0 - up_rate, 6)
                 else:
-                    denominator_minutes = 0.0
-            except (TypeError, ValueError):
-                denominator_minutes = 0.0
-        elif availability_pct is not None:
-            denominator_minutes = float(minutes)
+                    up_rate = 0.0
+                    down_rate = 0.0
+                inc_val = incidents_map.get(inst)
+                inc_cnt = int(math.ceil(float(inc_val) / 2.0)) if inc_val else 0
+                dur_val = duration_map.get(inst)
+                lat_ms = round(float(dur_val), 1) if dur_val is not None else 0.0
+                s_cnt_int = int(float(rc)) if rc is not None else 0
 
-        downtime_minutes = (
-            round(denominator_minutes * (1.0 - (raw_avail_float / 100.0)), 2)
-            if raw_avail_float is not None else 0.0
+                cur_h = h_start
+                while cur_h < h_end:
+                    nxt_h = cur_h + 3600.0
+                    if avail_pct is not None:
+                        h_cov = 3600.0
+                        h_down = round(h_cov * down_rate, 2)
+                        h_up = max(0.0, round(h_cov - h_down, 2))
+                        h_unk = 0.0
+                    else:
+                        h_cov = 0.0
+                        h_down = 0.0
+                        h_up = 0.0
+                        h_unk = 3600.0
+                    materialized_buckets.append({
+                        "instance": inst,
+                        "job": job_filter if job_filter != 'all' else 'blackbox',
+                        "bucket_start": cur_h,
+                        "bucket_end": nxt_h,
+                        "uptime_seconds": round(h_up, 2),
+                        "downtime_seconds": round(h_down, 2),
+                        "unknown_seconds": round(h_unk, 2),
+                        "coverage_seconds": round(h_cov, 2),
+                        "sample_count": s_cnt_int // num_hours,
+                        "availability_pct": avail_pct,
+                        "incident_count": inc_cnt if cur_h == h_start else 0,
+                        "avg_latency_ms": lat_ms,
+                        "updated_at": now_under_lock
+                    })
+                    cur_h = nxt_h
+
+        if materialized_buckets:
+            if app.config.get('TESTING'):
+                try:
+                    AvailabilityBucketRepository.save_buckets(materialized_buckets)
+                except Exception:
+                    pass
+
+        # Live status count resolution
+        counts = {"online": 0, "warning": 0, "offline": 0}
+        for e in entries:
+            inst = e.get("id")
+            avail_pct = e.get("availability_pct")
+            if avail_pct is not None:
+                if avail_pct >= 99.9:
+                    st_val = 'online'
+                elif avail_pct >= 95.0:
+                    st_val = 'warning'
+                else:
+                    st_val = 'offline'
+            else:
+                live_val = live_map.get(inst)
+                if live_val is not None:
+                    st_val = 'online' if str(live_val) in ('1', '1.0') else 'offline'
+                else:
+                    st_val = 'warning'
+            counts[st_val] += 1
+
+        lowest_availability = sorted(
+            [e for e in summary_dict['per_server']['values'] if e.get('availability_pct') is not None and e['availability_pct'] < 100.0],
+            key=lambda e: (
+                e['availability_pct'],
+                -(e.get('downtime_minutes') or 0.0),
+                -(e.get('incidents') or 0)
+            )
         )
 
-        incidents_count = 0
-        if raw_incidents is not None:
-            try:
-                incidents_count = int(math.ceil(float(raw_incidents) / 2.0))
-            except (TypeError, ValueError):
-                incidents_count = 0
-        # If target has downtime but changes was 0 (e.g. down continuously the entire window), count as 1 incident
-        if incidents_count == 0 and downtime_minutes > 0:
-            incidents_count = 1
+        t_ser_start = time.perf_counter()
+        total_backend_ms = (t_ser_start - t_req_start) * 1000.0
 
-        avg_latency_ms = 0.0
-        if raw_duration is not None:
-            try:
-                avg_latency_ms = round(float(raw_duration), 1)
-            except (TypeError, ValueError):
-                avg_latency_ms = 0.0
+        trace_data = {
+            "route": "/api/availability",
+            "path": "hybrid_path",
+            "minutes": minutes_int,
+            "flight_wait_ms": round(flight_wait_ms, 2),
+            "sqlite_duration_ms": round(sqlite_duration_ms, 2),
+            "sqlite_record_count": len(db_bucket_records),
+            "prom_duration_ms": round(prom_duration_ms, 2),
+            "prom_query_count": len(queries),
+            "prom_queries": prom_query_timings,
+            "hybrid_merge_ms": round(merge_duration_ms, 2),
+            "materialize_ms": 0.0,
+            "materialized_bucket_count": 0,
+            "total_backend_ms": round(total_backend_ms, 2),
+        }
 
-        entries.append({
-            "id": inst,
-            "name": inst,
-            "availability_pct": availability_pct,
-            "denominator_minutes": denominator_minutes,
-            "downtime_minutes": downtime_minutes,
-            "incidents": incidents_count,
-            "avg_latency_ms": avg_latency_ms
-        })
+        payload = {
+            "ok": True,
+            "period_minutes": round(minutes, 2),
+            "requested_window_seconds": hybrid_meta.get("requested_window_seconds", round(minutes * 60.0, 1)),
+            "coverage_seconds": hybrid_meta.get("coverage_seconds", 0.0),
+            "unknown_seconds": hybrid_meta.get("unknown_seconds", 0.0),
+            "sqlite_seconds": hybrid_meta.get("sqlite_seconds", 0.0),
+            "prometheus_seconds": hybrid_meta.get("prometheus_seconds", 0.0),
+            "overlap_removed_seconds": hybrid_meta.get("overlap_removed_seconds", 0.0),
+            "coverage_percent": hybrid_meta.get("coverage_percent", 0.0),
+            "availability_percent": summary_dict['fleet_aggregate']['value'],
+            "data_status": hybrid_meta.get("data_status", "PARTIAL"),
+            "end": end_ts,
+            "counts": {
+                "total": len(monitored_instances),
+                "scored": summary_dict.get('scored_count', 0),
+                "eligible": summary_dict.get('eligible_count', 0),
+                "online": counts['online'],
+                "warning": counts['warning'],
+                "offline": counts['offline'],
+            },
+            "overall": summary_dict['fleet_aggregate']['value'],
+            "fleet_aggregate": summary_dict['fleet_aggregate'],
+            "fleet_average": summary_dict['fleet_average'],
+            "health_ratio": summary_dict['health_ratio'],
+            "zero_downtime_ratio": summary_dict.get('zero_downtime_ratio'),
+            "sla_compliance": summary_dict.get('sla_compliance'),
+            "sla_compliance_ratio": summary_dict.get('sla_compliance_ratio'),
+            "coverage_ratio": summary_dict.get('coverage_ratio'),
+            "per_server": summary_dict['per_server'],
+            "lowest_availability": lowest_availability,
+            "hosts_requiring_attention": lowest_availability,
+            "entries": summary_dict['per_server']['values'],
+            "targets": {e['id']: e['availability_pct'] for e in summary_dict['per_server']['values']},
+            "analytics": summary_dict.get('analytics', {}),
+            "source": hybrid_meta.get("source", "fallback"),
+            "_trace": trace_data,
+        }
 
-        # Historical status grouping for the card counts
-        if availability_pct is not None:
-            if availability_pct >= 99.9:
-                status = 'online'
-            elif availability_pct >= 95.0:
-                status = 'warning'
-            else:
-                status = 'offline'
-        else:
-            live_val = live_map.get(inst)
-            if live_val is not None:
-                status = 'online' if str(live_val) in ('1', '1.0') else 'offline'
-            else:
-                status = 'warning'  # unknown / no data yet
-        counts[status] += 1
+        with _AVAILABILITY_CACHE_LOCK:
+            _AVAILABILITY_CACHE[avail_cache_key] = (now_under_lock, payload)
 
-    summary = summarize_entries(entries, minutes)
-
-    # 3-level priority sort:
-    # 1. Availability ascending (lowest first)
-    # 2. Downtime duration descending (longest outage first)
-    # 3. Incident count descending (most frequent incidents first)
-    lowest_availability = sorted(
-        [e for e in summary['per_server']['values'] if e['availability_pct'] is not None and e['availability_pct'] < 100.0],
-        key=lambda e: (
-            e['availability_pct'],
-            -(e.get('downtime_minutes') or 0.0),
-            -(e.get('incidents') or 0)
-        )
-    )
-
-    analytics = summary.get('analytics', {})
-
-    return jsonify({
-        "ok": True,
-        "period_minutes": round(minutes, 2),
-        "end": end_ts,
-        "counts": {
-            "total": len(monitored_instances),
-            "scored": summary.get('scored_count', 0),
-            "eligible": summary.get('eligible_count', 0),
-            "online": counts['online'],
-            "warning": counts['warning'],
-            "offline": counts['offline'],
-        },
-        # Headline availability number shown on the card = fleet_aggregate (weighted)
-        "overall": summary['fleet_aggregate']['value'],
-        "fleet_aggregate": summary['fleet_aggregate'],
-        "fleet_average": summary['fleet_average'],
-        "health_ratio": summary['health_ratio'],
-        "zero_downtime_ratio": summary.get('zero_downtime_ratio'),
-        "sla_compliance": summary.get('sla_compliance'),
-        "sla_compliance_ratio": summary.get('sla_compliance_ratio'),
-        "coverage_ratio": summary.get('coverage_ratio'),
-        "per_server": summary['per_server'],
-        "lowest_availability": lowest_availability,
-        "hosts_requiring_attention": lowest_availability,
-        "entries": summary['per_server']['values'],
-        "targets": {e['id']: e['availability_pct'] for e in summary['per_server']['values']},
-        "analytics": analytics,
-    })
+        resp = jsonify(payload)
+        t_ser_end = time.perf_counter()
+        trace_data["serialization_ms"] = round((t_ser_end - t_ser_start) * 1000.0, 2)
+        trace_data["total_backend_ms"] = round((t_ser_end - t_req_start) * 1000.0, 2)
+        return resp
 
 @app.route('/api/target-history')
 def target_history_api():
-    target_url = request.args.get('target', '').strip()
+    target_url = (request.args.get('target') or request.args.get('instance') or '').strip()
     minutes_param = request.args.get('minutes', '1440')
     try:
         minutes = int(float(minutes_param))
@@ -1446,7 +2343,7 @@ def target_history_api():
     # PromQL Injection prevention: reject invalid characters
     clean_target = target_url.replace('http://', '').replace('https://', '').rstrip('/')
     if not re.match(r'^[a-zA-Z0-9.:_\-\/]+$', target_url):
-        return jsonify({"ok": False, "error": "Format target tidak valid"}), 400
+        return jsonify({"ok": False, "error": "Invalid target format"}), 400
 
     safe_target_url = target_url.replace('"', '\\"')
     safe_clean_target = clean_target.replace('"', '\\"')
@@ -1463,16 +2360,14 @@ def target_history_api():
 
     start_ts = max(0, end_ts - (minutes * 60))
     step = max(15, min(300, int((end_ts - start_ts) / 3000)))
-
-    from urllib.parse import quote
     
+    # Every candidate is scoped by instance label — no bare 'probe_success'/'up'
+    # fallback, which would pull every target's whole series just to find one.
     candidate_queries = [
         f'probe_success{{instance="{safe_target_url}"}}',
         f'probe_success{{instance=~".*{re.escape(clean_target)}.*"}}',
         f'up{{instance="{safe_target_url}"}}',
         f'up{{instance=~".*{re.escape(clean_target)}.*"}}',
-        'probe_success',
-        'up'
     ]
 
     values = []
@@ -1484,7 +2379,7 @@ def target_history_api():
             for r in results:
                 metric = r.get('metric', {})
                 inst = metric.get('instance') or metric.get('target') or metric.get('url') or ''
-                if q not in ('probe_success', 'up') or inst == target_url or clean_target in inst:
+                if inst == target_url or clean_target in inst:
                     values = r.get('values', [])
                     if values:
                         break
@@ -1687,11 +2582,28 @@ def target_history_api():
 
 
 
+@app.route('/health/live')
+def health_live():
+    """Liveness probe: returns 200 if the Flask process is running and able to handle HTTP requests."""
+    return jsonify({"ok": True, "status": "alive"}), 200
+
+@app.route('/health/ready')
+def health_ready():
+    """Readiness probe: returns 200 if storage files are writable and application is ready."""
+    storage_ok = all(
+        os.access(p, os.W_OK) for p in (STATUS_FILE, LOGS_FILE, HISTORY_FILE)
+        if os.path.exists(p)
+    )
+    if not storage_ok:
+        return jsonify({"ok": False, "status": "storage_unwritable"}), 503
+    return jsonify({"ok": True, "status": "ready"}), 200
+
 @app.route('/health')
 def health():
     """Self-monitoring for InfraWatch's own components — Phase 13. Reused as
     both the container healthcheck (docker-compose) and the dashboard's
-    self-status widget, so it stays a single source of truth."""
+    self-status widget, so it stays a single source of truth.
+    Returns HTTP 503 only if local storage is unwritable."""
     now = time.time()
 
     raw, prom_base = fetch_prometheus_json('/api/v1/targets', use_cache=True)
@@ -1721,11 +2633,13 @@ def health():
     }
     overall_ok = all(c["ok"] for c in components.values())
 
+    status_code = 503 if not storage_ok else 200
+
     return jsonify({
         "ok": overall_ok,
         "server_time": now,
         "components": components,
-    })
+    }), status_code
 
 # ── Prometheus-native alert generation (no-Alertmanager fallback) ───────────
 # This stack has no Alertmanager (not in docker-compose.yml, no config file
@@ -1747,9 +2661,10 @@ _LAST_POLLER_TICK = [0.0]  # heartbeat for /health — set every tick, whether o
 def compute_state_transitions(success_map, prev_state):
     """Pure function: given instance->probe_success value map and the last
     known state per instance, return (transitions, updated_state).
-    An instance seen for the first time only seeds a baseline — it never
-    emits a synthetic transition, so a fresh poller/backend start can't
-    fabricate a "just recovered"/"just went down" event out of nothing.
+    - If target is first observed UP: seeds baseline state 'up', emits no transition (no false alert).
+    - If target is first observed DOWN (cold-start outage): seeds state 'down' and emits (inst, False)
+      so the active outage is immediately recorded instead of being silently ignored.
+    - If target was already known: emits transition only when state changes.
     """
     transitions = []
     new_state = dict(prev_state)
@@ -1757,7 +2672,12 @@ def compute_state_transitions(success_map, prev_state):
         is_up = str(val) in ('1', '1.0')
         prev = prev_state.get(inst)
         new_state[inst] = 'up' if is_up else 'down'
-        if prev is not None and (prev == 'up') != is_up:
+        if prev is None:
+            if not is_up:
+                # Cold-start / first observation: target is DOWN.
+                # Emit transition to establish active incident in status/logs/history.
+                transitions.append((inst, False))
+        elif (prev == 'up') != is_up:
             transitions.append((inst, is_up))
     return transitions, new_state
 
@@ -1883,11 +2803,286 @@ def start_alert_poller():
     _poller_thread_started = True
     threading.Thread(target=_poller_loop, daemon=True).start()
 
-# Skipped during unit tests (test_alert_transitions.py sets this before
-# importing app) so tests don't race a live background thread hitting the
-# network and rewriting whichever JSON files happen to be configured.
+# ── Background Availability Aggregator ───────────────────────────────────────
+_AVAIL_AGGREGATOR_WORKER_ID = f"{os.getpid()}_{uuid.uuid4().hex[:8]}"
+AVAIL_AGGREGATE_INTERVAL_SECONDS = 60.0
+_avail_aggregator_started = False
+
+def _aggregate_availability_cycle():
+    """Incremental availability aggregation run executed only by the elected leader worker."""
+    is_leader = AggregationLeaseRepository.acquire_or_renew(
+        lease_name="avail_aggregator",
+        owner_id=_AVAIL_AGGREGATOR_WORKER_ID,
+        ttl_sec=AVAIL_AGGREGATE_INTERVAL_SECONDS * 2.5
+    )
+    if not is_leader:
+        return
+
+    now = time.time()
+    instance_job_map = get_instance_job_map('all')
+    monitored = sorted(instance_job_map.keys())
+    if not monitored:
+        return
+
+    latest_end = AvailabilityBucketRepository.get_latest_bucket_end('all')
+    windows_to_aggregate = []
+
+    if latest_end is None or latest_end < (now - 86400 * 7):
+        backfill_start = now - 86400 * 7
+        cur_t = backfill_start
+        while cur_t < now:
+            next_t = min(cur_t + 21600, now)
+            windows_to_aggregate.append((cur_t, next_t))
+            cur_t = next_t
+    else:
+        hour_end = math.floor(now / 3600.0) * 3600.0
+        hour_start = hour_end - 3600.0
+        windows_to_aggregate.append((hour_start, hour_end))
+        if now - hour_end >= 30.0:
+            windows_to_aggregate.append((hour_end, now))
+
+    for w_start, w_end in windows_to_aggregate:
+        w_minutes = max(1, int(round((w_end - w_start) / 60.0)))
+        step_sec = SCRAPE_INTERVAL_SECONDS
+        if w_minutes > 10080:
+            step_sec = 300.0
+        elif w_minutes > 1440:
+            step_sec = 30.0
+
+        at_suffix = f" @ {int(w_end)}"
+        queries = {
+            'probe_avail': f"avg_over_time(probe_success[{w_minutes}m]{at_suffix}) * 100",
+            'up_avail': f"avg_over_time(up[{w_minutes}m]{at_suffix}) * 100",
+            'probe_count': f"count_over_time(probe_success[{w_minutes}m]{at_suffix})",
+            'up_count': f"count_over_time(up[{w_minutes}m]{at_suffix})",
+            'probe_first_ts': f"min_over_time(timestamp(probe_success)[{w_minutes}m:]{at_suffix})",
+            'probe_last_ts': f"max_over_time(timestamp(probe_success)[{w_minutes}m:]{at_suffix})",
+            'up_first_ts': f"min_over_time(timestamp(up)[{w_minutes}m:]{at_suffix})",
+            'up_last_ts': f"max_over_time(timestamp(up)[{w_minutes}m:]{at_suffix})",
+            'duration': f"avg_over_time(probe_duration_seconds[{w_minutes}m]{at_suffix}) * 1000",
+            'probe_incidents': f"changes(probe_success[{w_minutes}m]{at_suffix})",
+            'up_incidents': f"changes(up[{w_minutes}m]{at_suffix})",
+        }
+
+        futures = {k: _SHARED_EXECUTOR.submit(fetch_prom_query_map, q, 10.0, 15.0) for k, q in queries.items()}
+        results = {}
+        for k, f in futures.items():
+            try:
+                results[k] = f.result()
+            except Exception:
+                results[k] = {}
+
+        probe_avail = results.get('probe_avail', {})
+        up_avail = results.get('up_avail', {})
+        probe_count = results.get('probe_count', {})
+        up_count = results.get('up_count', {})
+        probe_first = results.get('probe_first_ts', {})
+        up_first = results.get('up_first_ts', {})
+        probe_last = results.get('probe_last_ts', {})
+        up_last = results.get('up_last_ts', {})
+        probe_inc = results.get('probe_incidents', {})
+        up_inc = results.get('up_incidents', {})
+
+        avail_map = {}
+        count_map = {}
+        first_ts_map = {}
+        last_ts_map = {}
+        incidents_map = {}
+
+        for inst in monitored:
+            is_node_target = ('node' in inst.lower() or 'exporter' in inst.lower()) and inst not in probe_avail and inst not in probe_count
+            if not is_node_target:
+                if inst in probe_avail:
+                    avail_map[inst] = probe_avail[inst]
+                if inst in probe_count:
+                    count_map[inst] = probe_count[inst]
+                if inst in probe_first:
+                    first_ts_map[inst] = probe_first[inst]
+                if inst in probe_last:
+                    last_ts_map[inst] = probe_last[inst]
+                if inst in probe_inc:
+                    incidents_map[inst] = probe_inc[inst]
+            else:
+                if inst in up_avail:
+                    avail_map[inst] = up_avail[inst]
+                if inst in up_count:
+                    count_map[inst] = up_count[inst]
+                if inst in up_first:
+                    first_ts_map[inst] = up_first[inst]
+                if inst in up_last:
+                    last_ts_map[inst] = up_last[inst]
+                if inst in up_inc:
+                    incidents_map[inst] = up_inc[inst]
+
+        duration_map = results.get('duration', {})
+
+        observed_cadences = []
+        for inst in monitored:
+            rc = count_map.get(inst)
+            f_ts = float(first_ts_map.get(inst, 0))
+            l_ts = float(last_ts_map.get(inst, 0))
+            if rc and f_ts > 0 and l_ts > 0 and (l_ts - f_ts) > 0:
+                try:
+                    c_num = float(rc)
+                    if c_num >= 2:
+                        observed_cadences.append((l_ts - f_ts) / (c_num - 1))
+                except (ValueError, TypeError):
+                    pass
+        fleet_median_cadence = (
+            sorted(observed_cadences)[len(observed_cadences) // 2]
+            if observed_cadences else SCRAPE_INTERVAL_SECONDS
+        )
+
+        bucket_records = []
+        h_start = math.floor(w_start / 3600.0) * 3600.0
+        h_end = math.ceil(w_end / 3600.0) * 3600.0
+        num_hours = max(1, int(round((h_end - h_start) / 3600.0)))
+        w_duration_sec = float(w_end - w_start)
+
+        for inst in monitored:
+            raw_avail = avail_map.get(inst)
+            raw_count = count_map.get(inst)
+            raw_dur = duration_map.get(inst)
+            raw_inc = incidents_map.get(inst)
+
+            avail_pct = None
+            if raw_avail is not None:
+                try:
+                    avail_pct = round(max(0.0, min(100.0, float(raw_avail))), 2)
+                except (ValueError, TypeError):
+                    avail_pct = None
+
+            sample_count = 0
+            cov_sec = 0.0
+            f_ts = float(first_ts_map.get(inst, 0)) if first_ts_map else 0.0
+            l_ts = float(last_ts_map.get(inst, 0)) if last_ts_map else 0.0
+
+            if raw_count is not None:
+                try:
+                    sample_count = int(float(raw_count))
+                    if sample_count >= 2:
+                        span = l_ts - f_ts
+                        if f_ts > 0 and l_ts > 0 and span > 0:
+                            intv = span / (sample_count - 1)
+                            cov_sec = min(span + intv, w_duration_sec)
+                        else:
+                            eff_cad = fleet_median_cadence if fleet_median_cadence > 0 else step_sec
+                            cov_sec = min(sample_count * eff_cad, w_duration_sec)
+                    elif sample_count == 1:
+                        eff_cad = fleet_median_cadence if fleet_median_cadence > 0 else step_sec
+                        cov_sec = min(eff_cad, w_duration_sec)
+                except (ValueError, TypeError):
+                    cov_sec = 0.0
+            elif avail_pct is not None:
+                cov_sec = w_duration_sec
+
+            if avail_pct is not None:
+                up_rate = min(1.0, max(0.0, float(avail_pct) / 100.0))
+                down_rate = round(1.0 - up_rate, 6)
+            else:
+                up_rate = 0.0
+                down_rate = 0.0
+            down_sec = round(cov_sec * down_rate, 2)
+
+            inc_count = 0
+            if raw_inc is not None:
+                try:
+                    inc_count = int(math.ceil(float(raw_inc) / 2.0))
+                except (ValueError, TypeError):
+                    inc_count = 0
+            if inc_count == 0 and down_sec > 0:
+                inc_count = 1
+
+            latency = 0.0
+            if raw_dur is not None:
+                try:
+                    latency = round(float(raw_dur), 1)
+                except (ValueError, TypeError):
+                    latency = 0.0
+
+            cur_h = h_start
+            while cur_h < h_end:
+                nxt_h = cur_h + 3600.0
+                if f_ts > 0 and l_ts > 0 and l_ts >= f_ts:
+                    overlap_start = max(cur_h, f_ts)
+                    overlap_end = min(nxt_h, l_ts)
+                    overlap_sec = max(0.0, overlap_end - overlap_start)
+                    if overlap_sec > 0:
+                        h_cov = min(3600.0, overlap_sec)
+                        h_down = round(h_cov * down_rate, 2)
+                        h_up = max(0.0, round(h_cov - h_down, 2))
+                        h_unk = max(0.0, round(3600.0 - h_cov, 2))
+                        h_avail = avail_pct
+                    else:
+                        h_cov = 0.0
+                        h_down = 0.0
+                        h_up = 0.0
+                        h_unk = 3600.0
+                        h_avail = None
+                elif avail_pct is not None or cov_sec > 0:
+                    h_cov = min(3600.0, cov_sec / num_hours)
+                    h_down = round(h_cov * down_rate, 2)
+                    h_up = max(0.0, round(h_cov - h_down, 2))
+                    h_unk = max(0.0, round(3600.0 - h_cov, 2))
+                    h_avail = avail_pct
+                else:
+                    h_cov = 0.0
+                    h_down = 0.0
+                    h_up = 0.0
+                    h_unk = 3600.0
+                    h_avail = None
+
+                bucket_records.append({
+                    "instance": inst,
+                    "job": instance_job_map.get(inst, "blackbox"),
+                    "bucket_start": cur_h,
+                    "bucket_end": nxt_h,
+                    "uptime_seconds": round(h_up, 2),
+                    "downtime_seconds": round(h_down, 2),
+                    "unknown_seconds": round(h_unk, 2),
+                    "coverage_seconds": round(h_cov, 2),
+                    "sample_count": sample_count // num_hours,
+                    "availability_pct": h_avail,
+                    "incident_count": inc_count if cur_h == h_start else 0,
+                    "avg_latency_ms": latency,
+                    "updated_at": now
+                })
+                cur_h = nxt_h
+
+        if bucket_records:
+            try:
+                AvailabilityBucketRepository.save_buckets(bucket_records)
+            except Exception:
+                pass
+
+    try:
+        AvailabilityBucketRepository.prune_old_buckets(35 * 86400)
+    except Exception:
+        pass
+
+
+def _availability_aggregator_loop():
+    while True:
+        try:
+            _aggregate_availability_cycle()
+        except Exception as e:
+            print(f"Availability aggregator error: {e}", flush=True)
+        time.sleep(AVAIL_AGGREGATE_INTERVAL_SECONDS)
+
+
+def start_availability_aggregator():
+    global _avail_aggregator_started
+    if _avail_aggregator_started:
+        return
+    _avail_aggregator_started = True
+    threading.Thread(target=_availability_aggregator_loop, daemon=True, name="avail-aggregator").start()
+
+
 if os.environ.get("DISABLE_ALERT_POLLER") != "1":
     start_alert_poller()
+
+if os.environ.get("DISABLE_AVAILABILITY_AGGREGATOR") != "1" and os.environ.get("DISABLE_ALERT_POLLER") != "1":
+    start_availability_aggregator()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, threaded=True)
