@@ -938,14 +938,22 @@ class InstancesPage {
 
     // force=true (manual refresh, custom range submit) supersedes in-flight requests.
     // Switching presets aborts stale in-flight requests to save network/backend bandwidth.
+    // Only skip when the in-flight request is for the SAME key (e.g. the 15s
+    // poll firing while an identical fetch is still pending) — an in-flight
+    // request for a different job/period/end must always be aborted and
+    // replaced, otherwise switching e.g. All Jobs -> blackbox-ping-internal
+    // while the All Jobs response is still in flight drops the new request
+    // and lets the stale All Jobs data land (and overwrite Card 5) once it
+    // finally resolves.
     if (this._availAbortController) {
-      if (!force && this._availLoading) {
+      if (!force && this._availLoading && this._availInFlightKey === cacheKey) {
         return;
       }
       this._availAbortController.abort();
     }
     const controller = new AbortController();
     this._availAbortController = controller;
+    this._availInFlightKey = cacheKey;
     const seq = ++this._availRequestSeq;
     const isStale = () => seq !== this._availRequestSeq;
 
@@ -998,6 +1006,7 @@ class InstancesPage {
     } finally {
       if (this._availAbortController === controller) {
         this._availAbortController = null;
+        this._availInFlightKey = null;
         this._availLoading = false;
         this._updateAvailLoadingUI(false);
       }
@@ -2084,7 +2093,12 @@ class InstancesPage {
     if (statSlow) statSlow.textContent = slow;
     if (this.statDown) this.statDown.textContent = down;
 
-    if (this.isRealtime || (this.statUptime && (this.statUptime.textContent === '—' || !this.statUptime.textContent.trim()))) {
+    // Only realtime mode owns Card 5 here — historical mode leaves it to
+    // loadAvailability()'s /api/availability response. Previously this also
+    // fired on a bare '—' placeholder (first paint / preset switch), which
+    // raced that response and made the card flicker between the live
+    // snapshot % and the historical %.
+    if (this.isRealtime) {
       const pct = total > 0 ? (up / total) * 100 : 0;
       this.statUptime.textContent = `${pct.toFixed(2)}%`;
     }

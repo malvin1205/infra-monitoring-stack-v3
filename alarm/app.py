@@ -1772,6 +1772,54 @@ def get_instance_job_map(job_filter=None):
     return job_map
 
 
+_PROM_DURATION_RE = re.compile(r'(\d+(?:\.\d+)?)(ms|s|m|h)')
+
+def _parse_prom_duration_sec(value):
+    """Parses a Prometheus model.Duration string ("60s", "1m0s", "500ms")
+    into seconds. Returns None if unparseable/empty."""
+    if not value:
+        return None
+    total = 0.0
+    matched = False
+    for num, unit in _PROM_DURATION_RE.findall(str(value)):
+        matched = True
+        n = float(num)
+        total += n / 1000.0 if unit == 'ms' else n * {'s': 1.0, 'm': 60.0, 'h': 3600.0}[unit]
+    return total if matched else None
+
+
+def get_instance_cadence_map(job_filter=None):
+    """Instance -> real per-target scrape interval (seconds), read straight
+    from Prometheus's own /api/v1/targets `scrapeInterval` field.
+
+    This is what expected_interval_sec should always be keyed by: a mixed
+    fleet scrapes blackbox-ping targets at 60s and node-exporter/http targets
+    at 15s, so one global SCRAPE_INTERVAL_SECONDS (or a fleet-wide median) is
+    wrong for whichever job doesn't match it. scrapeInterval is present on
+    every active target regardless of requested window size, unlike the
+    first_ts/last_ts subqueries (which api_availability skips for windows
+    over 60 minutes for cost reasons) — so it works for the 24h/7d/30d cases
+    those can't cover.
+    """
+    if job_filter is None:
+        job_filter = DEFAULT_JOB_FILTER
+    raw_targets, _ = fetch_prometheus_json('/api/v1/targets', use_cache=True, cache_ttl=3.0)
+    deleted_targets = set(load_deleted_targets())
+
+    cadence_map = {}
+    if raw_targets and raw_targets.get('status') == 'success':
+        for t in raw_targets.get('data', {}).get('activeTargets', []):
+            labels = t.get('labels', {})
+            job = labels.get('job') or t.get('scrapePool') or ''
+            scrape_pool = t.get('scrapePool', '')
+            inst_name = labels.get('instance', t.get('scrapeUrl', '?'))
+            if job != 'prometheus' and matches_job_filter(job, scrape_pool, job_filter) and inst_name not in deleted_targets:
+                sec = _parse_prom_duration_sec(t.get('scrapeInterval'))
+                if sec:
+                    cadence_map[inst_name] = sec
+    return cadence_map
+
+
 def get_monitored_instances(job_filter=None):
     return sorted(get_instance_job_map(job_filter).keys())
 
@@ -2130,8 +2178,18 @@ def api_availability():
 
         duration_map = results.get('duration', {})
 
-        # Dynamic median cadence
-        observed_cadences = []
+        # Per-instance cadence — NOT a fleet-wide median. A mixed fleet has
+        # 60s ping targets and 15s exporter targets; collapsing that to one
+        # number under-counts whichever job doesn't match it. Prefer the
+        # directly observed cadence (span between first/last sample over
+        # sample count) when first_ts/last_ts were fetched (windows <= 60m);
+        # otherwise — and always as a fallback — use the target's real
+        # scrapeInterval from Prometheus's own /api/v1/targets (see
+        # get_instance_cadence_map). Previously windows > 60m always skipped
+        # first_ts/last_ts and fell back straight to SCRAPE_INTERVAL_SECONDS
+        # (2.0s) instead, starving 24h/7d/30d queries of ~97% of their real
+        # coverage.
+        cadence_map = dict(get_instance_cadence_map(job_filter))
         for inst in monitored_instances:
             rc = count_map.get(inst)
             f_ts = float(first_ts_map.get(inst, 0))
@@ -2140,13 +2198,9 @@ def api_availability():
                 try:
                     c_num = float(rc)
                     if c_num >= 2:
-                        observed_cadences.append((l_ts - f_ts) / (c_num - 1))
+                        cadence_map[inst] = (l_ts - f_ts) / (c_num - 1)
                 except (ValueError, TypeError):
                     pass
-        fleet_median_cadence = (
-            sorted(observed_cadences)[len(observed_cadences) // 2]
-            if observed_cadences else SCRAPE_INTERVAL_SECONDS
-        )
 
         prom_results_map = {
             "first_ts": first_ts_map,
@@ -2165,7 +2219,7 @@ def api_availability():
             monitored_instances=monitored_instances,
             sqlite_buckets=db_bucket_records,
             prom_results_map=prom_results_map,
-            expected_interval_sec=fleet_median_cadence,
+            expected_interval_sec=cadence_map,
         )
         t_merge_end = time.perf_counter()
         merge_duration_ms = (t_merge_end - t_merge_start) * 1000.0

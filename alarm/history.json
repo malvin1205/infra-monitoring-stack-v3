@@ -1,5 +1,33 @@
 [
   {
+    "key": "TargetDown|api.telegram.com",
+    "name": "TargetDown",
+    "severity": "critical",
+    "instance": "api.telegram.com",
+    "summary": "api.telegram.com is unreachable (Unknown)",
+    "time": 1787541239.1107528,
+    "status": "resolved",
+    "job": "blackbox",
+    "receiver": "prometheus-poller",
+    "generatorURL": "",
+    "resolved_time": 1787541299.2010026,
+    "duration_seconds": 60.09024977684021
+  },
+  {
+    "key": "TargetDown|https://demo-erp.justclick.id",
+    "name": "TargetDown",
+    "severity": "critical",
+    "instance": "https://demo-erp.justclick.id",
+    "summary": "https://demo-erp.justclick.id is unreachable (HTTP 502)",
+    "time": 1787539090.4472065,
+    "status": "resolved",
+    "job": "blackbox",
+    "receiver": "prometheus-poller",
+    "generatorURL": "",
+    "resolved_time": 1787539150.7095244,
+    "duration_seconds": 60.26231789588928
+  },
+  {
     "key": "TargetDown|192.168.9.50",
     "name": "TargetDown",
     "severity": "critical",

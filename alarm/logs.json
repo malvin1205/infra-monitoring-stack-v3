@@ -1,5 +1,57 @@
 [
   {
+    "time": 1787541299.2010026,
+    "event": "resolved",
+    "name": "TargetDown",
+    "severity": "critical",
+    "instance": "api.telegram.com",
+    "summary": "api.telegram.com recovered",
+    "job": "blackbox",
+    "receiver": "prometheus-poller",
+    "generatorURL": "",
+    "latency_ms": 28.6,
+    "duration_seconds": 60.09024977684021
+  },
+  {
+    "time": 1787541239.1107528,
+    "event": "firing",
+    "name": "TargetDown",
+    "severity": "critical",
+    "instance": "api.telegram.com",
+    "summary": "api.telegram.com is unreachable (Unknown)",
+    "job": "blackbox",
+    "receiver": "prometheus-poller",
+    "generatorURL": "",
+    "latency_ms": 5001.1,
+    "duration_seconds": null
+  },
+  {
+    "time": 1787539150.7095244,
+    "event": "resolved",
+    "name": "TargetDown",
+    "severity": "critical",
+    "instance": "https://demo-erp.justclick.id",
+    "summary": "https://demo-erp.justclick.id recovered",
+    "job": "blackbox",
+    "receiver": "prometheus-poller",
+    "generatorURL": "",
+    "latency_ms": 153.9,
+    "duration_seconds": 60.26231789588928
+  },
+  {
+    "time": 1787539090.4472065,
+    "event": "firing",
+    "name": "TargetDown",
+    "severity": "critical",
+    "instance": "https://demo-erp.justclick.id",
+    "summary": "https://demo-erp.justclick.id is unreachable (HTTP 502)",
+    "job": "blackbox",
+    "receiver": "prometheus-poller",
+    "generatorURL": "",
+    "latency_ms": 6130.6,
+    "duration_seconds": null
+  },
+  {
     "time": 1787537513.9434276,
     "event": "resolved",
     "name": "TargetDown",
@@ -2546,57 +2598,5 @@
     "generatorURL": "",
     "latency_ms": 251.4,
     "duration_seconds": 19.731998682022095
-  },
-  {
-    "time": 1787505096.6094346,
-    "event": "resolved",
-    "name": "TargetDown",
-    "severity": "critical",
-    "instance": "64.6.65.6",
-    "summary": "64.6.65.6 recovered",
-    "job": "blackbox",
-    "receiver": "prometheus-poller",
-    "generatorURL": "",
-    "latency_ms": 18.0,
-    "duration_seconds": 15.436096429824829
-  },
-  {
-    "time": 1787505081.1733382,
-    "event": "firing",
-    "name": "TargetDown",
-    "severity": "critical",
-    "instance": "64.6.65.6",
-    "summary": "64.6.65.6 is unreachable (Unknown)",
-    "job": "blackbox",
-    "receiver": "prometheus-poller",
-    "generatorURL": "",
-    "latency_ms": 5000.7,
-    "duration_seconds": null
-  },
-  {
-    "time": 1787505081.1733382,
-    "event": "firing",
-    "name": "TargetDown",
-    "severity": "critical",
-    "instance": "64.6.64.6",
-    "summary": "64.6.64.6 is unreachable (Unknown)",
-    "job": "blackbox",
-    "receiver": "prometheus-poller",
-    "generatorURL": "",
-    "latency_ms": 5000.6,
-    "duration_seconds": null
-  },
-  {
-    "time": 1787505081.1733382,
-    "event": "firing",
-    "name": "TargetDown",
-    "severity": "critical",
-    "instance": "182.254.116.116",
-    "summary": "182.254.116.116 is unreachable (Unknown)",
-    "job": "blackbox",
-    "receiver": "prometheus-poller",
-    "generatorURL": "",
-    "latency_ms": 5001.5,
-    "duration_seconds": null
   }
 ]

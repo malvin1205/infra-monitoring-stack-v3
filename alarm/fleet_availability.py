@@ -442,13 +442,18 @@ def merge_hybrid_fleet_availability(
     monitored_instances: List[str],
     sqlite_buckets: List[Dict[str, Any]],
     prom_results_map: Dict[str, Any],
-    expected_interval_sec: float = DEFAULT_SCRAPE_INTERVAL_SEC,
+    expected_interval_sec: Union[float, Dict[str, float]] = DEFAULT_SCRAPE_INTERVAL_SEC,
     gap_tolerance: float = DEFAULT_GAP_TOLERANCE,
     min_sla_coverage_pct: Optional[float] = None,
     sla_threshold: float = SLA_COMPLIANCE_THRESHOLD,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
     Merges per-target availability for all monitored instances and calculates fleet metrics.
+
+    expected_interval_sec may be a single fleet-wide seconds value, or a
+    {instance: seconds} map (e.g. from get_instance_cadence_map) for a mixed
+    fleet where jobs scrape at different cadences — a target missing from the
+    map falls back to DEFAULT_SCRAPE_INTERVAL_SEC.
     """
     period_minutes = max(0.0, (req_end - req_start) / 60.0)
     buckets_by_instance: Dict[str, List[Dict[str, Any]]] = {}
@@ -474,6 +479,10 @@ def merge_hybrid_fleet_availability(
             "duration": prom_results_map.get("duration", {}).get(inst),
         }
         inst_buckets = buckets_by_instance.get(inst, [])
+        if isinstance(expected_interval_sec, dict):
+            inst_interval_sec = expected_interval_sec.get(inst) or DEFAULT_SCRAPE_INTERVAL_SEC
+        else:
+            inst_interval_sec = expected_interval_sec
         entry = merge_hybrid_target_availability(
             req_start=req_start,
             req_end=req_end,
@@ -482,7 +491,7 @@ def merge_hybrid_fleet_availability(
             job="blackbox",
             sqlite_buckets=inst_buckets,
             prom_metrics=target_prom,
-            expected_interval_sec=expected_interval_sec,
+            expected_interval_sec=inst_interval_sec,
             gap_tolerance=gap_tolerance,
             min_sla_coverage_pct=min_sla_coverage_pct,
             sla_threshold=sla_threshold,
