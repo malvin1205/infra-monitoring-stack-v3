@@ -1,0 +1,8 @@
+{
+  "enabled": true,
+  "bot_token": "YOUR_TELEGRAM_BOT_TOKEN_HERE",
+  "chat_id": "YOUR_TELEGRAM_CHAT_ID_HERE",
+  "send_firing": true,
+  "send_resolved": true,
+  "min_severity": "warning"
+}

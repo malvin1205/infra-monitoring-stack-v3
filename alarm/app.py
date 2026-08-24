@@ -48,6 +48,15 @@ except ImportError:
         AvailabilityBucketRepository, AggregationLeaseRepository
     )
 
+try:
+    from telegram_notifier import (
+        dispatch_alert_async, get_telegram_config, save_telegram_config, test_telegram_connection
+    )
+except ImportError:
+    from alarm.telegram_notifier import (
+        dispatch_alert_async, get_telegram_config, save_telegram_config, test_telegram_connection
+    )
+
 init_db()
 
 # Matches prometheus/prometheus.yml `global.scrape_interval`. Used to turn a
@@ -820,6 +829,23 @@ def record_alert_event(name, severity, instance, summary, job, event_time, is_no
         save_json(STATUS_FILE, {"status": status_state, "alerts": firing_list, "updated": time.time()})
         save_json(LOGS_FILE, logs[:MAX_LOGS])
         save_with_retention(HISTORY_FILE, HISTORY_ARCHIVE_FILE, history, MAX_HISTORY)
+
+        # Asynchronously dispatch Telegram notification on verified state transition
+        try:
+            dispatch_alert_async(
+                name=name,
+                severity=severity,
+                instance=instance,
+                summary=summary,
+                job=job,
+                event_time=event_time,
+                is_now_firing=is_now_firing,
+                duration_seconds=duration_seconds,
+                latency_ms=latency_ms
+            )
+        except Exception as e:
+            logger.error(f"Error dispatching telegram alert: {e}")
+
         return True
 
 # ── Webhook ───────────────────────────────────────────────────────────────────
@@ -1287,6 +1313,54 @@ def delete_dependency_api(dep_id):
             return jsonify({"ok": False, "error": "Dependency not found"}), 404
         save_json(DEPENDENCIES_FILE, remaining)
     return jsonify({"ok": True})
+
+# ── Telegram Notifications API ───────────────────────────────────────────────
+@app.route('/api/telegram', methods=['GET'])
+def get_telegram_api():
+    config = get_telegram_config()
+    token = config.get("bot_token", "")
+    masked_token = token[:8] + "..." + token[-6:] if len(token) > 14 else (token if token else "")
+    return jsonify({
+        "ok": True,
+        "enabled": config.get("enabled", True),
+        "bot_token_masked": masked_token,
+        "has_token": bool(token),
+        "chat_id": str(config.get("chat_id", "")),
+        "send_firing": config.get("send_firing", True),
+        "send_resolved": config.get("send_resolved", True),
+        "min_severity": config.get("min_severity", "warning")
+    })
+
+@app.route('/api/telegram', methods=['POST'])
+def save_telegram_api():
+    data = request.json or {}
+    updated = {}
+    if "enabled" in data:
+        updated["enabled"] = bool(data["enabled"])
+    if "bot_token" in data and data["bot_token"].strip():
+        updated["bot_token"] = data["bot_token"].strip()
+    if "chat_id" in data:
+        updated["chat_id"] = str(data["chat_id"]).strip()
+    if "send_firing" in data:
+        updated["send_firing"] = bool(data["send_firing"])
+    if "send_resolved" in data:
+        updated["send_resolved"] = bool(data["send_resolved"])
+    if "min_severity" in data:
+        updated["min_severity"] = str(data["min_severity"]).strip().lower()
+
+    if save_telegram_config(updated):
+        return jsonify({"ok": True, "message": "Telegram configuration saved"})
+    return jsonify({"ok": False, "error": "Failed to save configuration"}), 500
+
+@app.route('/api/telegram/test', methods=['POST'])
+def test_telegram_api():
+    data = request.json or {}
+    token = data.get("bot_token")
+    cid = data.get("chat_id")
+    ok, msg = test_telegram_connection(token, cid)
+    if ok:
+        return jsonify({"ok": True, "message": "Test notification sent successfully to Telegram"})
+    return jsonify({"ok": False, "error": msg}), 400
 
 def fetch_prom_query_map(query_expr, cache_ttl=5.0, timeout=None):
     raw, base = fetch_prometheus_json(f"/api/v1/query?query={quote(query_expr)}", use_cache=True, cache_ttl=cache_ttl, timeout=timeout)

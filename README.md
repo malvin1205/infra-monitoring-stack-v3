@@ -116,10 +116,16 @@ Sistem mengkalkulasi 4 jenis metrik ketersediaan secara matematis dari data Prom
 - Apabila sistem digunakan tanpa Alertmanager, poller ini secara otomatis mensintesis event `TargetDown` dan pemulihannya (*resolved*) langsung ke `status.json`, `logs.json`, dan `history.json`.
 - **Authoritative Webhook Backoff**: Jika webhooks eksternal dari Alertmanager masuk ke `/webhook`, poller otomatis *back-off* agar tidak terjadi ganda notifikasi.
 
-### 8. 🛡️ System Self-Health Diagnostics (`/health`)
-- Melakukan verifikasi kesehatan 4 komponen internal:
+### 8. 📱 Notifikasi Real-time Telegram Bot (`telegram_notifier.py`)
+- **Asynchronous Alert Dispatcher**: Mengirimkan pemberitahuan instan ke grup/channel Telegram saat status target `FIRING` (Down) maupun `RESOLVED` (Recovered) tanpa menghambat poller backend.
+- **Rich HTML Alert Cards**: Format pesan yang dilengkapi status visual (🚨/✅), nama instance, job, latency (*ms*), durasi downtime terhitung, serta timestamp lokal WIB (UTC+7).
+- **Masked Token Security**: Perlindungan token bot melalui masking di UI/API dan isolasi file konfigurasi dari repository publik.
+- **Dynamic Config & Uji Koneksi**: Konfigurasi dapat diperbarui secara dinamis via REST API `/api/telegram` dan diverifikasi dengan tombol tes koneksi.
+
+### 9. 🛡️ System Self-Health Diagnostics (`/health`)
+- Melakukan verifikasi kesehatan komponen internal InfraWatch:
   1. **Prometheus Engine Connection**: Status konektivitas dan keaktifan Prometheus.
-  2. **Storage Filesystem**: Ketersediaan akses write pada file `status.json`, `logs.json`, dan `history.json`.
+  2. **Storage Filesystem**: Ketersediaan akses write pada database dan file state.
   3. **Monitoring API**: Responsivitas endpoint API.
   4. **Alarm Poller Service**: Heartbeat keaktifan background poller thread (`_LAST_POLLER_TICK`).
 - Digunakan sebagai *Healthcheck Engine* bawaan pada Docker Compose.
@@ -141,11 +147,14 @@ Sistem mengkalkulasi 4 jenis metrik ketersediaan secara matematis dari data Prom
 | `/api/dependencies/<id>` | `DELETE` | Menghapus hirarki ketergantungan |
 | `/api/endpoints` | `GET / POST / DELETE` | Manajemen & failover kandidat endpoint Prometheus |
 | `/api/endpoints/select` | `POST` | Memilih endpoint Prometheus aktif secara manual |
+| `/api/telegram` | `GET / POST` | Membaca status (masked token) dan memperbarui konfigurasi notifikasi Telegram |
+| `/api/telegram/test` | `POST` | Mengirim pesan uji koneksi ke Bot & Chat ID Telegram |
 | `/status` | `GET` | Mengambil data status global (`NORMAL`, `WARNING`, `CRITICAL`) & active alerts |
 | `/logs` | `GET` | Mengambil log kejadian insiden terkini (limit hingga 200 log) |
 | `/history` | `GET` | Mengambil riwayat insiden berdurasi lengkap |
 | `/webhook` | `POST` | Receiver webhook resmi dari Alertmanager |
 | `/health` | `GET` | Self-health diagnostics 4 komponen internal InfraWatch |
+
 
 ---
 
@@ -255,3 +264,11 @@ docker compose ps
      - PROMETHEUS_URL=http://192.168.x.x:9090
    ```
    Lalu restart container dengan `docker compose restart`.
+
+---
+
+## 👥 Tim & Kontributor
+
+- **dimi** ([@malvin1205](https://github.com/malvin1205)) - Maintainer & Core Architect
+- **Fachriyusuf** ([@Fachriyusuf](https://github.com/Fachriyusuf)) - Contributor: Telegram Alerting Engine, REST APIs, & Changelog v3.2.0
+

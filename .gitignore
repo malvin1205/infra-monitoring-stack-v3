@@ -26,3 +26,8 @@ env/
 *.db-shm
 *.db-journal
 *.db
+
+# Secrets and local configurations
+alarm/telegram_config.json
+!alarm/telegram_config.json.example
+
