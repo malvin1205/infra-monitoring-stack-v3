@@ -204,8 +204,17 @@ newgrp docker
 ```bash
 git clone https://github.com/malvin1205/infra-monitoring-stack-v3.git
 cd infra-monitoring-stack-v3
+cp .env.example .env
+# isi INFRAWATCH_API_KEY dan WEBHOOK_SECRET di .env (generate: openssl rand -hex 32)
 docker compose up -d
 ```
+
+> `INFRAWATCH_API_KEY` melindungi seluruh endpoint `POST`/`DELETE` di `/api/*`
+> (dashboard mengirimkannya otomatis lewat header `X-API-Key`).
+> `WEBHOOK_SECRET` melindungi `POST /webhook` — set Alertmanager's
+> `webhook_configs.url` ke `http://<host>:5000/webhook?secret=<WEBHOOK_SECRET>`.
+> Tanpa kedua variabel ini, container tetap jalan tapi endpoint terkait akan
+> menolak semua request dengan `401`.
 
 Verifikasi status container:
 

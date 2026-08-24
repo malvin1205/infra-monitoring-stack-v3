@@ -31,3 +31,14 @@ env/
 alarm/telegram_config.json
 !alarm/telegram_config.json.example
 
+# Runtime data (contains internal host/network info, regenerated at runtime)
+alarm/infrawatch.db*
+alarm/history.json
+alarm/history_archive.json
+alarm/logs.json
+alarm/status.json
+alarm/endpoints.json
+alarm/deleted_targets.json
+alarm/dependencies.json
+alarm/maintenance.json
+

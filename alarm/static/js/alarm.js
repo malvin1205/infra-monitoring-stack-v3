@@ -13,6 +13,14 @@
 
 const JOB_DEFAULT_LS_KEY = 'infrawatch.defaultJob';
 
+// Server-rendered API key for the protected /api/* POST|DELETE routes (see
+// alarm/auth.py). Empty when INFRAWATCH_API_KEY isn't configured — those
+// routes then fail closed with 401 rather than silently accepting requests.
+const API_KEY = document.querySelector('meta[name="api-key"]')?.content || '';
+function authHeaders(extra) {
+  return API_KEY ? { ...extra, 'X-API-Key': API_KEY } : (extra || {});
+}
+
 /* ════════════════════════════════════════════════════════════════════════════
    INSTANCES PAGE
    ════════════════════════════════════════════════════════════════════════════ */
@@ -2915,7 +2923,7 @@ class InstancesPage {
     const now = Math.floor(Date.now() / 1000);
     const res = await fetch('/api/maintenance', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ target: instance, scope: 'instance', reason, start: now, end: now + minutes * 60 })
     });
     if (res.ok) {
@@ -2938,7 +2946,7 @@ class InstancesPage {
 
   async _endMaintenance(maintenanceId, instance) {
     if (!maintenanceId) return false;
-    const res = await fetch(`/api/maintenance/${encodeURIComponent(maintenanceId)}`, { method: 'DELETE' });
+    const res = await fetch(`/api/maintenance/${encodeURIComponent(maintenanceId)}`, { method: 'DELETE', headers: authHeaders() });
     if (res.ok) {
       const target = this.data.find(t => t.instance === instance);
       if (target) {
@@ -2981,7 +2989,7 @@ class InstancesPage {
   async _setDependency(child, parent) {
     const res = await fetch('/api/dependencies', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ child, parent })
     });
     if (res.ok) {
@@ -3000,7 +3008,7 @@ class InstancesPage {
 
   async _removeDependency(dependencyId, child) {
     if (!dependencyId) return false;
-    const res = await fetch(`/api/dependencies/${encodeURIComponent(dependencyId)}`, { method: 'DELETE' });
+    const res = await fetch(`/api/dependencies/${encodeURIComponent(dependencyId)}`, { method: 'DELETE', headers: authHeaders() });
     if (res.ok) {
       const target = this.data.find(t => t.instance === child);
       if (target) {
@@ -3031,7 +3039,7 @@ class InstancesPage {
         const btn = e.target.closest('[data-end-id]');
         if (!btn) return;
         btn.disabled = true;
-        const res = await fetch(`/api/maintenance/${encodeURIComponent(btn.dataset.endId)}`, { method: 'DELETE' });
+        const res = await fetch(`/api/maintenance/${encodeURIComponent(btn.dataset.endId)}`, { method: 'DELETE', headers: authHeaders() });
         if (res.ok) {
           this._lastDataSignature = null;
           await this.load(); // so any affected host card/badge updates too
@@ -3897,7 +3905,7 @@ class InstancesPage {
     try {
       const res = await fetch('/api/targets', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({ url: url })
       });
       const data = await res.json();
@@ -3934,7 +3942,7 @@ class InstancesPage {
     try {
       const res = await fetch('/api/targets', {
         method: 'DELETE',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({ url: url })
       });
       const data = await res.json();
@@ -4738,7 +4746,7 @@ class ServerMonitor {
       try {
         const res = await fetch('/api/endpoints/select', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: authHeaders({ 'Content-Type': 'application/json' }),
           body: JSON.stringify({ url })
         });
         const data = await res.json();
@@ -4754,7 +4762,7 @@ class ServerMonitor {
       try {
         const res = await fetch('/api/endpoints', {
           method: 'DELETE',
-          headers: { 'Content-Type': 'application/json' },
+          headers: authHeaders({ 'Content-Type': 'application/json' }),
           body: JSON.stringify({ url })
         });
         const data = await res.json();
@@ -4801,7 +4809,7 @@ class ServerMonitor {
         try {
           const res = await fetch('/api/endpoints', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: authHeaders({ 'Content-Type': 'application/json' }),
             body: JSON.stringify({ url, set_active: true })
           });
           const data = await res.json();

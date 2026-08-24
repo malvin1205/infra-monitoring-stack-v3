@@ -13,12 +13,14 @@ from app import (
     _FETCH_LOCKS, _FAILED_CANDIDATES, _FAILED_CANDIDATES_LOCK,
     build_canonical_monitoring_state, fetch_all_probe_metrics, fetch_down_since_prom_map
 )
+from conftest import TEST_API_KEY, TEST_WEBHOOK_SECRET
 
 
 class PerformanceCachingTests(unittest.TestCase):
     def setUp(self):
         app.config['TESTING'] = True
         self.client = app.test_client()
+        self.client.environ_base = {"HTTP_X_API_KEY": TEST_API_KEY, "HTTP_X_WEBHOOK_SECRET": TEST_WEBHOOK_SECRET}
         self.tmpdir = tempfile.mkdtemp()
         self._orig = (
             alarm_app.STATUS_FILE, alarm_app.MAINTENANCE_FILE,

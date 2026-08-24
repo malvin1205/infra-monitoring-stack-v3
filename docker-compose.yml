@@ -6,12 +6,18 @@ services:
     container_name: alarm
     restart: unless-stopped
     ports:
+      # LAN-wide on purpose — the TV wallboard reaches this over the NOC LAN
+      # (see README). State-changing /api/* routes and /webhook require
+      # INFRAWATCH_API_KEY / WEBHOOK_SECRET (alarm/auth.py), so LAN visitors
+      # can view the dashboard but can't mutate config or forge alerts.
       - "5000:5000"
     environment:
       - PROMETHEUS_URL=${PROMETHEUS_URL:-http://prometheus:9090}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
       - TELEGRAM_ENABLED=${TELEGRAM_ENABLED:-true}
+      - INFRAWATCH_API_KEY=${INFRAWATCH_API_KEY:?set INFRAWATCH_API_KEY in .env}
+      - WEBHOOK_SECRET=${WEBHOOK_SECRET:?set WEBHOOK_SECRET in .env}
     volumes:
       - ./alarm:/app
       - ./alarm/targets:/app/targets

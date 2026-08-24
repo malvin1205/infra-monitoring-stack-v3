@@ -1,16 +1,21 @@
 FROM python:3.12-slim
 
+RUN groupadd -g 10001 appgroup && \
+    useradd -u 10001 -g appgroup -s /bin/sh -m appuser
+
 WORKDIR /app
 
 RUN apt update && \
-    apt install -y ffmpeg curl && \
+    apt install -y curl && \
     rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+COPY --chown=appuser:appgroup . .
+
+USER appuser
 
 EXPOSE 5000
 

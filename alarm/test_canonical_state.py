@@ -8,12 +8,14 @@ from unittest.mock import patch
 
 import app as alarm_app
 from app import app, record_alert_event, load_json, save_json
+from conftest import TEST_API_KEY, TEST_WEBHOOK_SECRET
 
 
 class CanonicalMonitoringStateTests(unittest.TestCase):
     def setUp(self):
         app.config['TESTING'] = True
         self.client = app.test_client()
+        self.client.environ_base = {"HTTP_X_API_KEY": TEST_API_KEY, "HTTP_X_WEBHOOK_SECRET": TEST_WEBHOOK_SECRET}
         self.tmpdir = tempfile.mkdtemp()
         self._orig = (
             alarm_app.STATUS_FILE,

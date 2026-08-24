@@ -6,6 +6,38 @@ Format changelog ini mengacu pada standar [Keep a Changelog](https://keepachange
 
 ---
 
+## [3.3.0] - 2026-08-24
+
+### 🛡️ Peningkatan Keamanan (Security)
+- **Autentikasi API Key & Webhook Secret (`alarm/auth.py`)**:
+  - Seluruh endpoint state-changing (`POST`/`DELETE` di `/api/endpoints`, `/api/targets`, `/api/maintenance`, `/api/dependencies`, `/api/telegram`) kini wajib mengirim header `X-API-Key` (atau `Authorization: Bearer <key>`), divalidasi terhadap `INFRAWATCH_API_KEY`.
+  - `POST /webhook` kini wajib header `X-Webhook-Secret` (atau `?secret=`), divalidasi terhadap `WEBHOOK_SECRET`.
+  - Fail-closed: jika `INFRAWATCH_API_KEY`/`WEBHOOK_SECRET` belum diset di environment, endpoint terkait menolak seluruh request dengan `401`/`500` alih-alih terbuka bebas.
+  - Dashboard (`alarm.html`, `alarm.js`) menyisipkan API key secara otomatis lewat meta tag server-rendered, jadi UI tetap jalan tanpa perlu login manual.
+- **Perbaikan Bypass SSRF (`is_safe_endpoint_url`, `select_endpoint_api`, `is_valid_target`)**:
+  - `POST /api/endpoints/select` sebelumnya menerima URL Prometheus baru tanpa validasi anti-SSRF sama sekali — sekarang divalidasi sama seperti `POST /api/endpoints`.
+  - `is_safe_endpoint_url` sekarang melakukan resolusi DNS (`socket.getaddrinfo`) dan memeriksa setiap IP hasil resolve, menutup celah bypass via hostname yang mengarah ke IP loopback/link-local/metadata.
+  - `is_valid_target` menolak target ke alamat cloud metadata (`169.254.169.254`, `metadata.google.internal`, dll) secara eksplisit.
+- **Git & Docker Hygiene**:
+  - File data runtime (`history.json`, `status.json`, `endpoints.json`, `maintenance.json`, `dependencies.json`, `deleted_targets.json`, `history_archive.json`, `*.db`) di-untrack dari git dan ditambahkan ke `.gitignore` — sebelumnya ikut ter-commit dan berpotensi membocorkan topologi jaringan internal.
+  - `alarm/.dockerignore` baru mencegah secret dan database ikut ter-copy ke Docker image layer.
+  - `alarm/Dockerfile`: container kini berjalan sebagai non-root user (UID 10001) alih-alih root; paket `ffmpeg` yang tidak terpakai dicabut.
+  - `alarm/requirements.txt`: `PyYAML` dipin ke versi exact (`==6.0.2`).
+
+### 🔧 Diubah (Changed)
+- `docker-compose.yml` menambahkan env var wajib `INFRAWATCH_API_KEY` dan `WEBHOOK_SECRET` (compose gagal start dengan pesan jelas jika belum diset).
+- `.env.example` baru sebagai template konfigurasi.
+- `README.md`: langkah instalasi memuat setup `.env` sebelum `docker compose up`.
+
+### 🧪 Pengujian (Testing)
+- `alarm/conftest.py` baru untuk menyuntik API key/webhook secret ke seluruh test suite sebelum modul `app` diimpor.
+- 135 test case terverifikasi 100% lolos pasca perubahan.
+
+### 👤 Kontributor (Contributor)
+- **dimi** ([@dimimayoalvin1205](https://github.com/dimimayoalvin1205) - `dimimayoalvin1205@gmail.com`) — Remediasi temuan security audit: autentikasi API, perbaikan SSRF, hardening Docker, dan git hygiene.
+
+---
+
 ## [3.2.0] - 2026-08-24
 
 ### 🚀 Ditambahkan (Added)

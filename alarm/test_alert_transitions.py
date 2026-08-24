@@ -13,6 +13,8 @@ try:
 except ImportError:
     from alarm import app as alarm_app
 
+from conftest import TEST_API_KEY, TEST_WEBHOOK_SECRET
+
 
 class ComputeStateTransitionsTests(unittest.TestCase):
     """Pure-function tests for the poller's transition detector — no network,
@@ -214,6 +216,7 @@ class HealthEndpointTests(unittest.TestCase):
 
     def setUp(self):
         self.client = alarm_app.app.test_client()
+        self.client.environ_base = {"HTTP_X_API_KEY": TEST_API_KEY, "HTTP_X_WEBHOOK_SECRET": TEST_WEBHOOK_SECRET}
 
     def test_health_reports_component_breakdown(self):
         resp = self.client.get('/health')
@@ -238,6 +241,7 @@ class MaintenanceApiTests(unittest.TestCase):
         self._orig_db_env = os.environ.get("INFRAWATCH_DB_PATH")
         os.environ["INFRAWATCH_DB_PATH"] = self.db_path
         self.client = alarm_app.app.test_client()
+        self.client.environ_base = {"HTTP_X_API_KEY": TEST_API_KEY, "HTTP_X_WEBHOOK_SECRET": TEST_WEBHOOK_SECRET}
 
     def tearDown(self):
         if self._orig_db_env is not None:
@@ -318,6 +322,7 @@ class DependencyApiTests(unittest.TestCase):
         self._orig_db_env = os.environ.get("INFRAWATCH_DB_PATH")
         os.environ["INFRAWATCH_DB_PATH"] = self.db_path
         self.client = alarm_app.app.test_client()
+        self.client.environ_base = {"HTTP_X_API_KEY": TEST_API_KEY, "HTTP_X_WEBHOOK_SECRET": TEST_WEBHOOK_SECRET}
 
     def tearDown(self):
         if self._orig_db_env is not None:

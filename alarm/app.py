@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, render_template
+﻿from flask import Flask, request, jsonify, render_template
 import json
 import time
 import os
@@ -10,6 +10,7 @@ import sys
 import uuid
 import ipaddress
 import logging
+import socket
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from urllib.request import urlopen, Request
@@ -56,6 +57,11 @@ except ImportError:
     from alarm.telegram_notifier import (
         dispatch_alert_async, get_telegram_config, save_telegram_config, test_telegram_connection
     )
+
+try:
+    from auth import API_KEY, require_api_key, require_webhook_secret
+except ImportError:
+    from alarm.auth import API_KEY, require_api_key, require_webhook_secret
 
 init_db()
 
@@ -254,6 +260,14 @@ PROMETHEUS_CANDIDATES = [
     "http://127.0.0.1:9090"
 ]
 
+def _is_blocked_ip(ip):
+    return (ip.is_link_local or
+            ip.is_multicast or
+            ip.is_reserved or
+            ip.is_loopback or
+            (isinstance(ip, ipaddress.IPv4Address) and str(ip).startswith('169.254.')) or
+            (isinstance(ip, ipaddress.IPv6Address) and (ip.is_site_local or ip.ipv4_mapped)))
+
 def is_safe_endpoint_url(url: str):
     try:
         parsed = urlparse(url.strip())
@@ -278,15 +292,27 @@ def is_safe_endpoint_url(url: str):
 
         try:
             ip = ipaddress.ip_address(hostname)
-            if (ip.is_link_local or
-                ip.is_multicast or
-                ip.is_reserved or
-                ip.is_loopback or
-                (isinstance(ip, ipaddress.IPv4Address) and str(ip).startswith('169.254.')) or
-                (isinstance(ip, ipaddress.IPv6Address) and (ip.is_site_local or ip.ipv4_mapped))):
+            if _is_blocked_ip(ip):
                 return False, "Endpoint URL is not allowed (restricted network)"
+            return True, ""
         except ValueError:
-            pass
+            pass  # hostname is a name, not a literal IP - resolve it below
+
+        # Hostname (not a literal IP): resolve and check every address it maps
+        # to, so a name pointed at a loopback/link-local/metadata IP (DNS
+        # rebinding, or just a misconfigured record) can't slip past the
+        # literal-IP checks above. A hostname that fails to resolve here is
+        # NOT rejected — it's likely a Docker Compose service name only
+        # resolvable from inside the compose network (e.g. added before that
+        # container exists), same as the pre-existing behavior for hostnames.
+        try:
+            addr_infos = socket.getaddrinfo(hostname, None)
+        except socket.gaierror:
+            return True, ""
+        for family, _, _, _, sockaddr in addr_infos:
+            ip = ipaddress.ip_address(sockaddr[0])
+            if _is_blocked_ip(ip):
+                return False, "Endpoint URL is not allowed (restricted network)"
 
         return True, ""
     except Exception as e:
@@ -333,9 +359,19 @@ DEFAULT_JOB_FILTER = os.environ.get("JOB_FILTER", "all")
 # are intentionally allowed — that's a real, valid target shape here.
 TARGET_HOST_RE = re.compile(r'^[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?)*$')
 
+# Cloud metadata endpoints are never a legitimate monitoring target (unlike
+# private/internal IPs, which this tool exists to monitor) — block them
+# outright rather than trying to enumerate "safe" internal ranges.
+_BLOCKED_TARGET_HOSTS = {
+    'metadata.google.internal', '169.254.169.254', '100.100.100.200',
+    'instance-data', 'fd00:ec2::254',
+}
+
 def is_valid_target(url):
     candidate = re.sub(r'^https?://', '', url.strip()).split('/')[0].split(':')[0]
     if not candidate:
+        return False
+    if candidate.lower() in _BLOCKED_TARGET_HOSTS or candidate.startswith('169.254.'):
         return False
     if re.match(r'^\d{1,3}(\.\d{1,3}){3}$', candidate):
         return True
@@ -649,7 +685,7 @@ def fetch_prometheus_json(path, use_cache=True, cache_ttl=None, timeout=None):
 
 @app.route('/')
 def index():
-    return render_template('alarm.html')
+    return render_template('alarm.html', api_key=API_KEY)
 
 # Set whenever /webhook receives a real Alertmanager delivery — the poller
 # fallback below checks this and backs off, since Alertmanager (when present)
@@ -850,6 +886,7 @@ def record_alert_event(name, severity, instance, summary, job, event_time, is_no
 
 # ── Webhook ───────────────────────────────────────────────────────────────────
 @app.route('/webhook', methods=['POST'])
+@require_webhook_secret
 def webhook():
     data     = request.json or {}
     if not isinstance(data, dict):
@@ -985,6 +1022,7 @@ def get_endpoints_api():
     return jsonify(resp_data)
 
 @app.route('/api/endpoints', methods=['POST'])
+@require_api_key
 def add_endpoint_api():
     global LAST_WORKING_PROMETHEUS_URL
     body = request.json or {}
@@ -1028,12 +1066,17 @@ def add_endpoint_api():
     return jsonify({"ok": True, "active": data["active"], "endpoints": data["endpoints"]})
 
 @app.route('/api/endpoints/select', methods=['POST'])
+@require_api_key
 def select_endpoint_api():
     global LAST_WORKING_PROMETHEUS_URL
     body = request.json or {}
     url = body.get('url', '').strip()
     if not url:
         return jsonify({"ok": False, "error": "Prometheus Endpoint URL is required"}), 400
+
+    is_safe, err_msg = is_safe_endpoint_url(url)
+    if not is_safe:
+        return jsonify({"ok": False, "error": err_msg or "Invalid endpoint URL"}), 400
 
     with _WEBHOOK_LOCK:
         try:
@@ -1057,6 +1100,7 @@ def select_endpoint_api():
     return jsonify({"ok": True, "active": url})
 
 @app.route('/api/endpoints', methods=['DELETE'])
+@require_api_key
 def delete_endpoint_api():
     global LAST_WORKING_PROMETHEUS_URL
     body = request.json or {}
@@ -1145,6 +1189,7 @@ def get_targets_api():
     return jsonify({"ok": True, "targets": load_website_targets()})
 
 @app.route('/api/targets', methods=['POST'])
+@require_api_key
 def add_target_api():
     data = request.json or {}
     url = data.get('url', '').strip()
@@ -1168,6 +1213,7 @@ def add_target_api():
     return jsonify({"ok": True, "targets": current})
 
 @app.route('/api/targets', methods=['DELETE'])
+@require_api_key
 def delete_target_api():
     data = request.json or {}
     url = data.get('url', '').strip()
@@ -1198,6 +1244,7 @@ def list_maintenance_api():
     return jsonify({"ok": True, "windows": windows})
 
 @app.route('/api/maintenance', methods=['POST'])
+@require_api_key
 def create_maintenance_api():
     data = request.json or {}
     target = (data.get('target') or '').strip()
@@ -1235,6 +1282,7 @@ def create_maintenance_api():
     return jsonify({"ok": True, "window": window})
 
 @app.route('/api/maintenance/<window_id>', methods=['DELETE'])
+@require_api_key
 def delete_maintenance_api(window_id):
     with _WEBHOOK_LOCK:
         deleted = False
@@ -1280,6 +1328,7 @@ def list_dependencies_api():
     return jsonify({"ok": True, "dependencies": load_dependencies()})
 
 @app.route('/api/dependencies', methods=['POST'])
+@require_api_key
 def create_dependency_api():
     data = request.json or {}
     child = (data.get('child') or '').strip()
@@ -1300,6 +1349,7 @@ def create_dependency_api():
     return jsonify({"ok": True, "dependency": dep})
 
 @app.route('/api/dependencies/<dep_id>', methods=['DELETE'])
+@require_api_key
 def delete_dependency_api(dep_id):
     with _WEBHOOK_LOCK:
         deleted = False
@@ -1332,6 +1382,7 @@ def get_telegram_api():
     })
 
 @app.route('/api/telegram', methods=['POST'])
+@require_api_key
 def save_telegram_api():
     data = request.json or {}
     updated = {}
@@ -1353,6 +1404,7 @@ def save_telegram_api():
     return jsonify({"ok": False, "error": "Failed to save configuration"}), 500
 
 @app.route('/api/telegram/test', methods=['POST'])
+@require_api_key
 def test_telegram_api():
     data = request.json or {}
     token = data.get("bot_token")

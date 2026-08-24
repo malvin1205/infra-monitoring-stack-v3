@@ -15,12 +15,14 @@ from storage import (
     DeletedTargetRepository
 )
 from fleet_availability import calculate_fleet_availability, summarize_entries
+from conftest import TEST_API_KEY, TEST_WEBHOOK_SECRET
 
 
 class SingleSourcePersistenceTests(unittest.TestCase):
     def setUp(self):
         app.config['TESTING'] = True
         self.client = app.test_client()
+        self.client.environ_base = {"HTTP_X_API_KEY": TEST_API_KEY, "HTTP_X_WEBHOOK_SECRET": TEST_WEBHOOK_SECRET}
         self.tmpdir = tempfile.mkdtemp()
         self.db_path = os.path.join(self.tmpdir, "test_infrawatch.db")
         init_db(self.db_path)
