@@ -82,6 +82,79 @@ def calculate_percentile(values: List[float], percentile: float) -> Optional[flo
     return round(float(d0 + d1), 2)
 
 
+def derive_bucket_inputs(
+    instances: List[str],
+    probe_results: Dict[str, Dict[str, Any]],
+    up_results: Dict[str, Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    """Classify each instance as a Blackbox probe target or a node/exporter
+    target, then merge every named Prometheus query result (avail/count/
+    first_ts/last_ts/incidents/live/...) from whichever of probe_results /
+    up_results matches that classification.
+
+    Used identically by both places in app.py that turn raw probe_success/up
+    query results into per-instance availability inputs — api_availability's
+    SQLite-materialize path and the background _aggregate_availability_cycle
+    — which duplicated this exact classification (including the
+    node/exporter name heuristic below) before it was extracted here.
+
+    probe_results / up_results: {metric_name: {instance: value}}, e.g.
+    {"avail": probe_avail_map, "count": probe_count_map, ...}. A metric only
+    needs to be present in whichever dict(s) actually queried it — a caller
+    that never queried e.g. "live" simply omits that key from both.
+    """
+    metric_names = set(probe_results) | set(up_results)
+    merged: Dict[str, Dict[str, Any]] = {name: {} for name in metric_names}
+    probe_avail = probe_results.get("avail", {})
+    probe_count = probe_results.get("count", {})
+    for inst in instances:
+        # A target is treated as node/exporter-style (falls back to the raw
+        # `up` metric) only by name, AND only when the probe_* series has no
+        # data for it at all — an explicit blackbox probe target named e.g.
+        # "node-exporter-proxy.internal" still resolves through probe_success
+        # first if that series actually has samples for it.
+        is_node_target = (
+            ("node" in inst.lower() or "exporter" in inst.lower())
+            and inst not in probe_avail
+            and inst not in probe_count
+        )
+        source = up_results if is_node_target else probe_results
+        for name in metric_names:
+            m = source.get(name, {})
+            if inst in m:
+                merged[name][inst] = m[inst]
+    return merged
+
+
+def estimate_instance_cadence(
+    instance: str,
+    count_map: Dict[str, Any],
+    first_ts_map: Dict[str, Any],
+    last_ts_map: Dict[str, Any],
+) -> Optional[float]:
+    """Observed per-instance scrape cadence (seconds/sample), from the span
+    between an instance's first and last sample over its sample count in a
+    query window. Returns None when there isn't enough data to estimate from
+    (fewer than 2 samples, or a zero/negative span) — callers fall back to a
+    different cadence source in that case.
+
+    Used identically by api_availability (applied directly, per-instance)
+    and _aggregate_availability_cycle (collected across instances into a
+    fleet median) — the estimation formula itself was duplicated in both
+    before this was extracted."""
+    rc = count_map.get(instance)
+    f_ts = float(first_ts_map.get(instance, 0))
+    l_ts = float(last_ts_map.get(instance, 0))
+    if rc and f_ts > 0 and l_ts > 0 and (l_ts - f_ts) > 0:
+        try:
+            c_num = float(rc)
+            if c_num >= 2:
+                return (l_ts - f_ts) / (c_num - 1)
+        except (ValueError, TypeError):
+            pass
+    return None
+
+
 def clip_hourly_bucket(bucket: Dict[str, Any], clip_start: float, clip_end: float) -> Optional[Dict[str, Any]]:
     """
     Proportionally clips an hourly or aggregated SQLite bucket to [clip_start, clip_end].

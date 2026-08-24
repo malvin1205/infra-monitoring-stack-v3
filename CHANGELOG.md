@@ -6,6 +6,39 @@ Format changelog ini mengacu pada standar [Keep a Changelog](https://keepachange
 
 ---
 
+## [3.5.0] - 2026-08-24
+
+### 🛡️ Hardening Keamanan Lanjutan (Security Hardening)
+- **API Key Tidak Lagi Terekspos ke Publik**:
+  - `GET /` tidak lagi merender API key ke `<meta>` tag HTML — sebelumnya setiap perangkat di LAN yang membuka wallboard otomatis mendapat kredensial mutasi penuh (`view-source`), membuat lapisan `require_api_key` tidak efektif.
+  - Operator kini diminta memasukkan API key sekali via prompt browser pada aksi mutasi pertama (`alarm.js`: `apiFetch()`); key disimpan di `localStorage` browser tersebut saja, dan dibersihkan otomatis kalau server menolaknya (401) sehingga request berikutnya meminta ulang.
+- **Perbaikan SSRF DNS Rebinding**:
+  - Endpoint Prometheus yang didaftarkan lewat `/api/endpoints` sebelumnya hanya divalidasi sekali saat registrasi — hostname yang di-rebind ke IP loopback/link-local/metadata setelahnya tetap dipercaya selamanya oleh poller & aggregator background.
+  - `_filter_safe_candidates()` baru me-revalidasi IP hasil resolve tiap kali endpoint akan di-poll (TTL-cache 20 detik), dijalankan di executor DNS terpisah (`_DNS_CHECK_EXECUTOR`, timeout 1 detik) agar resolusi lambat tidak menyumbat worker pool query utama.
+- **Rate Limiting**: limiter in-process ringan (fixed-window, tanpa Redis) — 20 request/60s untuk endpoint mutasi, 120 request/60s untuk endpoint query mahal (`/instances`, `/api/availability`, `/api/target-history`); mengembalikan `429` saat terlampaui.
+- **Webhook Secret Header-Only**: fallback `?secret=` di query string dihapus dari `require_webhook_secret` (rawan bocor lewat access log reverse-proxy/Referer) — hanya `X-Webhook-Secret` yang diterima.
+- **Proteksi Konfigurasi Telegram**: `GET /api/telegram` kini butuh `X-API-Key` — sebelumnya bot token (masked) dan chat ID bisa dibaca siapa saja di LAN tanpa autentikasi.
+- **Docker Hardening**: `docker-compose.yml` menambahkan `cap_drop: [ALL]`, `security_opt: [no-new-privileges:true]`, dan `read_only: true` + `tmpfs: [/tmp]` (bind mount `./alarm:/app` tetap writable untuk state aplikasi).
+
+### 🗄️ SQLite sebagai Single Source of Truth (Parsial)
+- Domain **endpoints, deleted-targets, maintenance windows, dan dependencies** kini sepenuhnya dibaca/ditulis lewat SQLite (`EndpointRepository`, `DeletedTargetRepository`, `MaintenanceRepository`, `DependencyRepository`) — sidecar JSON-nya (`endpoints.json`, `deleted_targets.json`, `maintenance.json`, `dependencies.json`) dan seluruh dual-write/merge-by-id yang menyertainya dihapus total.
+- `status.json`, `history.json`, dan `logs.json` **belum** dimigrasikan — domain ini menyentuh jalur alert paling kritis (webhook, poller, `record_alert_event`) sehingga sengaja ditunda sebagai pekerjaan terpisah demi menjaga risiko regresi tetap rendah.
+
+### ♻️ Deduplikasi & Pembersihan Kode
+- `derive_bucket_inputs()` dan `estimate_instance_cadence()` (baru, di `fleet_availability.py`) menyatukan pipeline probe→hourly-bucket yang sebelumnya diimplementasikan dua kali secara verbatim di `api_availability` (materialize path) dan `_aggregate_availability_cycle` (background aggregator).
+- `_derive_probe_readings()` (baru) menyatukan dua loop enrichment target (probe-discovered vs custom) di `build_canonical_monitoring_state`.
+- `PROMETHEUS_CANDIDATES` (daftar tebakan 4 URL fallback: `host.docker.internal`/`localhost`/`127.0.0.1`) dihapus — `/api/endpoints` sudah menyediakan cara eksplisit mendaftarkan endpoint, jadi menebak topologi deployment tidak diperlukan lagi.
+- `alarm/check_subjobs.py` dihapus (CLI standalone tanpa referensi di mana pun di repo).
+
+### 📚 Dokumentasi
+- `README.md`: memperjelas bahwa Prometheus, Blackbox Exporter, dan Alertmanager adalah dependency **eksternal** yang tidak dikelola `docker-compose.yml` repo ini — sebelumnya diagram arsitektur dan tabel Tech Stack menyiratkan ketiganya bagian dari stack yang sama, padahal `docker compose up -d` hanya menjalankan container `alarm`. Menambahkan bagian Prasyarat dan tabel endpoint API dengan penanda 🔒 untuk rute yang butuh API key.
+
+### 🧪 Pengujian (Testing)
+- `alarm/test_security_hardening.py` baru: cakupan regresi untuk kelima perbaikan keamanan di atas (API key tidak bocor, mutasi ditolak tanpa key, SSRF revalidation, rate limit 429, dll).
+- 158 test lolos (9 subtest) — diverifikasi 4x run berturut-turut via `pytest alarm -q`.
+
+---
+
 ## [3.4.0] - 2026-08-24
 
 ### 🚀 Provisioning Otomatis Kredensial (Automatic First-Run Provisioning)

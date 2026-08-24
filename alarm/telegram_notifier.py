@@ -151,50 +151,50 @@ def build_alert_message(
     duration_seconds: Optional[float] = None,
     latency_ms: Optional[float] = None,
 ) -> str:
-    """Build a rich, structured HTML message for Telegram."""
-    sev_upper = (severity or "critical").upper()
+    """Build a clean, structured HTML message for Telegram."""
     safe_instance = html.escape(str(instance or "-"))
-    safe_summary = html.escape(str(summary or "-"))
-    safe_job = html.escape(str(job or "-"))
+    safe_job = html.escape(str(job or "blackbox"))
     time_str = format_timestamp(event_time)
 
     if is_now_firing:
-        icon = "🚨" if sev_upper == "CRITICAL" else "⚠️"
-        status_label = "DOWN / UNREACHABLE"
-        msg_lines = [
-            f"{icon} <b>INFRAWATCH ALERT: {sev_upper}</b>",
-            "━━━━━━━━━━━━━━━━━━━━━━━━━",
-            f"🎯 <b>Target:</b> <code>{safe_instance}</code>",
-            f"🏷️ <b>Service / Job:</b> <code>{safe_job}</code>",
-            f"📊 <b>Status:</b> <b>{status_label}</b>",
-            f"🕒 <b>Waktu:</b> {time_str}",
-            f"📝 <b>Detail:</b> {safe_summary}",
+        table_lines = [
+            f"{'Target':<11}{safe_instance}",
+            f"{'Job':<11}{safe_job}",
+            f"{'Status':<11}UNREACHABLE",
         ]
         if latency_ms is not None:
-            msg_lines.append(f"⚡ <b>Latency:</b> {latency_ms} ms")
-        msg_lines.extend([
-            "━━━━━━━━━━━━━━━━━━━━━━━━━",
-            "⚠️ <i>Segera periksa ketersediaan host / service terkait!</i>"
-        ])
+            try:
+                table_lines.append(f"{'Latency':<11}{float(latency_ms):.1f} ms")
+            except (ValueError, TypeError):
+                table_lines.append(f"{'Latency':<11}{latency_ms} ms")
+        table_lines.append(f"{'Time':<11}{time_str}")
+        table_content = "\n".join(table_lines)
+
+        return (
+            "<b>🔴 InfraWatch — Service Down</b>\n\n"
+            f"<pre>{table_content}</pre>\n\n"
+            "Investigate host availability."
+        )
     else:
         duration_str = format_duration(duration_seconds)
-        msg_lines = [
-            "🟢 <b>INFRAWATCH RECOVERY: RESOLVED</b>",
-            "━━━━━━━━━━━━━━━━━━━━━━━━━",
-            f"🎯 <b>Target:</b> <code>{safe_instance}</code>",
-            f"🏷️ <b>Service / Job:</b> <code>{safe_job}</code>",
-            f"📊 <b>Status:</b> <b>NORMAL / OPERATIONAL</b>",
-            f"🕒 <b>Waktu Pulih:</b> {time_str}",
-            f"⏳ <b>Total Downtime:</b> <code>{duration_str}</code>",
+        table_lines = [
+            f"{'Target':<11}{safe_instance}",
+            f"{'Job':<11}{safe_job}",
+            f"{'Status':<11}OPERATIONAL",
+            f"{'Downtime':<11}{duration_str}",
         ]
         if latency_ms is not None:
-            msg_lines.append(f"⚡ <b>Latency:</b> {latency_ms} ms")
-        msg_lines.extend([
-            "━━━━━━━━━━━━━━━━━━━━━━━━━",
-            "✅ <i>Layanan telah kembali online dan beroperasi normal.</i>"
-        ])
+            try:
+                table_lines.append(f"{'Latency':<11}{float(latency_ms):.1f} ms")
+            except (ValueError, TypeError):
+                table_lines.append(f"{'Latency':<11}{latency_ms} ms")
+        table_lines.append(f"{'Time':<11}{time_str}")
+        table_content = "\n".join(table_lines)
 
-    return "\n".join(msg_lines)
+        return (
+            "<b>🟢 InfraWatch — Service Restored</b>\n\n"
+            f"<pre>{table_content}</pre>"
+        )
 
 
 def _async_send_worker(
@@ -276,13 +276,14 @@ def test_telegram_connection(bot_token: Optional[str] = None, chat_id: Optional[
         return False, "Chat ID belum diisi"
 
     now_str = format_timestamp(time.time())
+    table_lines = [
+        f"{'Status':<11}CONNECTED",
+        f"{'Time':<11}{now_str}",
+    ]
+    table_content = "\n".join(table_lines)
     text = (
-        "🤖 <b>INFRAWATCH MONITORING STACK v3.0</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "✅ <b>Uji Coba Notifikasi Telegram Berhasil!</b>\n"
-        f"🕒 <b>Waktu Uji:</b> {now_str}\n"
-        "📡 <b>Status:</b> Terhubung dengan Bot InfraWatch NOC.\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🚀 <i>Sistem siap mengirimkan alert saat service / server down!</i>"
+        "<b>🤖 InfraWatch — Test Notification</b>\n\n"
+        f"<pre>{table_content}</pre>\n\n"
+        "Telegram notification test successful."
     )
     return send_telegram_raw(token, cid, text, parse_mode="HTML")

@@ -2,6 +2,8 @@
 
 Sistem monitoring ketersediaan infrastruktur enterprise berbasis Docker yang memantau ketersediaan server, jaringan, dan website secara **real-time** dengan pengujian probe ultra-responsif (**v3.0**).
 
+> **Penting — cakupan repo ini**: repo ini berisi **InfraWatch** — backend Flask + dashboard NOC wallboard yang mengonsumsi Prometheus. Prometheus, Blackbox Exporter, dan Alertmanager **tidak** dikelola oleh `docker-compose.yml` di repo ini; ketiganya adalah dependency eksternal yang harus sudah berjalan dan bisa dijangkau dari container InfraWatch sebelum `docker compose up -d` dijalankan. Lihat [Prasyarat](#prasyarat-sebelum-menjalankan-infrawatch) di bawah.
+
 ---
 
 <img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/a79a7f51-4dbe-4b02-b68e-5b2a04212d24" />
@@ -43,37 +45,43 @@ Sistem monitoring ketersediaan infrastruktur enterprise berbasis Docker yang mem
 ## 🛠️ Arsitektur & Komponen Utama Sistem v3
 
 ```text
-Target Infrastructure (HTTP/HTTPS, ICMP Ping, Ports)
-       │
-       ▼
-Blackbox Exporter Probe Engine (v0.25.0)
-       │
-       ▼
-Prometheus Time-Series Engine (Scrape: 2s, Query Window: 5s)
-       │
-       ├──────────────────────────────────────────┐
-       ▼                                          ▼
-Synthetic Alert Poller (15s)          Alertmanager Webhook (Option)
-(Prometheus Probe Fallback)           (External Receiver /webhook)
-       │                                          │
-       └────────────────────┬─────────────────────┘
-                            ▼
-      InfraWatch Engine Backend (Python Flask - app.py)
-      ├── Single-Flight Query Lock (_FETCH_LOCKS)
-      ├── Failover Prometheus Pool (PROMETHEUS_CANDIDATES)
-      ├── Maintenance Window Suppression (/api/maintenance)
-      ├── Alert Correlation Engine (/api/dependencies)
-      ├── Fleet SLA & Availability Engine (fleet_availability.py)
-      └── Thread-Safe State Retention (_WEBHOOK_LOCK)
-                            │
-                            ▼
-      InfraWatch TV Wallboard Console (http://localhost:5000)
-      ├── Audio Consent Splash Overlay & Autoplay Permission
-      ├── High-Contrast Visual Beacon (Healthy / Critical)
-      ├── Live Response Time (ms) & HTTP Status Code
-      ├── 1-Click Acknowledge Alarm & Audio Mute
-      └── CSV Incident Report Exporter
+┌─ EKSTERNAL — dikelola & di-deploy TERPISAH, bukan oleh docker-compose.yml repo ini ─┐
+│                                                                                      │
+│  Target Infrastructure (HTTP/HTTPS, ICMP Ping, Ports)                               │
+│         │                                                                           │
+│         ▼                                                                           │
+│  Blackbox Exporter Probe Engine                                                     │
+│         │                                                                           │
+│         ▼                                                                           │
+│  Prometheus Time-Series Engine (Scrape: 2s, Query Window: 5s)                       │
+│         │                                                                           │
+│         ├──────────────────────────────────────────┐                               │
+│         ▼                                          ▼                               │
+│  Synthetic Alert Poller (15s, di dalam InfraWatch)  Alertmanager Webhook (opsional)  │
+└─────────┼──────────────────────────────────────────┼───────────────────────────────┘
+          │                                          │
+          └────────────────────┬─────────────────────┘
+                                ▼
+┌─ INFRAWATCH — repo ini, di-deploy oleh docker-compose.yml ──────────────────────────┐
+│                                                                                      │
+│      InfraWatch Engine Backend (Python Flask - app.py)                              │
+│      ├── Single-Flight Query Lock (_FETCH_LOCKS)                                    │
+│      ├── Failover Prometheus Pool (endpoint terdaftar via /api/endpoints)            │
+│      ├── Maintenance Window Suppression (/api/maintenance)                          │
+│      ├── Alert Correlation Engine (/api/dependencies)                               │
+│      ├── Fleet SLA & Availability Engine (fleet_availability.py)                    │
+│      └── Thread-Safe State Retention (_WEBHOOK_LOCK)                                │
+│                                ▼                                                     │
+│      InfraWatch TV Wallboard Console (http://localhost:5000)                        │
+│      ├── Audio Consent Splash Overlay & Autoplay Permission                         │
+│      ├── High-Contrast Visual Beacon (Healthy / Critical)                           │
+│      ├── Live Response Time (ms) & HTTP Status Code                                 │
+│      ├── 1-Click Acknowledge Alarm & Audio Mute                                     │
+│      └── CSV Incident Report Exporter                                               │
+└──────────────────────────────────────────────────────────────────────────────────────┘
 ```
+
+`docker compose up -d` di repo ini **hanya** menjalankan container InfraWatch. Prometheus/Blackbox Exporter/Alertmanager harus sudah reachable dari container tersebut lewat `PROMETHEUS_URL` (lihat [Prasyarat](#prasyarat-sebelum-menjalankan-infrawatch)).
 
 ---
 
@@ -107,7 +115,7 @@ Sistem mengkalkulasi 4 jenis metrik ketersediaan secara matematis dari data Prom
 - **Target History Sparkline (`/api/target-history`)**: Menampilkan grafik tren latensi dan blok durasi status ONLINE/OFFLINE target dari waktu ke waktu.
 
 ### 6. ⚡ Prometheus High-Availability Pool & Query Optimizer
-- **Failover Prometheus Endpoint (`/api/endpoints`)**: Backend menyimpan daftar kandidat URL Prometheus (`PROMETHEUS_CANDIDATES`). Jika endpoint utama offline, backend otomatis melakukan failover ke endpoint cadangan secara transparan.
+- **Failover Prometheus Endpoint (`/api/endpoints`)**: Operator mendaftarkan satu atau lebih URL Prometheus secara eksplisit lewat API/UI ini. Jika endpoint aktif offline, backend otomatis melakukan failover ke endpoint terdaftar lain secara transparan; setiap kandidat (termasuk `PROMETHEUS_URL` default) divalidasi ulang tepat sebelum dipakai untuk menutup celah DNS rebinding.
 - **Single-Flight Lock (`_FETCH_LOCKS`)**: Mencegah query Prometheus berulang saat banyak layar TV / pengguna mengakses dashboard bersamaan (*thundering herd protection*).
 - **Backend Query Caching (`PROMETHEUS_CACHE`)**: Caching hasil query PromQL dengan mekanisme auto-pruning berkala (`_maybe_prune_cache`).
 
@@ -140,33 +148,50 @@ Sistem mengkalkulasi 4 jenis metrik ketersediaan secara matematis dari data Prom
 | `/instances` | `GET` | Mengambil data live target, health status, response time (ms), HTTP code, & maintenance |
 | `/api/availability` | `GET` | Perhitungan matematis 4 metrik SLA Availability & analisis stabilitas target |
 | `/api/target-history` | `GET` | Riwayat timeline status & titik latensi sparkline untuk target tertentu |
-| `/api/targets` | `GET / POST / DELETE` | CRUD manajemen target secara dinamis (sinkronisasi ke `targets/websites.yml`) |
-| `/api/maintenance` | `GET / POST` | Menampilkan dan membuat jadwal Maintenance Window baru |
-| `/api/maintenance/<id>` | `DELETE` | Menghapus jadwal Maintenance Window |
-| `/api/dependencies` | `GET / POST` | Menampilkan dan membuat hirarki ketergantungan Parent-Child |
-| `/api/dependencies/<id>` | `DELETE` | Menghapus hirarki ketergantungan |
-| `/api/endpoints` | `GET / POST / DELETE` | Manajemen & failover kandidat endpoint Prometheus |
-| `/api/endpoints/select` | `POST` | Memilih endpoint Prometheus aktif secara manual |
-| `/api/telegram` | `GET / POST` | Membaca status (masked token) dan memperbarui konfigurasi notifikasi Telegram |
-| `/api/telegram/test` | `POST` | Mengirim pesan uji koneksi ke Bot & Chat ID Telegram |
+| `/api/targets` | `GET` / `POST` 🔒 `DELETE` 🔒 | CRUD manajemen target secara dinamis (sinkronisasi ke `targets/websites.yml`) |
+| `/api/maintenance` | `GET` / `POST` 🔒 | Menampilkan dan membuat jadwal Maintenance Window baru |
+| `/api/maintenance/<id>` | `DELETE` 🔒 | Menghapus jadwal Maintenance Window |
+| `/api/dependencies` | `GET` / `POST` 🔒 | Menampilkan dan membuat hirarki ketergantungan Parent-Child |
+| `/api/dependencies/<id>` | `DELETE` 🔒 | Menghapus hirarki ketergantungan |
+| `/api/endpoints` | `GET` / `POST` 🔒 `DELETE` 🔒 | Manajemen & failover kandidat endpoint Prometheus |
+| `/api/endpoints/select` | `POST` 🔒 | Memilih endpoint Prometheus aktif secara manual |
+| `/api/telegram` | `GET` 🔒 / `POST` 🔒 | Membaca status (masked token) dan memperbarui konfigurasi notifikasi Telegram |
+| `/api/telegram/test` | `POST` 🔒 | Mengirim pesan uji koneksi ke Bot & Chat ID Telegram |
 | `/status` | `GET` | Mengambil data status global (`NORMAL`, `WARNING`, `CRITICAL`) & active alerts |
 | `/logs` | `GET` | Mengambil log kejadian insiden terkini (limit hingga 200 log) |
 | `/history` | `GET` | Mengambil riwayat insiden berdurasi lengkap |
 | `/webhook` | `POST` | Receiver webhook resmi dari Alertmanager |
 | `/health` | `GET` | Self-health diagnostics 4 komponen internal InfraWatch |
 
+🔒 = butuh header `X-API-Key` (lihat Zero Manual Key Setup di atas). Rute lain bisa diakses tanpa key — dashboard viewer tidak pernah butuh kredensial.
+
 
 ---
 
 # Tech Stack
 
-| Komponen | Versi | Deskripsi |
+| Komponen | Dikelola oleh | Deskripsi |
 | --- | --- | --- |
-| Docker Compose | v2.x | Container Orchestration Engine |
-| InfraWatch Console | v3.0 | Dashboard NOC TV Display, SLA Engine, Maintenance & Correlation Manager (Python/Flask) |
-| Prometheus | v2.54.1 | Time-series metrics collection & rule evaluation engine (5s evaluation) |
-| Alertmanager | v0.27.0 | Routing & webhook notification engine |
-| Blackbox Exporter | v0.25.0 | Dynamic HTTP/HTTPS & ICMP Ping availability probe |
+| Docker Compose | — | Container Orchestration Engine |
+| InfraWatch Console | **repo ini** (`docker-compose.yml`) | Dashboard NOC TV Display, SLA Engine, Maintenance & Correlation Manager (Python/Flask) |
+| Prometheus | **eksternal** — deploy terpisah | Time-series metrics collection & rule evaluation engine; harus reachable dari container InfraWatch via `PROMETHEUS_URL` |
+| Alertmanager | **eksternal** (opsional) — deploy terpisah | Routing & webhook notification engine; jika tidak ada, Synthetic Alert Poller InfraWatch mengambil alih |
+| Blackbox Exporter | **eksternal** — deploy terpisah | Dynamic HTTP/HTTPS & ICMP Ping availability probe, di-scrape oleh Prometheus |
+
+InfraWatch sendiri tidak menspesifikasikan versi Prometheus/Blackbox Exporter/Alertmanager tertentu — pakai versi apa pun yang sudah berjalan di infrastruktur Anda, selama Prometheus mengekspos `probe_success`/`probe_duration_seconds`/`probe_http_status_code` dari job Blackbox seperti biasa.
+
+---
+
+# Prasyarat Sebelum Menjalankan InfraWatch
+
+Sebelum `docker compose up -d` di repo ini:
+
+1. **Prometheus sudah berjalan dan reachable** dari container InfraWatch (baik sebagai container lain di Docker network yang sama, service terpisah, atau instance di host/jaringan lain).
+2. **Blackbox Exporter dikonfigurasi sebagai scrape target Prometheus** (di luar repo ini), dengan job blackbox probe yang menghasilkan metrik `probe_success`, `probe_duration_seconds`, `probe_http_status_code`.
+3. Set `PROMETHEUS_URL` (via `.env`, lihat `.env.example`) ke URL Prometheus tersebut — default `http://prometheus:9090` mengasumsikan sebuah service bernama `prometheus` ada di Docker network yang sama, yang **tidak** disediakan oleh `docker-compose.yml` repo ini.
+4. (Opsional) Alertmanager, jika ada, arahkan webhook receiver-nya ke `http://<host-infrawatch>:5000/webhook` dengan header `X-Webhook-Secret`. Tanpa Alertmanager, InfraWatch tetap berfungsi penuh lewat Synthetic Alert Poller bawaannya.
+
+Setelah container InfraWatch jalan, cek `GET /health` — field `prometheus.ok` memberi tahu langsung apakah Prometheus berhasil dijangkau atau belum, tanpa perlu menebak dari dashboard.
 
 ---
 
@@ -210,10 +235,11 @@ docker compose up -d
 > **Zero Manual Key Setup**:
 > Pada startup pertama, InfraWatch secara otomatis men-generate kredensial 64-karakter hex yang aman (`secrets.token_hex(32)`) dan menyimpannya ke `alarm/.api_key` serta `alarm/.webhook_secret`. Anda **tidak perlu menginstal OpenSSL** atau membuat API key secara manual.
 >
-> - **Otomatis di Dashboard**: Dashboard web secara otomatis memuat API key untuk request mutasi (`POST`/`DELETE` di `/api/*`).
+> - **Dashboard tetap read-only tanpa key**: Melihat wallboard (`/`, `/instances`, `/api/availability`, dst) tidak pernah butuh API key — key **tidak** dikirim ke browser secara otomatis, sehingga siapa pun yang bisa membuka wallboard di LAN tidak otomatis mendapat kredensial mutasi.
+> - **Operator diminta key saat pertama kali mutasi**: Begitu operator melakukan aksi yang mengubah state (tambah/hapus target, buat maintenance window, ganti endpoint Prometheus, ubah config Telegram), browser akan menampilkan prompt untuk memasukkan API key. Key tersebut lalu disimpan di `localStorage` browser itu saja — tidak dikirim ke viewer lain.
 > - **Melihat Kredensial**: Jalankan `cat alarm/.api_key` atau `cat alarm/.webhook_secret`.
 > - **Override Kustom (Opsional)**: Jika ingin menggunakan key khusus, salin `.env.example` ke `.env` dan tentukan `INFRAWATCH_API_KEY` atau `WEBHOOK_SECRET`.
-> - **Rotasi Key**: Hapus file `alarm/.api_key` dan restart service untuk men-generate key baru.
+> - **Rotasi Key**: Hapus file `alarm/.api_key` dan restart service untuk men-generate key baru — operator akan diminta memasukkan key baru pada mutasi berikutnya (browser lama akan mendapat 401 dan otomatis diminta ulang).
 
 Verifikasi status container:
 

@@ -31,6 +31,23 @@ services:
         limits:
           cpus: '1.50'
           memory: 1024M
+    # Hardening: no Linux capabilities beyond the default-dropped set are
+    # needed (the app binds an unprivileged port and does no raw sockets/
+    # network admin), and no-new-privileges blocks setuid/setgid escalation.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # read_only pins the image's own filesystem layer read-only; it does NOT
+    # affect the two bind mounts above (./alarm:/app, ./alarm/targets), which
+    # is exactly what's needed here — the app's actual writes (status.json,
+    # infrawatch.db + WAL, .api_key/.webhook_secret, targets/websites.yml,
+    # …) all land inside /app, already writable via that bind mount. /tmp is
+    # given a small tmpfs since gunicorn/Python may still want a writable
+    # scratch dir there even though the app itself never uses it directly.
+    read_only: true
+    tmpfs:
+      - /tmp
 
 
 

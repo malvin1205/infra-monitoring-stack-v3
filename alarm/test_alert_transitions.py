@@ -153,18 +153,26 @@ class MaintenanceModeTests(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
         self._orig = (alarm_app.STATUS_FILE, alarm_app.HISTORY_FILE,
-                      alarm_app.HISTORY_ARCHIVE_FILE, alarm_app.LOGS_FILE,
-                      alarm_app.MAINTENANCE_FILE)
+                      alarm_app.HISTORY_ARCHIVE_FILE, alarm_app.LOGS_FILE)
         alarm_app.STATUS_FILE = os.path.join(self.tmpdir, "status.json")
         alarm_app.HISTORY_FILE = os.path.join(self.tmpdir, "history.json")
         alarm_app.HISTORY_ARCHIVE_FILE = os.path.join(self.tmpdir, "history_archive.json")
         alarm_app.LOGS_FILE = os.path.join(self.tmpdir, "logs.json")
-        alarm_app.MAINTENANCE_FILE = os.path.join(self.tmpdir, "maintenance.json")
+        # get_active_maintenance()/record_alert_event() read maintenance
+        # windows from SQLite (MaintenanceRepository) — isolate it too.
+        self.db_path = os.path.join(self.tmpdir, "test.db")
+        from storage import init_db
+        init_db(self.db_path)
+        self._orig_db_env = os.environ.get("INFRAWATCH_DB_PATH")
+        os.environ["INFRAWATCH_DB_PATH"] = self.db_path
 
     def tearDown(self):
         (alarm_app.STATUS_FILE, alarm_app.HISTORY_FILE,
-         alarm_app.HISTORY_ARCHIVE_FILE, alarm_app.LOGS_FILE,
-         alarm_app.MAINTENANCE_FILE) = self._orig
+         alarm_app.HISTORY_ARCHIVE_FILE, alarm_app.LOGS_FILE) = self._orig
+        if self._orig_db_env is not None:
+            os.environ["INFRAWATCH_DB_PATH"] = self._orig_db_env
+        else:
+            os.environ.pop("INFRAWATCH_DB_PATH", None)
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def test_instance_scope_matches_only_that_instance(self):
@@ -185,10 +193,9 @@ class MaintenanceModeTests(unittest.TestCase):
         self.assertIsNone(alarm_app.get_active_maintenance("10.0.0.5", "blackbox", windows=windows))
 
     def test_firing_during_maintenance_leaves_no_trace(self):
+        from storage import MaintenanceRepository
         now = time.time()
-        alarm_app.save_json(alarm_app.MAINTENANCE_FILE, [
-            {"scope": "instance", "target": "10.0.0.5", "start": now - 60, "end": now + 60}
-        ])
+        MaintenanceRepository.create_window(scope="instance", target="10.0.0.5", reason="", start=now - 60, end=now + 60)
         ok = alarm_app.record_alert_event(
             name="TargetDown", severity="critical", instance="10.0.0.5",
             summary="down for maintenance", job="blackbox", event_time=now, is_now_firing=True)
@@ -199,10 +206,9 @@ class MaintenanceModeTests(unittest.TestCase):
         self.assertEqual(status.get("status", "NORMAL"), "NORMAL")
 
     def test_firing_resumes_normally_once_window_ends(self):
+        from storage import MaintenanceRepository
         past = time.time() - 3600
-        alarm_app.save_json(alarm_app.MAINTENANCE_FILE, [
-            {"scope": "instance", "target": "10.0.0.5", "start": past - 60, "end": past}
-        ])
+        MaintenanceRepository.create_window(scope="instance", target="10.0.0.5", reason="", start=past - 60, end=past)
         ok = alarm_app.record_alert_event(
             name="TargetDown", severity="critical", instance="10.0.0.5",
             summary="down", job="blackbox", event_time=time.time(), is_now_firing=True)
@@ -233,8 +239,6 @@ class MaintenanceApiTests(unittest.TestCase):
 
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
-        self._orig = alarm_app.MAINTENANCE_FILE
-        alarm_app.MAINTENANCE_FILE = os.path.join(self.tmpdir, "maintenance.json")
         self.db_path = os.path.join(self.tmpdir, "test.db")
         from storage import init_db
         init_db(self.db_path)
@@ -248,7 +252,6 @@ class MaintenanceApiTests(unittest.TestCase):
             os.environ["INFRAWATCH_DB_PATH"] = self._orig_db_env
         else:
             os.environ.pop("INFRAWATCH_DB_PATH", None)
-        alarm_app.MAINTENANCE_FILE = self._orig
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def test_create_list_delete_roundtrip(self):
@@ -314,8 +317,6 @@ class DependencyApiTests(unittest.TestCase):
 
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
-        self._orig = alarm_app.DEPENDENCIES_FILE
-        alarm_app.DEPENDENCIES_FILE = os.path.join(self.tmpdir, "dependencies.json")
         self.db_path = os.path.join(self.tmpdir, "test.db")
         from storage import init_db
         init_db(self.db_path)
@@ -329,7 +330,6 @@ class DependencyApiTests(unittest.TestCase):
             os.environ["INFRAWATCH_DB_PATH"] = self._orig_db_env
         else:
             os.environ.pop("INFRAWATCH_DB_PATH", None)
-        alarm_app.DEPENDENCIES_FILE = self._orig
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def test_create_list_delete_roundtrip(self):

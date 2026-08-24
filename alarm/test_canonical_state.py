@@ -21,18 +21,12 @@ class CanonicalMonitoringStateTests(unittest.TestCase):
             alarm_app.STATUS_FILE,
             alarm_app.HISTORY_FILE,
             alarm_app.HISTORY_ARCHIVE_FILE,
-            alarm_app.LOGS_FILE,
-            alarm_app.MAINTENANCE_FILE,
-            alarm_app.DEPENDENCIES_FILE,
-            alarm_app.DELETED_TARGETS_FILE
+            alarm_app.LOGS_FILE
         )
         alarm_app.STATUS_FILE = os.path.join(self.tmpdir, "status.json")
         alarm_app.HISTORY_FILE = os.path.join(self.tmpdir, "history.json")
         alarm_app.HISTORY_ARCHIVE_FILE = os.path.join(self.tmpdir, "history_archive.json")
         alarm_app.LOGS_FILE = os.path.join(self.tmpdir, "logs.json")
-        alarm_app.MAINTENANCE_FILE = os.path.join(self.tmpdir, "maintenance.json")
-        alarm_app.DEPENDENCIES_FILE = os.path.join(self.tmpdir, "dependencies.json")
-        alarm_app.DELETED_TARGETS_FILE = os.path.join(self.tmpdir, "deleted_targets.json")
         self.db_path = os.path.join(self.tmpdir, "test_infrawatch.db")
         from storage import init_db
         init_db(self.db_path)
@@ -48,10 +42,7 @@ class CanonicalMonitoringStateTests(unittest.TestCase):
             alarm_app.STATUS_FILE,
             alarm_app.HISTORY_FILE,
             alarm_app.HISTORY_ARCHIVE_FILE,
-            alarm_app.LOGS_FILE,
-            alarm_app.MAINTENANCE_FILE,
-            alarm_app.DEPENDENCIES_FILE,
-            alarm_app.DELETED_TARGETS_FILE
+            alarm_app.LOGS_FILE
         ) = self._orig
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
@@ -192,16 +183,11 @@ class CanonicalMonitoringStateTests(unittest.TestCase):
         }
         now = time.time()
         # Create active maintenance window
-        save_json(alarm_app.MAINTENANCE_FILE, [{
-            "id": "m1",
-            "scope_type": "instance",
-            "scope_target": "maint-host",
-            "start": "2026-08-20T00:00:00Z",
-            "end": "2026-08-30T00:00:00Z",
-            "start_epoch": now - 3600,
-            "end_epoch": now + 3600,
-            "reason": "Scheduled kernel upgrade"
-        }])
+        from storage import MaintenanceRepository
+        MaintenanceRepository.create_window(
+            scope="instance", target="maint-host", reason="Scheduled kernel upgrade",
+            start=now - 3600, end=now + 3600
+        )
 
         with patch.object(alarm_app, 'fetch_prometheus_json', return_value=(raw_targets, 'http://prom:9090')), \
              patch.object(alarm_app, 'fetch_all_probe_metrics', return_value=({"maint-host": "0"}, {}, {})), \
@@ -231,11 +217,8 @@ class CanonicalMonitoringStateTests(unittest.TestCase):
                 ]
             }
         }
-        save_json(alarm_app.DEPENDENCIES_FILE, [{
-            "id": "dep-1",
-            "parent": "router-core",
-            "child": "switch-leaf"
-        }])
+        from storage import DependencyRepository
+        DependencyRepository.create_dependency(parent="router-core", child="switch-leaf")
 
         with patch.object(alarm_app, 'fetch_prometheus_json', return_value=(raw_targets, 'http://prom:9090')), \
              patch.object(alarm_app, 'fetch_all_probe_metrics', return_value=({"router-core": "0", "switch-leaf": "0"}, {}, {})), \

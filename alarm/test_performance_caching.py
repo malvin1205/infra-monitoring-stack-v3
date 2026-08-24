@@ -22,14 +22,8 @@ class PerformanceCachingTests(unittest.TestCase):
         self.client = app.test_client()
         self.client.environ_base = {"HTTP_X_API_KEY": TEST_API_KEY, "HTTP_X_WEBHOOK_SECRET": TEST_WEBHOOK_SECRET}
         self.tmpdir = tempfile.mkdtemp()
-        self._orig = (
-            alarm_app.STATUS_FILE, alarm_app.MAINTENANCE_FILE,
-            alarm_app.DEPENDENCIES_FILE, alarm_app.DELETED_TARGETS_FILE
-        )
+        self._orig = (alarm_app.STATUS_FILE,)
         alarm_app.STATUS_FILE = os.path.join(self.tmpdir, "status.json")
-        alarm_app.MAINTENANCE_FILE = os.path.join(self.tmpdir, "maintenance.json")
-        alarm_app.DEPENDENCIES_FILE = os.path.join(self.tmpdir, "dependencies.json")
-        alarm_app.DELETED_TARGETS_FILE = os.path.join(self.tmpdir, "deleted_targets.json")
         self.db_path = os.path.join(self.tmpdir, "test_infrawatch.db")
         self._orig_db_env = os.environ.get("INFRAWATCH_DB_PATH")
         os.environ["INFRAWATCH_DB_PATH"] = self.db_path
@@ -41,16 +35,19 @@ class PerformanceCachingTests(unittest.TestCase):
         with _FAILED_CANDIDATES_LOCK:
             _FAILED_CANDIDATES.clear()
         alarm_app.clear_availability_cache(clear_db=True)
+        # _ENDPOINTS_CACHE is a short-TTL (2s) process-global cache — an
+        # adjacent test file's still-warm entry (pointing at its own
+        # already-torn-down tmp DB state) can otherwise leak into this test's
+        # avail_cache_key derivation (api_availability keys its cache on
+        # active_url) within that window.
+        alarm_app._ENDPOINTS_CACHE["data"] = None
 
     def tearDown(self):
         if self._orig_db_env is not None:
             os.environ["INFRAWATCH_DB_PATH"] = self._orig_db_env
         else:
             os.environ.pop("INFRAWATCH_DB_PATH", None)
-        (
-            alarm_app.STATUS_FILE, alarm_app.MAINTENANCE_FILE,
-            alarm_app.DEPENDENCIES_FILE, alarm_app.DELETED_TARGETS_FILE
-        ) = self._orig
+        (alarm_app.STATUS_FILE,) = self._orig
         shutil.rmtree(self.tmpdir, ignore_errors=True)
         with PROMETHEUS_CACHE_LOCK:
             PROMETHEUS_CACHE.clear()
@@ -125,8 +122,7 @@ class PerformanceCachingTests(unittest.TestCase):
              patch('app.load_endpoints', return_value={
                  "active": "http://dead-prom-1:9090",
                  "endpoints": ["http://dead-prom-1:9090", "http://backup-prom:9090"]
-             }), \
-             patch.object(alarm_app, 'PROMETHEUS_CANDIDATES', ["http://dead-prom-2:9090"]):
+             }):
 
             # Query 1: Discovers backup-prom
             data1, base1 = fetch_prometheus_json('/api/v1/targets', use_cache=False)
@@ -201,9 +197,17 @@ class PerformanceCachingTests(unittest.TestCase):
                 return {'srv-cache-1': '1'}
             return {'srv-cache-1': '99.9'}
 
+        # The route's in-memory cache key buckets live requests by
+        # int(time.time() // 15) * 15 (see avail_cache_key in app.py). Two
+        # back-to-back calls landing in different 15s buckets — entirely
+        # possible under load, since nothing else here controls wall-clock
+        # timing — would each recompute independently and could legitimately
+        # disagree, which isn't what this test means to exercise (a genuine
+        # cache *hit*). Freeze time so both calls fall in the same bucket.
         with patch.object(alarm_app, 'get_monitored_instances', return_value=['srv-cache-1']), \
              patch.object(alarm_app, 'load_json', return_value=[]), \
-             patch.object(alarm_app, 'fetch_prom_query_map', side_effect=fake_query_map):
+             patch.object(alarm_app, 'fetch_prom_query_map', side_effect=fake_query_map), \
+             patch('app.time.time', return_value=time.time()):
 
             # Call 1: Cache miss -> queries Prometheus
             res1 = self.client.get('/api/availability?minutes=1440')

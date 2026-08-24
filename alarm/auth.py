@@ -184,7 +184,10 @@ def require_webhook_secret(f):
         current_secret = get_webhook_secret()
         if not current_secret:
             return jsonify({"ok": False, "error": "Server auth not configured (WEBHOOK_SECRET unset)"}), 500
-        provided = request.headers.get("X-Webhook-Secret") or request.args.get("secret", "")
+        # Header only — a query-string fallback (?secret=...) is prone to
+        # leaking via reverse-proxy access logs, browser/proxy history, and
+        # Referer headers, none of which a header is exposed to.
+        provided = request.headers.get("X-Webhook-Secret") or ""
         if not provided or not hmac.compare_digest(provided, current_secret):
             return jsonify({"ok": False, "error": "Unauthorized"}), 401
         return f(*args, **kwargs)

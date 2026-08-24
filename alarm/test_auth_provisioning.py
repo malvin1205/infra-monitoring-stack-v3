@@ -211,7 +211,7 @@ class TestAuthProvisioning(unittest.TestCase):
         self.assertEqual(secret1, secret2)
 
     def test_webhook_secret_authentication(self):
-        """10. Webhook secret validation with query parameter and header."""
+        """10. Webhook secret validation: header-only (query-string fallback removed)."""
         import app as alarm_app
         client = alarm_app.app.test_client()
 
@@ -229,19 +229,21 @@ class TestAuthProvisioning(unittest.TestCase):
         res_missing = client.post("/webhook", json=sample_alertmanager_payload)
         self.assertEqual(res_missing.status_code, 401)
 
-        # Invalid secret -> 401
+        # Invalid secret via header -> 401
         res_invalid = client.post(
-            "/webhook?secret=wrong",
+            "/webhook",
+            headers={"X-Webhook-Secret": "wrong"},
             json=sample_alertmanager_payload
         )
         self.assertEqual(res_invalid.status_code, 401)
 
-        # Valid secret via query param -> 200
+        # Valid secret via query param is REJECTED — query-string fallback was
+        # removed (prone to leaking via proxy access logs / Referer headers).
         res_query = client.post(
             f"/webhook?secret={generated_secret}",
             json=sample_alertmanager_payload
         )
-        self.assertEqual(res_query.status_code, 200)
+        self.assertEqual(res_query.status_code, 401)
 
         # Valid secret via X-Webhook-Secret header -> 200
         res_header = client.post(

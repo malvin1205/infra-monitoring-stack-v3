@@ -13,6 +13,7 @@ import logging
 import socket
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from functools import wraps
 from urllib.request import urlopen, Request
 from urllib.error import URLError
 from urllib.parse import urlparse, quote
@@ -28,12 +29,14 @@ sys.path.insert(0, os.path.dirname(__file__))
 try:
     from fleet_availability import (
         summarize_entries, reconstruct_time_series_intervals, calculate_percentile,
-        clip_hourly_bucket, merge_hybrid_target_availability, merge_hybrid_fleet_availability
+        clip_hourly_bucket, merge_hybrid_target_availability, merge_hybrid_fleet_availability,
+        derive_bucket_inputs, estimate_instance_cadence
     )
 except ImportError:
     from alarm.fleet_availability import (
         summarize_entries, reconstruct_time_series_intervals, calculate_percentile,
-        clip_hourly_bucket, merge_hybrid_target_availability, merge_hybrid_fleet_availability
+        clip_hourly_bucket, merge_hybrid_target_availability, merge_hybrid_fleet_availability,
+        derive_bucket_inputs, estimate_instance_cadence
     )
 
 try:
@@ -157,31 +160,13 @@ STATUS_FILE  = os.path.join(os.path.dirname(__file__), "status.json")
 HISTORY_FILE = os.path.join(os.path.dirname(__file__), "history.json")
 HISTORY_ARCHIVE_FILE = os.path.join(os.path.dirname(__file__), "history_archive.json")
 LOGS_FILE    = os.path.join(os.path.dirname(__file__), "logs.json")
-DELETED_TARGETS_FILE = os.path.join(os.path.dirname(__file__), "deleted_targets.json")
-ENDPOINTS_FILE = os.path.join(os.path.dirname(__file__), "endpoints.json")
-MAINTENANCE_FILE = os.path.join(os.path.dirname(__file__), "maintenance.json")
 
-# dependencies.json — kept as its own sidecar file rather than folded into
-# "target configuration". Audited (Phase 12 revision) whether that's still
-# the least-intrusive option; it is, for two concrete reasons:
-#   1. Most targets aren't owned by this app at all — they're discovered
-#      live from Prometheus's own scrape config (job=blackbox-ping-internal,
-#      fetched via /api/v1/targets from the remote Prometheus at
-#      PROMETHEUS_URL). There is no file in this repo to attach a
-#      dependsOn field to for those hosts.
-#   2. The one target file this app *does* own, targets/websites.yml (see
-#      load_website_targets/save_website_targets above), isn't an app config
-#      object — it's a Prometheus file_sd YAML snippet, parsed with a
-#      regex into a flat list of URL strings and written back the same way.
-#      Adding relational metadata there would either break Prometheus's
-#      ingestion of that file or require a parallel structure anyway,
-#      and would still miss the Prometheus-native hosts from point 1.
-# A tiny sidecar JSON (load_json/save_json, identical shape to
-# maintenance.json) is therefore the smallest change that covers every
-# target regardless of where it came from, and keeps "which host depends
-# on which" — a purely operator-editable, independently-changing piece of
-# state — decoupled from target add/remove lifecycle.
-DEPENDENCIES_FILE = os.path.join(os.path.dirname(__file__), "dependencies.json")
+# Dependencies ("which host depends on which", see DependencyRepository /
+# load_dependencies below) live in SQLite, independent of target config —
+# most targets aren't even owned by this app (discovered live from
+# Prometheus's own scrape config), and the one target file this app does
+# own (targets/websites.yml) is a Prometheus file_sd YAML snippet, not a
+# place to hang relational metadata off of.
 MAX_HISTORY  = 1000
 MAX_LOGS     = 200
 
@@ -251,14 +236,13 @@ def save_json(path, data):
     except Exception as e:
         logger.error(f"Error saving {path}: {e}")
 
+# The one compiled-in fallback. Used to be a 4-entry topology-guessing list
+# (host.docker.internal / localhost / 127.0.0.1) — removed: /api/endpoints
+# already lets an operator register exactly the Prometheus URL their
+# deployment needs, so guessing at container-networking conventions no
+# longer earns its keep. This single default covers the common case (a
+# compose service literally named "prometheus") without guessing further.
 _DEFAULT_PROM_URL = os.environ.get("PROMETHEUS_URL", "http://prometheus:9090")
-PROMETHEUS_CANDIDATES = [
-    _DEFAULT_PROM_URL,
-    "http://prometheus:9090",
-    "http://host.docker.internal:9090",
-    "http://localhost:9090",
-    "http://127.0.0.1:9090"
-]
 
 def _is_blocked_ip(ip):
     return (ip.is_link_local or
@@ -319,37 +303,26 @@ def is_safe_endpoint_url(url: str):
         return False, f"Invalid URL: {e}"
 
 _ENDPOINTS_CACHE = {"ts": 0.0, "data": None}
-_ENDPOINTS_CACHE_TTL = 2.0  # endpoints.json rarely changes; avoid a disk read on every hot-path call
+_ENDPOINTS_CACHE_TTL = 2.0  # SQLite rarely changes; avoid a query on every hot-path call
 
+# EndpointRepository (SQLite) is the sole source of truth — endpoints.json
+# used to be read first (when present) and written on every mutation as a
+# parallel copy; every mutating route below now writes only through the
+# repository, and load_endpoints() reads only from it (short-TTL cached).
 def load_endpoints():
     now = time.time()
     cached = _ENDPOINTS_CACHE["data"]
     if cached is not None and now - _ENDPOINTS_CACHE["ts"] < _ENDPOINTS_CACHE_TTL:
         return cached
 
-    default_url = _DEFAULT_PROM_URL
-    data = load_json(ENDPOINTS_FILE, None)
-    if not (isinstance(data, dict) and "endpoints" in data and isinstance(data.get("endpoints"), list)):
-        try:
-            data = EndpointRepository.load_endpoints_state(default_url)
-        except Exception:
-            data = {
-                "active": default_url,
-                "endpoints": [default_url]
-            }
-
-    if not isinstance(data.get("endpoints"), list) or not data["endpoints"]:
-        data["endpoints"] = [default_url]
-    if not data.get("active") or data["active"] not in data["endpoints"]:
-        data["active"] = data["endpoints"][0]
+    try:
+        data = EndpointRepository.load_endpoints_state(_DEFAULT_PROM_URL)
+    except Exception:
+        data = {"active": _DEFAULT_PROM_URL, "endpoints": [_DEFAULT_PROM_URL]}
 
     _ENDPOINTS_CACHE["data"] = data
     _ENDPOINTS_CACHE["ts"] = now
     return data
-
-def save_endpoints(data):
-    save_json(ENDPOINTS_FILE, data)
-    _ENDPOINTS_CACHE["data"] = None  # invalidate so the next read picks up the change immediately
 
 DEFAULT_JOB_FILTER = os.environ.get("JOB_FILTER", "all")
 
@@ -481,6 +454,12 @@ PROMETHEUS_CACHE_TTL_DEFAULT = 8.0  # backend cache window for identical PromQL 
 # Shared thread pool executor to prevent continuous thread creation/destruction
 _SHARED_EXECUTOR = ThreadPoolExecutor(max_workers=16, thread_name_prefix="infrawatch-worker")
 
+# Separate, small pool for the SSRF DNS-revalidation check (_cached_is_safe_endpoint_url
+# below). socket.getaddrinfo() has no portable timeout, so a hung/slow resolver
+# can tie up a worker for well past our 1s wait — kept off _SHARED_EXECUTOR so
+# that can never queue behind (or starve) actual Prometheus query submission.
+_DNS_CHECK_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="infrawatch-dnscheck")
+
 # Cooldown circuit-breaker for unreachable candidate endpoints (prevents timeout cascades)
 _FAILED_CANDIDATES = {}
 _FAILED_CANDIDATES_LOCK = threading.Lock()
@@ -561,6 +540,63 @@ def _maybe_prune_cache(now):
             for k in unlocked_avail:
                 _AVAILABILITY_FLIGHT_LOCKS.pop(k, None)
 
+# is_safe_endpoint_url() does a real (blocking) DNS resolution — fine once,
+# at /api/endpoints registration time, but fetch_prometheus_json is called
+# for every distinct PromQL query, many times a minute. A short TTL cache
+# keeps the DNS-rebinding re-check cheap on the hot path while still closing
+# the gap within one TTL window of a hostname's record changing (registration
+# alone left it trusted forever).
+_SAFE_CANDIDATE_CACHE = {}
+_SAFE_CANDIDATE_CACHE_LOCK = threading.Lock()
+_SAFE_CANDIDATE_CACHE_TTL = 20.0
+# A hostname that doesn't resolve at all (e.g. a Compose-internal name whose
+# container isn't up yet) can take several seconds to fail via the system
+# resolver, with no way to bound socket.getaddrinfo's own timeout portably.
+# Run it off-thread with a hard deadline so a slow/hanging lookup can't stall
+# an HTTP request or poll cycle; on timeout, fail open — same treatment
+# is_safe_endpoint_url already gives an unresolvable hostname, since a name
+# that's merely slow to resolve is not the DNS-rebinding case this guards
+# against (a rebound name resolves fine, just to a different, blocked IP).
+_SAFE_CHECK_TIMEOUT_SEC = 1.0
+
+def _cached_is_safe_endpoint_url(url):
+    now = time.time()
+    with _SAFE_CANDIDATE_CACHE_LOCK:
+        cached = _SAFE_CANDIDATE_CACHE.get(url)
+        if cached and now - cached[0] < _SAFE_CANDIDATE_CACHE_TTL:
+            return cached[1], cached[2]
+    try:
+        future = _DNS_CHECK_EXECUTOR.submit(is_safe_endpoint_url, url)
+        ok, reason = future.result(timeout=_SAFE_CHECK_TIMEOUT_SEC)
+    except TimeoutError:
+        ok, reason = True, "DNS check timed out; treated as safe (re-checked next cycle)"
+    except Exception:
+        ok, reason = True, "DNS check errored; treated as safe (re-checked next cycle)"
+    with _SAFE_CANDIDATE_CACHE_LOCK:
+        _SAFE_CANDIDATE_CACHE[url] = (now, ok, reason)
+    return ok, reason
+
+def _filter_safe_candidates(urls):
+    """Re-validate each URL's currently-resolved IP right before it's used as a
+    poll target. is_safe_endpoint_url() is also run once at endpoint
+    registration time (/api/endpoints), but a hostname that resolved to a
+    public IP then can be repointed via DNS to a loopback/link-local/metadata
+    address afterwards (DNS rebinding) — the background poller and aggregator
+    would otherwise keep trusting that first check forever. Re-running the
+    same check (TTL-cached, see above) closes that gap for anything that came
+    from user/operator input: active endpoint, other saved endpoints, and
+    PROMETHEUS_URL (_DEFAULT_PROM_URL) are all revalidated here."""
+    safe = []
+    for u in urls:
+        if not u:
+            continue
+        ok, reason = _cached_is_safe_endpoint_url(u)
+        if ok:
+            safe.append(u)
+        else:
+            logger.warning("Skipping Prometheus candidate %s: %s", u, reason)
+    return safe
+
 def fetch_url(url, timeout=1.5):
     try:
         req = Request(url, headers={"User-Agent": "InfraWatch/1.0"})
@@ -610,6 +646,7 @@ def fetch_prometheus_json(path, use_cache=True, cache_ttl=None, timeout=None):
             primary_candidates.append(active_url)
         if LAST_WORKING_PROMETHEUS_URL and LAST_WORKING_PROMETHEUS_URL not in primary_candidates:
             primary_candidates.append(LAST_WORKING_PROMETHEUS_URL)
+        primary_candidates = _filter_safe_candidates(primary_candidates)
 
         # Try primary candidates first (2.5s default timeout)
         for base_url in primary_candidates:
@@ -641,19 +678,16 @@ def fetch_prometheus_json(path, use_cache=True, cache_ttl=None, timeout=None):
                     _FAILED_CANDIDATES[base_url] = time.time()
 
         # If primary candidates fail (or none exist), fallback to other registered
-        # endpoints and candidates. _DEFAULT_PROM_URL (PROMETHEUS_URL env, or the
-        # prometheus:9090 compose default) goes first — it's the one an operator
-        # actually configured for this deployment, ahead of the other saved
-        # endpoints and the generic localhost/host.docker.internal guesses.
+        # endpoints and _DEFAULT_PROM_URL (PROMETHEUS_URL env, or the
+        # prometheus:9090 compose default) — the one an operator actually
+        # configured for this deployment, ahead of the other saved endpoints.
         fallback_candidates = []
         if _DEFAULT_PROM_URL not in primary_candidates:
             fallback_candidates.append(_DEFAULT_PROM_URL)
         for ep in endpoints_data.get("endpoints", []):
             if ep not in primary_candidates and ep not in fallback_candidates:
                 fallback_candidates.append(ep)
-        for base_url in PROMETHEUS_CANDIDATES:
-            if base_url not in primary_candidates and base_url not in fallback_candidates:
-                fallback_candidates.append(base_url)
+        fallback_candidates = _filter_safe_candidates(fallback_candidates)
 
         for base_url in fallback_candidates:
             with _FAILED_CANDIDATES_LOCK:
@@ -683,9 +717,63 @@ def fetch_prometheus_json(path, use_cache=True, cache_ttl=None, timeout=None):
                     _FAILED_CANDIDATES[base_url] = time.time()
         return None, None
 
+# ── Rate limiting ─────────────────────────────────────────────────────────────
+# Lightweight in-process fixed-window limiter. No Redis/external store: this
+# app runs as a single gunicorn worker (Dockerfile), so a plain dict guarded
+# by a lock is sufficient — same pattern as the caches above. A production
+# deployment behind a reverse proxy can layer proxy-level rate limiting on
+# top of this; this is the floor, not the only line of defense.
+_RATE_BUCKETS = {}
+_RATE_BUCKETS_LOCK = threading.Lock()
+_RATE_LAST_PRUNE = [0.0]
+_RATE_PRUNE_INTERVAL = 60.0
+
+def _client_identity():
+    # An operator's API key (mutation routes) identifies them across tabs/
+    # devices sharing one budget; anonymous/read requests fall back to
+    # remote IP. Matches the credential lookup in auth.py's require_api_key.
+    header = request.headers.get("X-API-Key") or request.headers.get("Authorization", "")
+    if header.startswith("Bearer "):
+        header = header[len("Bearer "):]
+    if header:
+        return f"key:{header}"
+    return f"ip:{request.remote_addr or 'unknown'}"
+
+def rate_limit(max_calls, per_seconds):
+    """At most max_calls per per_seconds, per (route, client identity).
+    Fixed-window, not sliding — a request right at a window boundary can
+    momentarily allow close to 2x max_calls; an acceptable trade for a
+    NOC-internal tool over a real sliding-window implementation."""
+    def decorator(f):
+        @wraps(f)
+        def wrapped(*args, **kwargs):
+            now = time.time()
+            with _RATE_BUCKETS_LOCK:
+                if now - _RATE_LAST_PRUNE[0] > _RATE_PRUNE_INTERVAL:
+                    _RATE_LAST_PRUNE[0] = now
+                    current_window = int(now // per_seconds)
+                    stale = [k for k in _RATE_BUCKETS if k[2] < current_window]
+                    for k in stale:
+                        _RATE_BUCKETS.pop(k, None)
+
+                window = int(now // per_seconds)
+                key = (f.__name__, _client_identity(), window)
+                count = _RATE_BUCKETS.get(key, 0) + 1
+                _RATE_BUCKETS[key] = count
+
+            if count > max_calls:
+                return jsonify({"ok": False, "error": "Rate limit exceeded, try again shortly"}), 429
+            return f(*args, **kwargs)
+        return wrapped
+    return decorator
+
 @app.route('/')
 def index():
-    return render_template('alarm.html', api_key=get_api_key())
+    # No API key is rendered here. The dashboard is a read-only LAN wallboard;
+    # the mutation credential (@require_api_key routes) is entered by an
+    # operator client-side (see apiFetch()/authHeaders() in alarm.js) and
+    # kept only in that browser's localStorage, never shipped to every viewer.
+    return render_template('alarm.html')
 
 # Set whenever /webhook receives a real Alertmanager delivery — the poller
 # fallback below checks this and backs off, since Alertmanager (when present)
@@ -698,26 +786,15 @@ _LAST_WEBHOOK_AT = [0.0]
 # funnel through — so a maintenance window suppresses alerts/alarms without a
 # second alert pipeline.
 def load_maintenance_windows():
-    # create_maintenance_api() writes SQLite then JSON as two separate,
-    # non-transactional steps. Preferring the JSON file wholesale (old
-    # behavior) meant a DB-created window whose JSON write failed/lagged
-    # was invisible here forever — merge by id instead so a window that
-    # made it into either store still counts as active.
+    """SQLite (MaintenanceRepository) is the sole source of truth.
+    maintenance.json used to be written alongside every create/delete and
+    merged in here by id — a second, non-transactional copy that could
+    silently drift from the DB (the exact failure mode this now avoids by
+    construction: there's only one write path)."""
     try:
-        db_windows = MaintenanceRepository.list_windows()
+        return MaintenanceRepository.list_windows()
     except Exception:
-        db_windows = []
-    file_windows = load_json(MAINTENANCE_FILE, [])
-    if not isinstance(file_windows, list):
-        file_windows = []
-    # Windows without an 'id' (hand-written JSON, older records) have no key
-    # to merge on — keep them all rather than collapsing them together.
-    by_id = {}
-    for i, w in enumerate(file_windows):
-        by_id[w.get('id') or f'_file_{i}'] = w
-    for i, w in enumerate(db_windows):
-        by_id[w.get('id') or f'_db_{i}'] = w
-    return list(by_id.values())
+        return []
 
 def _parse_epoch_ts(val):
     if val is None:
@@ -964,27 +1041,29 @@ def logs():
     data = load_json(LOGS_FILE, [])
     return jsonify(data[:limit])
 
+# SQLite (DeletedTargetRepository) is the sole source of truth — deleted_targets.json
+# used to be read first (when present) and written on every mutation as a
+# parallel copy; both call sites now go straight through SQLite instead.
 def load_deleted_targets():
-    file_data = load_json(DELETED_TARGETS_FILE, None)
-    if file_data is not None and isinstance(file_data, list):
-        return file_data
     try:
         return DeletedTargetRepository.list_deleted()
     except Exception:
         return []
 
 def save_deleted_targets(deleted_list):
+    """Diffs deleted_list (the caller's full desired list, read-modified-write
+    style — see /api/targets POST|DELETE) against SQLite's current state and
+    applies add/restore so SQLite ends up matching it."""
     try:
         current_deleted = set(DeletedTargetRepository.list_deleted())
-        for d in deleted_list:
-            if d not in current_deleted:
-                DeletedTargetRepository.add_deleted(d)
-        for d in current_deleted:
-            if d not in deleted_list:
-                DeletedTargetRepository.restore_target(d)
     except Exception:
-        pass
-    save_json(DELETED_TARGETS_FILE, deleted_list)
+        current_deleted = set()
+    for d in deleted_list:
+        if d not in current_deleted:
+            DeletedTargetRepository.add_deleted(d)
+    for d in current_deleted:
+        if d not in deleted_list:
+            DeletedTargetRepository.restore_target(d)
 
 _EP_STATUS_CACHE = {"ts": 0.0, "key": "", "data": None}
 
@@ -1022,6 +1101,7 @@ def get_endpoints_api():
     return jsonify(resp_data)
 
 @app.route('/api/endpoints', methods=['POST'])
+@rate_limit(20, 60)
 @require_api_key
 def add_endpoint_api():
     global LAST_WORKING_PROMETHEUS_URL
@@ -1051,21 +1131,18 @@ def add_endpoint_api():
         except Exception:
             pass
 
-        data = load_endpoints()
-        if url not in data["endpoints"]:
-            data["endpoints"].append(url)
-
         if set_active:
-            data["active"] = url
             LAST_WORKING_PROMETHEUS_URL = url
             with PROMETHEUS_CACHE_LOCK:
                 PROMETHEUS_CACHE.clear()
 
-        save_endpoints(data)
+        _ENDPOINTS_CACHE["data"] = None
+        data = load_endpoints()
         _EP_STATUS_CACHE["data"] = None
     return jsonify({"ok": True, "active": data["active"], "endpoints": data["endpoints"]})
 
 @app.route('/api/endpoints/select', methods=['POST'])
+@rate_limit(20, 60)
 @require_api_key
 def select_endpoint_api():
     global LAST_WORKING_PROMETHEUS_URL
@@ -1084,12 +1161,7 @@ def select_endpoint_api():
         except Exception:
             pass
 
-        data = load_endpoints()
-        if url not in data["endpoints"]:
-            data["endpoints"].append(url)
-
-        data["active"] = url
-        save_endpoints(data)
+        _ENDPOINTS_CACHE["data"] = None
         _EP_STATUS_CACHE["data"] = None
 
         # Immediately clear cache and force selected URL as primary
@@ -1100,6 +1172,7 @@ def select_endpoint_api():
     return jsonify({"ok": True, "active": url})
 
 @app.route('/api/endpoints', methods=['DELETE'])
+@rate_limit(20, 60)
 @require_api_key
 def delete_endpoint_api():
     global LAST_WORKING_PROMETHEUS_URL
@@ -1115,18 +1188,18 @@ def delete_endpoint_api():
         if len(data["endpoints"]) <= 1:
             return jsonify({"ok": False, "error": "Cannot delete the last remaining endpoint"}), 400
 
+        was_active = (data["active"] == url)
         try:
             EndpointRepository.delete_endpoint(url)
         except Exception:
             pass
 
-        data["endpoints"].remove(url)
-        if data["active"] == url:
-            data["active"] = data["endpoints"][0]
+        _ENDPOINTS_CACHE["data"] = None
+        data = load_endpoints()
+        if was_active:
             LAST_WORKING_PROMETHEUS_URL = data["active"]
             with PROMETHEUS_CACHE_LOCK:
                 PROMETHEUS_CACHE.clear()
-        save_endpoints(data)
         _EP_STATUS_CACHE["data"] = None
 
     return jsonify({"ok": True, "active": data["active"], "endpoints": data["endpoints"]})
@@ -1189,6 +1262,7 @@ def get_targets_api():
     return jsonify({"ok": True, "targets": load_website_targets()})
 
 @app.route('/api/targets', methods=['POST'])
+@rate_limit(20, 60)
 @require_api_key
 def add_target_api():
     data = request.json or {}
@@ -1213,6 +1287,7 @@ def add_target_api():
     return jsonify({"ok": True, "targets": current})
 
 @app.route('/api/targets', methods=['DELETE'])
+@rate_limit(20, 60)
 @require_api_key
 def delete_target_api():
     data = request.json or {}
@@ -1244,6 +1319,7 @@ def list_maintenance_api():
     return jsonify({"ok": True, "windows": windows})
 
 @app.route('/api/maintenance', methods=['POST'])
+@rate_limit(20, 60)
 @require_api_key
 def create_maintenance_api():
     data = request.json or {}
@@ -1276,25 +1352,19 @@ def create_maintenance_api():
                 "end": end,
                 "created_at": int(time.time()),
             }
-        windows = load_json(MAINTENANCE_FILE, [])
-        windows.append(window)
-        save_json(MAINTENANCE_FILE, windows)
     return jsonify({"ok": True, "window": window})
 
 @app.route('/api/maintenance/<window_id>', methods=['DELETE'])
+@rate_limit(20, 60)
 @require_api_key
 def delete_maintenance_api(window_id):
     with _WEBHOOK_LOCK:
-        deleted = False
         try:
             deleted = MaintenanceRepository.delete_window(window_id)
         except Exception:
-            pass
-        windows = load_json(MAINTENANCE_FILE, [])
-        remaining = [w for w in windows if w.get('id') != window_id]
-        if not deleted and len(remaining) == len(windows):
+            deleted = False
+        if not deleted:
             return jsonify({"ok": False, "error": "Maintenance window not found"}), 404
-        save_json(MAINTENANCE_FILE, remaining)
     return jsonify({"ok": True})
 
 # ── Alert Correlation (Phase 12) ─────────────────────────────────────────────
@@ -1303,9 +1373,10 @@ def delete_maintenance_api(window_id):
 # Never touches status/logs/history — the underlying alert for a suppressed
 # child still fires and is recorded exactly as if this feature didn't exist.
 def load_dependencies():
-    file_data = load_json(DEPENDENCIES_FILE, None)
-    if file_data is not None and isinstance(file_data, list):
-        return file_data
+    """SQLite (DependencyRepository) is the sole source of truth — see
+    load_maintenance_windows() earlier in this file for why dependencies.json's
+    old dual-write (SQLite + a separate JSON copy) was removed rather than
+    kept as a merge-by-id fallback."""
     try:
         return DependencyRepository.list_dependencies()
     except Exception:
@@ -1328,6 +1399,7 @@ def list_dependencies_api():
     return jsonify({"ok": True, "dependencies": load_dependencies()})
 
 @app.route('/api/dependencies', methods=['POST'])
+@rate_limit(20, 60)
 @require_api_key
 def create_dependency_api():
     data = request.json or {}
@@ -1343,29 +1415,29 @@ def create_dependency_api():
             dep = DependencyRepository.create_dependency(parent=parent, child=child)
         except Exception:
             dep = {"id": f"dep_{int(time.time() * 1000)}", "child": child, "parent": parent, "created_at": int(time.time())}
-        deps = [d for d in load_json(DEPENDENCIES_FILE, []) if d.get('child') != child]
-        deps.append(dep)
-        save_json(DEPENDENCIES_FILE, deps)
     return jsonify({"ok": True, "dependency": dep})
 
 @app.route('/api/dependencies/<dep_id>', methods=['DELETE'])
+@rate_limit(20, 60)
 @require_api_key
 def delete_dependency_api(dep_id):
     with _WEBHOOK_LOCK:
-        deleted = False
         try:
             deleted = DependencyRepository.delete_dependency(dep_id)
         except Exception:
-            pass
-        deps = load_json(DEPENDENCIES_FILE, [])
-        remaining = [d for d in deps if d.get('id') != dep_id and d.get('child') != dep_id]
-        if not deleted and len(remaining) == len(deps):
+            deleted = False
+        if not deleted:
             return jsonify({"ok": False, "error": "Dependency not found"}), 404
-        save_json(DEPENDENCIES_FILE, remaining)
     return jsonify({"ok": True})
 
 # ── Telegram Notifications API ───────────────────────────────────────────────
+# Operator-only: returns bot_token_masked/chat_id, which are not currently
+# consumed by any part of the frontend (verified — no /api/telegram fetch
+# exists in alarm.js) and shouldn't be reachable by an unauthenticated LAN
+# viewer.
 @app.route('/api/telegram', methods=['GET'])
+@rate_limit(20, 60)
+@require_api_key
 def get_telegram_api():
     config = get_telegram_config()
     token = config.get("bot_token", "")
@@ -1382,6 +1454,7 @@ def get_telegram_api():
     })
 
 @app.route('/api/telegram', methods=['POST'])
+@rate_limit(20, 60)
 @require_api_key
 def save_telegram_api():
     data = request.json or {}
@@ -1404,6 +1477,7 @@ def save_telegram_api():
     return jsonify({"ok": False, "error": "Failed to save configuration"}), 500
 
 @app.route('/api/telegram/test', methods=['POST'])
+@rate_limit(10, 60)
 @require_api_key
 def test_telegram_api():
     data = request.json or {}
@@ -1516,6 +1590,86 @@ def fetch_all_probe_metrics(cache_ttl=3.0, timeout=None):
     return success_map, duration_map, status_code_map
 
 # ── Canonical Monitoring State Engine ───────────────────────────────────────
+def _derive_probe_readings(keys, probe_success_map, probe_duration_map, probe_status_code_map,
+                            down_since_prom_map, raw_target=None):
+    """Shared by both target-enrichment loops in build_canonical_monitoring_state:
+    derive health/down_since/response_time_ms/http_code/last_error from the
+    Prometheus probe metric maps for a target identified by one or more
+    lookup keys (instance name and/or scrapeUrl — checked in order, first
+    match wins).
+
+    raw_target, when given (the /api/v1/targets entry for a target Prometheus
+    itself discovered), supplies two extra fallbacks the probe-target path
+    always had: its own `health` field when probe_success has no reading yet,
+    and `lastScrapeDuration` when probe_duration_seconds has no reading yet —
+    plus lastError for classification. Custom (manually-added, non-Prometheus
+    -discovered) targets pass raw_target=None and keep the narrower fallbacks
+    (health='unknown', response_time_ms=0.0, last_error='') they always had.
+
+    This only extracts what both loops were already computing identically —
+    it does not change either path's behavior, including one small existing
+    difference the two call sites had for http_code: the probe-target path
+    treats probe_status_code_map's raw value with `is not None` (so a real
+    "0" — Blackbox's code for "no HTTP response" — comes through as 0), while
+    the custom-target path used a truthy check (so "0"/0 there resolves to
+    None). Preserved via the raw_target branch below rather than silently
+    unified, since nothing here proves which behavior is "correct"."""
+    def _first(mapping):
+        for k in keys:
+            if k in mapping:
+                return mapping[k]
+        return None
+
+    p_success = _first(probe_success_map)
+    if p_success is not None:
+        health = 'up' if str(p_success) in ('1', '1.0') else 'down'
+    elif raw_target is not None:
+        health = raw_target.get('health', 'unknown')
+    else:
+        health = 'unknown'
+
+    if health != 'up':
+        last_up = _first(down_since_prom_map)
+        down_since_val = int(last_up) if last_up else 0
+    else:
+        down_since_val = 0
+
+    p_duration = _first(probe_duration_map)
+    if p_duration is not None:
+        try:
+            response_time_ms = round(float(p_duration) * 1000, 1)
+        except ValueError:
+            response_time_ms = 0.0
+    elif raw_target is not None:
+        scrape_dur = raw_target.get('lastScrapeDuration')
+        if scrape_dur is not None:
+            try:
+                response_time_ms = round(float(scrape_dur) * 1000, 1)
+            except ValueError:
+                response_time_ms = 0.0
+        else:
+            response_time_ms = 0.0
+    else:
+        response_time_ms = 0.0
+
+    p_code = _first(probe_status_code_map)
+    if raw_target is not None:
+        if p_code is not None:
+            try:
+                http_code = int(float(p_code))
+            except ValueError:
+                http_code = None
+        else:
+            http_code = None
+    else:
+        try:
+            http_code = int(float(p_code)) if p_code else None
+        except ValueError:
+            http_code = None
+
+    last_error = raw_target.get('lastError', '') if raw_target is not None else ''
+    return health, down_since_val, response_time_ms, http_code, last_error
+
 def build_canonical_monitoring_state(job_param=None):
     if job_param is None:
         job_param = DEFAULT_JOB_FILTER
@@ -1596,47 +1750,10 @@ def build_canonical_monitoring_state(job_param=None):
                 seen_instances.add(inst_name)
                 seen_instances.add(scrape_url)
 
-                # Determine health from probe_success metric
-                p_success = probe_success_map.get(inst_name) or probe_success_map.get(scrape_url)
-                if p_success is not None:
-                    health = 'up' if str(p_success) in ('1', '1.0') else 'down'
-                else:
-                    health = t.get('health', 'unknown')
-
-                # Continuous downSince calculation
-                if health != 'up':
-                    last_up = down_since_prom_map.get(inst_name) or down_since_prom_map.get(scrape_url)
-                    down_since_val = int(last_up) if last_up else 0
-                else:
-                    down_since_val = 0
-
-                # Determine response time (in ms) from probe_duration_seconds metric
-                p_duration = probe_duration_map.get(inst_name) or probe_duration_map.get(scrape_url)
-                if p_duration is not None:
-                    try:
-                        response_time_ms = round(float(p_duration) * 1000, 1)
-                    except ValueError:
-                        response_time_ms = 0.0
-                else:
-                    scrape_dur = t.get('lastScrapeDuration')
-                    if scrape_dur is not None:
-                        try:
-                            response_time_ms = round(float(scrape_dur) * 1000, 1)
-                        except ValueError:
-                            response_time_ms = 0.0
-                    else:
-                        response_time_ms = 0.0
-
-                p_code = probe_status_code_map.get(inst_name) or probe_status_code_map.get(scrape_url)
-                if p_code is not None:
-                    try:
-                        http_code = int(float(p_code))
-                    except ValueError:
-                        http_code = None
-                else:
-                    http_code = None
-
-                last_error = t.get('lastError', '')
+                health, down_since_val, response_time_ms, http_code, last_error = _derive_probe_readings(
+                    (inst_name, scrape_url), probe_success_map, probe_duration_map,
+                    probe_status_code_map, down_since_prom_map, raw_target=t
+                )
                 classification = classify_scrape_failure(health, last_error, http_code)
 
                 matched_alerts = alerts_by_instance.get(inst_name, []) + [
@@ -1665,31 +1782,11 @@ def build_canonical_monitoring_state(job_param=None):
     # Merge custom user-added targets
     for target_url in config_web_targets:
         if matches_job_filter("custom", "custom", job_param) and target_url not in seen_instances and target_url not in deleted_targets:
-            p_success = probe_success_map.get(target_url)
-            if p_success is not None:
-                health = 'up' if str(p_success) in ('1', '1.0') else 'down'
-            else:
-                health = 'unknown'
-
-            if health != 'up':
-                last_up = down_since_prom_map.get(target_url)
-                down_since_val = int(last_up) if last_up else 0
-            else:
-                down_since_val = 0
-
-            p_duration = probe_duration_map.get(target_url)
-            try:
-                response_time_ms = round(float(p_duration) * 1000, 1) if p_duration else 0.0
-            except ValueError:
-                response_time_ms = 0.0
-
-            p_code = probe_status_code_map.get(target_url)
-            try:
-                http_code = int(float(p_code)) if p_code else None
-            except ValueError:
-                http_code = None
-
-            classification = classify_scrape_failure(health, '', http_code)
+            health, down_since_val, response_time_ms, http_code, last_error = _derive_probe_readings(
+                (target_url,), probe_success_map, probe_duration_map,
+                probe_status_code_map, down_since_prom_map, raw_target=None
+            )
+            classification = classify_scrape_failure(health, last_error, http_code)
             matched_alerts = alerts_by_instance.get(target_url, [])
 
             result.append({
@@ -1855,6 +1952,7 @@ def build_canonical_monitoring_state(job_param=None):
 
 # ── Instances & Real-time Metrics API ─────────────────────────────────────────
 @app.route('/instances')
+@rate_limit(120, 60)
 def instances():
     job_param = request.args.get('job', DEFAULT_JOB_FILTER)
     state = build_canonical_monitoring_state(job_param)
@@ -1952,6 +2050,7 @@ def get_monitored_instances(job_filter=None):
 # ── Availability (historical uptime %) ────────────────────────────────────────
 # ── Availability (historical uptime %) ────────────────────────────────────────
 @app.route('/api/availability')
+@rate_limit(120, 60)
 def api_availability():
     t_req_start = time.perf_counter()
     job_filter = request.args.get('job', DEFAULT_JOB_FILTER)
@@ -2253,54 +2352,26 @@ def api_availability():
         t_prom_end = time.perf_counter()
         prom_duration_ms = (t_prom_end - t_prom_start) * 1000.0
 
-        probe_avail = results.get('probe_avail', {})
-        up_avail = results.get('up_avail', {})
-        probe_count = results.get('probe_count', {})
-        up_count = results.get('up_count', {})
-        probe_first = results.get('probe_first_ts', {})
-        up_first = results.get('up_first_ts', {})
-        probe_last = results.get('probe_last_ts', {})
-        up_last = results.get('up_last_ts', {})
-        probe_inc = results.get('probe_incidents', {})
-        up_inc = results.get('up_incidents', {})
-        live_probe = results.get('live_probe', {})
-        live_up = results.get('live_up', {})
-
-        avail_map = {}
-        count_map = {}
-        first_ts_map = {}
-        last_ts_map = {}
-        incidents_map = {}
-        live_map = {}
-
-        for inst in monitored_instances:
-            is_node_target = ('node' in inst.lower() or 'exporter' in inst.lower()) and inst not in probe_avail and inst not in probe_count
-            if not is_node_target:
-                if inst in probe_avail:
-                    avail_map[inst] = probe_avail[inst]
-                if inst in probe_count:
-                    count_map[inst] = probe_count[inst]
-                if inst in probe_first:
-                    first_ts_map[inst] = probe_first[inst]
-                if inst in probe_last:
-                    last_ts_map[inst] = probe_last[inst]
-                if inst in probe_inc:
-                    incidents_map[inst] = probe_inc[inst]
-                if inst in live_probe:
-                    live_map[inst] = live_probe[inst]
-            else:
-                if inst in up_avail:
-                    avail_map[inst] = up_avail[inst]
-                if inst in up_count:
-                    count_map[inst] = up_count[inst]
-                if inst in up_first:
-                    first_ts_map[inst] = up_first[inst]
-                if inst in up_last:
-                    last_ts_map[inst] = up_last[inst]
-                if inst in up_inc:
-                    incidents_map[inst] = up_inc[inst]
-                if inst in live_up:
-                    live_map[inst] = live_up[inst]
+        # Classify each instance as probe vs node/exporter-style and merge
+        # the matching side's query results — shared with the background
+        # aggregator's identical step via derive_bucket_inputs().
+        probe_results_raw = {
+            "avail": results.get('probe_avail', {}), "count": results.get('probe_count', {}),
+            "first_ts": results.get('probe_first_ts', {}), "last_ts": results.get('probe_last_ts', {}),
+            "incidents": results.get('probe_incidents', {}), "live": results.get('live_probe', {}),
+        }
+        up_results_raw = {
+            "avail": results.get('up_avail', {}), "count": results.get('up_count', {}),
+            "first_ts": results.get('up_first_ts', {}), "last_ts": results.get('up_last_ts', {}),
+            "incidents": results.get('up_incidents', {}), "live": results.get('live_up', {}),
+        }
+        merged_maps = derive_bucket_inputs(monitored_instances, probe_results_raw, up_results_raw)
+        avail_map = merged_maps["avail"]
+        count_map = merged_maps["count"]
+        first_ts_map = merged_maps["first_ts"]
+        last_ts_map = merged_maps["last_ts"]
+        incidents_map = merged_maps["incidents"]
+        live_map = merged_maps["live"]
 
         duration_map = results.get('duration', {})
 
@@ -2317,16 +2388,9 @@ def api_availability():
         # coverage.
         cadence_map = dict(get_instance_cadence_map(job_filter))
         for inst in monitored_instances:
-            rc = count_map.get(inst)
-            f_ts = float(first_ts_map.get(inst, 0))
-            l_ts = float(last_ts_map.get(inst, 0))
-            if rc and f_ts > 0 and l_ts > 0 and (l_ts - f_ts) > 0:
-                try:
-                    c_num = float(rc)
-                    if c_num >= 2:
-                        cadence_map[inst] = (l_ts - f_ts) / (c_num - 1)
-                except (ValueError, TypeError):
-                    pass
+            estimated = estimate_instance_cadence(inst, count_map, first_ts_map, last_ts_map)
+            if estimated is not None:
+                cadence_map[inst] = estimated
 
         prom_results_map = {
             "first_ts": first_ts_map,
@@ -2509,6 +2573,7 @@ def api_availability():
         return resp
 
 @app.route('/api/target-history')
+@rate_limit(120, 60)
 def target_history_api():
     target_url = (request.args.get('target') or request.args.get('instance') or '').strip()
     minutes_param = request.args.get('minutes', '1440')
@@ -3052,62 +3117,32 @@ def _aggregate_availability_cycle():
             except Exception:
                 results[k] = {}
 
-        probe_avail = results.get('probe_avail', {})
-        up_avail = results.get('up_avail', {})
-        probe_count = results.get('probe_count', {})
-        up_count = results.get('up_count', {})
-        probe_first = results.get('probe_first_ts', {})
-        up_first = results.get('up_first_ts', {})
-        probe_last = results.get('probe_last_ts', {})
-        up_last = results.get('up_last_ts', {})
-        probe_inc = results.get('probe_incidents', {})
-        up_inc = results.get('up_incidents', {})
-
-        avail_map = {}
-        count_map = {}
-        first_ts_map = {}
-        last_ts_map = {}
-        incidents_map = {}
-
-        for inst in monitored:
-            is_node_target = ('node' in inst.lower() or 'exporter' in inst.lower()) and inst not in probe_avail and inst not in probe_count
-            if not is_node_target:
-                if inst in probe_avail:
-                    avail_map[inst] = probe_avail[inst]
-                if inst in probe_count:
-                    count_map[inst] = probe_count[inst]
-                if inst in probe_first:
-                    first_ts_map[inst] = probe_first[inst]
-                if inst in probe_last:
-                    last_ts_map[inst] = probe_last[inst]
-                if inst in probe_inc:
-                    incidents_map[inst] = probe_inc[inst]
-            else:
-                if inst in up_avail:
-                    avail_map[inst] = up_avail[inst]
-                if inst in up_count:
-                    count_map[inst] = up_count[inst]
-                if inst in up_first:
-                    first_ts_map[inst] = up_first[inst]
-                if inst in up_last:
-                    last_ts_map[inst] = up_last[inst]
-                if inst in up_inc:
-                    incidents_map[inst] = up_inc[inst]
+        # Same classify-and-merge step as api_availability's materialize
+        # path, via derive_bucket_inputs() — see its docstring.
+        probe_results_raw = {
+            "avail": results.get('probe_avail', {}), "count": results.get('probe_count', {}),
+            "first_ts": results.get('probe_first_ts', {}), "last_ts": results.get('probe_last_ts', {}),
+            "incidents": results.get('probe_incidents', {}),
+        }
+        up_results_raw = {
+            "avail": results.get('up_avail', {}), "count": results.get('up_count', {}),
+            "first_ts": results.get('up_first_ts', {}), "last_ts": results.get('up_last_ts', {}),
+            "incidents": results.get('up_incidents', {}),
+        }
+        merged_maps = derive_bucket_inputs(monitored, probe_results_raw, up_results_raw)
+        avail_map = merged_maps["avail"]
+        count_map = merged_maps["count"]
+        first_ts_map = merged_maps["first_ts"]
+        last_ts_map = merged_maps["last_ts"]
+        incidents_map = merged_maps["incidents"]
 
         duration_map = results.get('duration', {})
 
         observed_cadences = []
         for inst in monitored:
-            rc = count_map.get(inst)
-            f_ts = float(first_ts_map.get(inst, 0))
-            l_ts = float(last_ts_map.get(inst, 0))
-            if rc and f_ts > 0 and l_ts > 0 and (l_ts - f_ts) > 0:
-                try:
-                    c_num = float(rc)
-                    if c_num >= 2:
-                        observed_cadences.append((l_ts - f_ts) / (c_num - 1))
-                except (ValueError, TypeError):
-                    pass
+            estimated = estimate_instance_cadence(inst, count_map, first_ts_map, last_ts_map)
+            if estimated is not None:
+                observed_cadences.append(estimated)
         fleet_median_cadence = (
             sorted(observed_cadences)[len(observed_cadences) // 2]
             if observed_cadences else SCRAPE_INTERVAL_SECONDS

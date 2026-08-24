@@ -17,33 +17,36 @@ class ApiContractsTests(unittest.TestCase):
         self.client = app.test_client()
         self.client.environ_base = {"HTTP_X_API_KEY": TEST_API_KEY, "HTTP_X_WEBHOOK_SECRET": TEST_WEBHOOK_SECRET}
         self.tmpdir = tempfile.mkdtemp()
-        self._orig = (
-            alarm_app.STATUS_FILE, alarm_app.MAINTENANCE_FILE,
-            alarm_app.DEPENDENCIES_FILE, alarm_app.DELETED_TARGETS_FILE,
-            alarm_app.ENDPOINTS_FILE
-        )
+        self._orig = (alarm_app.STATUS_FILE,)
         self._orig_targets_env = os.environ.get("TARGETS_FILE")
         alarm_app.STATUS_FILE = os.path.join(self.tmpdir, "status.json")
-        alarm_app.MAINTENANCE_FILE = os.path.join(self.tmpdir, "maintenance.json")
-        alarm_app.DEPENDENCIES_FILE = os.path.join(self.tmpdir, "dependencies.json")
-        alarm_app.DELETED_TARGETS_FILE = os.path.join(self.tmpdir, "deleted_targets.json")
-        alarm_app.ENDPOINTS_FILE = os.path.join(self.tmpdir, "endpoints.json")
         os.environ["TARGETS_FILE"] = os.path.join(self.tmpdir, "websites.yml")
+
+        # SQLite (maintenance/dependencies/endpoints/deleted-targets/incidents)
+        # is the sole source of truth for those domains now — isolate it per
+        # test the same way the JSON sidecar paths above are isolated, or
+        # this file's CRUD assertions would read/write the real default DB.
+        self.db_path = os.path.join(self.tmpdir, "test_infrawatch.db")
+        self._orig_db_env = os.environ.get("INFRAWATCH_DB_PATH")
+        os.environ["INFRAWATCH_DB_PATH"] = self.db_path
+        from storage import init_db
+        init_db(self.db_path)
+
         alarm_app._ENDPOINTS_CACHE["data"] = None
         alarm_app._EP_STATUS_CACHE["data"] = None
 
     def tearDown(self):
         alarm_app._ENDPOINTS_CACHE["data"] = None
         alarm_app._EP_STATUS_CACHE["data"] = None
-        (
-            alarm_app.STATUS_FILE, alarm_app.MAINTENANCE_FILE,
-            alarm_app.DEPENDENCIES_FILE, alarm_app.DELETED_TARGETS_FILE,
-            alarm_app.ENDPOINTS_FILE
-        ) = self._orig
+        (alarm_app.STATUS_FILE,) = self._orig
         if self._orig_targets_env is not None:
             os.environ["TARGETS_FILE"] = self._orig_targets_env
         else:
             os.environ.pop("TARGETS_FILE", None)
+        if self._orig_db_env is not None:
+            os.environ["INFRAWATCH_DB_PATH"] = self._orig_db_env
+        else:
+            os.environ.pop("INFRAWATCH_DB_PATH", None)
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     # ── 1. Target Management Contracts ───────────────────────────────────────
@@ -87,9 +90,10 @@ class ApiContractsTests(unittest.TestCase):
 
     # ── 2. Endpoint Management Contracts ─────────────────────────────────────
     def test_api_endpoints_crud_contracts(self):
-        # Seed initial endpoints
-        with open(alarm_app.ENDPOINTS_FILE, 'w') as f:
-            json.dump({"active": "http://prom-1:9090", "endpoints": ["http://prom-1:9090", "http://prom-2:9090"]}, f)
+        # Seed initial endpoints directly in SQLite (the source of truth)
+        from storage import EndpointRepository
+        EndpointRepository.create_endpoint("prom-1", "http://prom-1:9090", is_active=True, db_path=self.db_path)
+        EndpointRepository.create_endpoint("prom-2", "http://prom-2:9090", is_active=False, db_path=self.db_path)
 
         # GET endpoints
         with patch('app.fetch_url', return_value='{}'):

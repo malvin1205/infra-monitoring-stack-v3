@@ -31,17 +31,11 @@ class SingleSourcePersistenceTests(unittest.TestCase):
 
         self._orig_files = (
             alarm_app.STATUS_FILE, alarm_app.HISTORY_FILE,
-            alarm_app.LOGS_FILE, alarm_app.MAINTENANCE_FILE,
-            alarm_app.DEPENDENCIES_FILE, alarm_app.DELETED_TARGETS_FILE,
-            alarm_app.ENDPOINTS_FILE
+            alarm_app.LOGS_FILE
         )
         alarm_app.STATUS_FILE = os.path.join(self.tmpdir, "status.json")
         alarm_app.HISTORY_FILE = os.path.join(self.tmpdir, "history.json")
         alarm_app.LOGS_FILE = os.path.join(self.tmpdir, "logs.json")
-        alarm_app.MAINTENANCE_FILE = os.path.join(self.tmpdir, "maintenance.json")
-        alarm_app.DEPENDENCIES_FILE = os.path.join(self.tmpdir, "dependencies.json")
-        alarm_app.DELETED_TARGETS_FILE = os.path.join(self.tmpdir, "deleted_targets.json")
-        alarm_app.ENDPOINTS_FILE = os.path.join(self.tmpdir, "endpoints.json")
         alarm_app._ENDPOINTS_CACHE["data"] = None
 
     def tearDown(self):
@@ -51,9 +45,7 @@ class SingleSourcePersistenceTests(unittest.TestCase):
             os.environ.pop("INFRAWATCH_DB_PATH", None)
         (
             alarm_app.STATUS_FILE, alarm_app.HISTORY_FILE,
-            alarm_app.LOGS_FILE, alarm_app.MAINTENANCE_FILE,
-            alarm_app.DEPENDENCIES_FILE, alarm_app.DELETED_TARGETS_FILE,
-            alarm_app.ENDPOINTS_FILE
+            alarm_app.LOGS_FILE
         ) = self._orig_files
         alarm_app._ENDPOINTS_CACHE["data"] = None
         shutil.rmtree(self.tmpdir, ignore_errors=True)

@@ -13,18 +13,40 @@ from telegram_notifier import (
 
 def test_telegram_message_builder():
     """Unit test for Telegram HTML message generation (runs in pytest)."""
-    msg = build_alert_message(
+    firing_msg = build_alert_message(
         name="TargetDown",
         severity="critical",
-        instance="192.168.1.100:9100",
+        instance="101.101.101.101",
         summary="Service unreachable",
-        job="node_exporter",
-        event_time=1700000000,
+        job="blackbox",
+        event_time=1787584676,
         is_now_firing=True,
-        latency_ms=15.2
+        latency_ms=5001.6
     )
-    assert "INFRAWATCH ALERT: CRITICAL" in msg
-    assert "192.168.1.100:9100" in msg
+    assert "🔴 InfraWatch — Service Down" in firing_msg
+    assert "Target     101.101.101.101" in firing_msg
+    assert "Job        blackbox" in firing_msg
+    assert "Status     UNREACHABLE" in firing_msg
+    assert "Latency    5001.6 ms" in firing_msg
+    assert "Investigate host availability." in firing_msg
+
+    resolved_msg = build_alert_message(
+        name="TargetDown",
+        severity="critical",
+        instance="156.154.71.1",
+        summary="Service restored",
+        job="blackbox",
+        event_time=1787584676,
+        is_now_firing=False,
+        duration_seconds=15.0,
+        latency_ms=18.4
+    )
+    assert "🟢 InfraWatch — Service Restored" in resolved_msg
+    assert "Target     156.154.71.1" in resolved_msg
+    assert "Job        blackbox" in resolved_msg
+    assert "Status     OPERATIONAL" in resolved_msg
+    assert "Downtime   15s" in resolved_msg
+    assert "Latency    18.4 ms" in resolved_msg
 
 def run_tests():
     print("=" * 60)
