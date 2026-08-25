@@ -39,8 +39,10 @@ alarm/telegram_config.json
 !alarm/telegram_config.json.example
 alarm/.api_key
 alarm/.webhook_secret
+alarm/.session_secret
 .api_key
 .webhook_secret
+.session_secret
 
 # Runtime data (contains internal host/network info, regenerated at runtime)
 alarm/infrawatch.db*

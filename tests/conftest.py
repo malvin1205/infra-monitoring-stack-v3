@@ -1,6 +1,13 @@
 """Set the auth env vars before any test module imports app/auth, since
 auth.API_KEY / auth.WEBHOOK_SECRET are read once at import time."""
 import os
+import sys
+from pathlib import Path
+
+# Add alarm directory to sys.path so tests can import alarm modules directly
+ALARM_DIR = Path(__file__).resolve().parent.parent / "alarm"
+if str(ALARM_DIR) not in sys.path:
+    sys.path.insert(0, str(ALARM_DIR))
 
 TEST_API_KEY = "test-api-key"
 TEST_WEBHOOK_SECRET = "test-webhook-secret"

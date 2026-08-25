@@ -371,5 +371,38 @@ class CanonicalMonitoringStateTests(unittest.TestCase):
             self.assertFalse(target['is_alarmable'])
 
 
+    def test_job_filtered_poll_does_not_clear_other_jobs_acks(self):
+        """A job-scoped poll (?job=X) must not wipe acks for down instances in
+        other jobs -- clear_resolved only has visibility into the job-filtered
+        `result`, so anything outside that filter looks "absent" and must not
+        be treated as recovered."""
+        import storage
+        raw_targets = {
+            "status": "success",
+            "data": {
+                "activeTargets": [
+                    {"labels": {"instance": "host-a", "job": "job-a"}, "health": "down", "scrapeUrl": "host-a"},
+                    {"labels": {"instance": "host-b", "job": "job-b"}, "health": "down", "scrapeUrl": "host-b"},
+                ]
+            }
+        }
+        storage.AcknowledgmentRepository.acknowledge_instances(["host-a", "host-b"], username="tester")
+        self.assertIn("host-a", storage.AcknowledgmentRepository.get_active_acknowledgments())
+        self.assertIn("host-b", storage.AcknowledgmentRepository.get_active_acknowledgments())
+
+        with patch.object(alarm_app, 'fetch_prometheus_json', return_value=(raw_targets, 'http://prom:9090')), \
+             patch.object(alarm_app, 'fetch_all_probe_metrics', return_value=({"host-a": "0", "host-b": "0"}, {}, {})), \
+             patch.object(alarm_app, 'fetch_down_since_prom_map', return_value={}), \
+             patch.object(alarm_app, 'load_website_targets', return_value=[]):
+
+            # Poll scoped to job-a only, like a dashboard tab filter would send
+            res = self.client.get('/instances?job=job-a')
+            self.assertEqual(res.status_code, 200)
+
+        active_acks = storage.AcknowledgmentRepository.get_active_acknowledgments()
+        self.assertIn("host-a", active_acks, "job-a's own ack must survive its own scoped poll")
+        self.assertIn("host-b", active_acks, "host-b is still down in job-b -- a job-a-scoped poll must not clear it")
+
+
 if __name__ == '__main__':
     unittest.main()

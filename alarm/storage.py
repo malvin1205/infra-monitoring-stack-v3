@@ -11,14 +11,23 @@ DB_DIR = os.path.dirname(__file__)
 DEFAULT_DB_PATH = os.path.join(DB_DIR, "infrawatch.db")
 
 
-def get_db(db_path: Optional[str] = None) -> sqlite3.Connection:
-    path = db_path or os.environ.get("INFRAWATCH_DB_PATH", DEFAULT_DB_PATH)
+_INITIALIZED_DBS = set()
+
+
+def _connect_raw(path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(path, timeout=30.0, check_same_thread=False, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode = WAL;")
     conn.execute("PRAGMA synchronous = NORMAL;")
     conn.execute("PRAGMA busy_timeout = 30000;")
     return conn
+
+
+def get_db(db_path: Optional[str] = None) -> sqlite3.Connection:
+    path = db_path or os.environ.get("INFRAWATCH_DB_PATH", DEFAULT_DB_PATH)
+    if path not in _INITIALIZED_DBS:
+        init_db(path)
+    return _connect_raw(path)
 
 
 @contextmanager
@@ -48,9 +57,11 @@ def db_read(db_path: Optional[str] = None):
 
 
 def init_db(db_path: Optional[str] = None):
-    conn = get_db(db_path)
-    with conn:
-        conn.executescript("""
+    path = db_path or os.environ.get("INFRAWATCH_DB_PATH", DEFAULT_DB_PATH)
+    conn = _connect_raw(path)
+    try:
+        with conn:
+            conn.executescript("""
             CREATE TABLE IF NOT EXISTS incidents (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 key TEXT UNIQUE NOT NULL,
@@ -158,22 +169,67 @@ def init_db(db_path: Optional[str] = None):
                 acquired_at REAL NOT NULL,
                 expires_at REAL NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                display_name TEXT,
+                role TEXT NOT NULL DEFAULT 'viewer', -- 'admin' or 'viewer'
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                last_login REAL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
+            CREATE INDEX IF NOT EXISTS idx_users_active ON users(is_active);
+
+            CREATE TABLE IF NOT EXISTS alert_acknowledgments (
+                target_key TEXT PRIMARY KEY, -- instance or alert fingerprint
+                instance TEXT NOT NULL,
+                acknowledged_by TEXT NOT NULL,
+                acknowledged_at REAL NOT NULL,
+                created_at REAL NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_ack_instance ON alert_acknowledgments(instance);
+
+            CREATE TABLE IF NOT EXISTS audit_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                actor_username TEXT NOT NULL,
+                actor_role TEXT NOT NULL,
+                action TEXT NOT NULL,
+                resource TEXT,
+                details TEXT,
+                created_at REAL NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_audit_time ON audit_logs(created_at DESC);
         """)
         # Sanitize any legacy corrupted buckets (e.g. down hosts marked with positive uptime)
         conn.execute("DELETE FROM availability_buckets WHERE uptime_seconds > 0 AND availability_pct = 0.0")
         conn.execute("DELETE FROM availability_buckets WHERE coverage_seconds = 0.0 AND (uptime_seconds > 0 OR downtime_seconds > 0)")
         conn.commit()
 
-    # Seed from JSON files only if using the default production DB and table is empty
-    if db_path is None:
-        _maybe_import_from_json(conn)
-    conn.close()
+        # Seed from JSON files only if using the default production DB and table is empty
+        if db_path is None:
+            _maybe_import_from_json(conn)
+        _INITIALIZED_DBS.add(path)
+    finally:
+        conn.close()
 
 
 def _maybe_import_from_json(conn: sqlite3.Connection):
     try:
-        count = conn.execute("SELECT COUNT(*) FROM incidents").fetchone()[0]
-        if count == 0:
+        def _empty(table):
+            return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+
+        # Each table is gated on its own row count, not a single shared check —
+        # e.g. incidents already having rows (from webhook activity before the
+        # legacy JSON files were copied in) must not skip importing endpoints/
+        # maintenance/dependencies too.
+        if _empty("incidents"):
             status_file = os.path.join(DB_DIR, "status.json")
             if os.path.exists(status_file):
                 with open(status_file, "r", encoding="utf-8") as f:
@@ -187,6 +243,25 @@ def _maybe_import_from_json(conn: sqlite3.Connection):
                             VALUES (?, ?, ?, ?, ?, ?, ?, 'firing', ?, ?)
                         """, (k, k, a.get("name", "Unknown"), a.get("severity", "critical"), a.get("instance", "-"), a.get("summary", ""), a.get("job", ""), t, t))
 
+            history_file = os.path.join(DB_DIR, "history.json")
+            if os.path.exists(history_file):
+                with open(history_file, "r", encoding="utf-8") as f:
+                    hist_data = json.load(f)
+                with conn:
+                    for h in hist_data:
+                        k = h.get("key") or f"{h.get('name')}|{h.get('instance')}|{h.get('time')}"
+                        st = float(h.get("time", time.time()))
+                        dur = h.get("duration_seconds")
+                        conn.execute("""
+                            INSERT OR IGNORE INTO incidents (key, fingerprint, name, severity, instance, summary, job, status, started_at, resolved_at, duration_seconds, updated_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, 'resolved', ?, ?, ?, ?)
+                        """, (
+                            k, k, h.get("name", "Alert"), h.get("severity", "critical"),
+                            h.get("instance", "-"), h.get("summary", ""), h.get("job", ""),
+                            st, st + (dur or 0), dur, st + (dur or 0)
+                        ))
+
+        if _empty("event_logs"):
             logs_file = os.path.join(DB_DIR, "logs.json")
             if os.path.exists(logs_file):
                 with open(logs_file, "r", encoding="utf-8") as f:
@@ -209,24 +284,7 @@ def _maybe_import_from_json(conn: sqlite3.Connection):
                             l.get("fingerprint")
                         ))
 
-            history_file = os.path.join(DB_DIR, "history.json")
-            if os.path.exists(history_file):
-                with open(history_file, "r", encoding="utf-8") as f:
-                    hist_data = json.load(f)
-                with conn:
-                    for h in hist_data:
-                        k = h.get("key") or f"{h.get('name')}|{h.get('instance')}|{h.get('time')}"
-                        st = float(h.get("time", time.time()))
-                        dur = h.get("duration_seconds")
-                        conn.execute("""
-                            INSERT OR IGNORE INTO incidents (key, fingerprint, name, severity, instance, summary, job, status, started_at, resolved_at, duration_seconds, updated_at)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, 'resolved', ?, ?, ?, ?)
-                        """, (
-                            k, k, h.get("name", "Alert"), h.get("severity", "critical"),
-                            h.get("instance", "-"), h.get("summary", ""), h.get("job", ""),
-                            st, st + (dur or 0), dur, st + (dur or 0)
-                        ))
-
+        if _empty("endpoints"):
             endpoints_file = os.path.join(DB_DIR, "endpoints.json")
             if os.path.exists(endpoints_file):
                 with open(endpoints_file, "r", encoding="utf-8") as f:
@@ -238,6 +296,7 @@ def _maybe_import_from_json(conn: sqlite3.Connection):
                             VALUES (?, ?, ?, ?, ?)
                         """, (ep.get("id"), ep.get("name"), ep.get("url"), 1 if ep.get("is_active") else 0, ep.get("created_at", time.time())))
 
+        if _empty("maintenance_windows"):
             maint_file = os.path.join(DB_DIR, "maintenance.json")
             if os.path.exists(maint_file):
                 with open(maint_file, "r", encoding="utf-8") as f:
@@ -256,6 +315,7 @@ def _maybe_import_from_json(conn: sqlite3.Connection):
                             float(m.get("created_at", time.time()))
                         ))
 
+        if _empty("dependencies"):
             dep_file = os.path.join(DB_DIR, "dependencies.json")
             if os.path.exists(dep_file):
                 with open(dep_file, "r", encoding="utf-8") as f:
@@ -751,10 +811,22 @@ class AvailabilityBucketRepository:
     @staticmethod
     def get_bucket_count_in_range(job: str, start_time: float, end_time: float, db_path: Optional[str] = None) -> int:
         with db_read(db_path) as conn:
-            row = conn.execute(
-                "SELECT COUNT(*) as c FROM availability_buckets WHERE (job = ? OR ? = 'all') AND bucket_end > ? AND bucket_start < ?",
-                (job, job, start_time, end_time)
-            ).fetchone()
+            if job == 'all':
+                # UNIQUE is (job, instance, bucket_start) -- if an instance's
+                # job tag changed between aggregation cycles, the same
+                # instance+hour can exist under two job rows. A plain
+                # COUNT(*) double-counts that hour for job='all', same issue
+                # get_bucket_records() already dedups for. Count distinct
+                # (instance, bucket_start) pairs instead.
+                row = conn.execute(
+                    "SELECT COUNT(DISTINCT instance || ':' || bucket_start) as c FROM availability_buckets WHERE bucket_end > ? AND bucket_start < ?",
+                    (start_time, end_time)
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT COUNT(*) as c FROM availability_buckets WHERE job = ? AND bucket_end > ? AND bucket_start < ?",
+                    (job, start_time, end_time)
+                ).fetchone()
             return int(row["c"]) if row and row["c"] is not None else 0
 
     @staticmethod
@@ -795,4 +867,229 @@ class AggregationLeaseRepository:
     def release(lease_name: str, owner_id: str, db_path: Optional[str] = None):
         with db_transaction(db_path) as conn:
             conn.execute("DELETE FROM aggregation_leases WHERE lease_name = ? AND owner_id = ?", (lease_name, owner_id))
+
+
+class UserRepository:
+    @staticmethod
+    def _sanitize(row: sqlite3.Row, include_password_hash: bool = False) -> Dict[str, Any]:
+        d = dict(row)
+        if not include_password_hash:
+            d.pop("password_hash", None)
+        return d
+
+    @staticmethod
+    def count_users(db_path: Optional[str] = None) -> int:
+        with db_read(db_path) as conn:
+            row = conn.execute("SELECT COUNT(*) as c FROM users").fetchone()
+            return int(row["c"]) if row else 0
+
+    @staticmethod
+    def create_first_admin(
+        username: str,
+        password_hash: str,
+        display_name: str = "",
+        db_path: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        now = time.time()
+        username = username.strip()
+        display_name = display_name.strip() if display_name else username
+        with db_transaction(db_path) as conn:
+            count = conn.execute("SELECT COUNT(*) as c FROM users").fetchone()["c"]
+            if count > 0:
+                return None  # Race condition protection: admin already created
+            conn.execute("""
+                INSERT INTO users (username, password_hash, display_name, role, is_active, created_at, updated_at)
+                VALUES (?, ?, ?, 'admin', 1, ?, ?)
+            """, (username, password_hash, display_name, now, now))
+            row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+            return UserRepository._sanitize(row, include_password_hash=False) if row else None
+
+    @staticmethod
+    def create_user(
+        username: str,
+        password_hash: str,
+        role: str = "viewer",
+        display_name: str = "",
+        is_active: int = 1,
+        db_path: Optional[str] = None
+    ) -> Dict[str, Any]:
+        now = time.time()
+        username = username.strip()
+        role = role.strip().lower()
+        if role not in ("admin", "viewer"):
+            role = "viewer"
+        display_name = display_name.strip() if display_name else username
+        with db_transaction(db_path) as conn:
+            conn.execute("""
+                INSERT INTO users (username, password_hash, display_name, role, is_active, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (username, password_hash, display_name, role, 1 if is_active else 0, now, now))
+            row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+            return UserRepository._sanitize(row, include_password_hash=False)
+
+    @staticmethod
+    def get_by_username(
+        username: str,
+        include_password_hash: bool = False,
+        db_path: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        with db_read(db_path) as conn:
+            row = conn.execute("SELECT * FROM users WHERE username = ?", (username.strip(),)).fetchone()
+            return UserRepository._sanitize(row, include_password_hash=include_password_hash) if row else None
+
+    @staticmethod
+    def get_by_id(
+        user_id: int,
+        include_password_hash: bool = False,
+        db_path: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        with db_read(db_path) as conn:
+            row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+            return UserRepository._sanitize(row, include_password_hash=include_password_hash) if row else None
+
+    @staticmethod
+    def list_users(db_path: Optional[str] = None) -> List[Dict[str, Any]]:
+        with db_read(db_path) as conn:
+            rows = conn.execute("SELECT id, username, display_name, role, is_active, created_at, updated_at, last_login FROM users ORDER BY id ASC").fetchall()
+            return [dict(r) for r in rows]
+
+    @staticmethod
+    def update_last_login(user_id: int, now: Optional[float] = None, db_path: Optional[str] = None):
+        t = now if now is not None else time.time()
+        with db_transaction(db_path) as conn:
+            conn.execute("UPDATE users SET last_login = ?, updated_at = ? WHERE id = ?", (t, t, user_id))
+
+    @staticmethod
+    def update_user(
+        user_id: int,
+        role: Optional[str] = None,
+        is_active: Optional[int] = None,
+        display_name: Optional[str] = None,
+        password_hash: Optional[str] = None,
+        db_path: Optional[str] = None
+    ) -> bool:
+        fields = []
+        params = []
+        now = time.time()
+        if role is not None and role in ("admin", "viewer"):
+            fields.append("role = ?")
+            params.append(role)
+        if is_active is not None:
+            fields.append("is_active = ?")
+            params.append(1 if is_active else 0)
+        if display_name is not None:
+            fields.append("display_name = ?")
+            params.append(display_name.strip())
+        if password_hash is not None:
+            fields.append("password_hash = ?")
+            params.append(password_hash)
+        if not fields:
+            return False
+        fields.append("updated_at = ?")
+        params.append(now)
+        params.append(user_id)
+        with db_transaction(db_path) as conn:
+            cur = conn.execute(f"UPDATE users SET {', '.join(fields)} WHERE id = ?", params)
+            return cur.rowcount > 0
+
+
+class AcknowledgmentRepository:
+    @staticmethod
+    def acknowledge_instances(
+        instances: List[str],
+        username: str,
+        now: Optional[float] = None,
+        db_path: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        t = now if now is not None else time.time()
+        res = []
+        with db_transaction(db_path) as conn:
+            for inst in instances:
+                inst_clean = str(inst).strip()
+                if not inst_clean:
+                    continue
+                conn.execute("""
+                    INSERT OR REPLACE INTO alert_acknowledgments (target_key, instance, acknowledged_by, acknowledged_at, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (inst_clean, inst_clean, username, t, t))
+                res.append({
+                    "instance": inst_clean,
+                    "acknowledged": True,
+                    "acknowledged_by": username,
+                    "acknowledged_at": t
+                })
+        return res
+
+    @staticmethod
+    def unacknowledge_instance(instance: str, db_path: Optional[str] = None) -> bool:
+        with db_transaction(db_path) as conn:
+            cur = conn.execute("DELETE FROM alert_acknowledgments WHERE target_key = ? OR instance = ?", (instance, instance))
+            return cur.rowcount > 0
+
+    @staticmethod
+    def get_active_acknowledgments(db_path: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+        with db_read(db_path) as conn:
+            rows = conn.execute("SELECT * FROM alert_acknowledgments").fetchall()
+            return {
+                r["instance"]: {
+                    "target_key": r["target_key"],
+                    "instance": r["instance"],
+                    "acknowledged_by": r["acknowledged_by"],
+                    "acknowledged_at": r["acknowledged_at"],
+                    "created_at": r["created_at"]
+                }
+                for r in rows
+            }
+
+    @staticmethod
+    def clear_resolved(active_down_instances: set, db_path: Optional[str] = None):
+        """Clean up acknowledgments for targets that are no longer down."""
+        with db_transaction(db_path) as conn:
+            rows = conn.execute("SELECT target_key, instance FROM alert_acknowledgments").fetchall()
+            for r in rows:
+                if r["instance"] not in active_down_instances:
+                    conn.execute("DELETE FROM alert_acknowledgments WHERE target_key = ?", (r["target_key"],))
+
+
+class AuditLogRepository:
+    @staticmethod
+    def record_action(
+        actor_username: str,
+        actor_role: str,
+        action: str,
+        resource: str = "",
+        details: str = "",
+        db_path: Optional[str] = None
+    ) -> Dict[str, Any]:
+        now = time.time()
+        with db_transaction(db_path) as conn:
+            conn.execute("""
+                INSERT INTO audit_logs (actor_username, actor_role, action, resource, details, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (actor_username, actor_role, action, resource, details, now))
+            # Retention limit: keep latest 5000 audit logs
+            conn.execute("""
+                DELETE FROM audit_logs WHERE id NOT IN (
+                    SELECT id FROM audit_logs ORDER BY created_at DESC, id DESC LIMIT 5000
+                )
+            """)
+        return {
+            "actor_username": actor_username,
+            "actor_role": actor_role,
+            "action": action,
+            "resource": resource,
+            "details": details,
+            "created_at": now
+        }
+
+    @staticmethod
+    def get_recent_logs(limit: int = 100, db_path: Optional[str] = None) -> List[Dict[str, Any]]:
+        limit = max(1, min(limit, 500))
+        with db_read(db_path) as conn:
+            rows = conn.execute("""
+                SELECT id, actor_username, actor_role, action, resource, details, created_at
+                FROM audit_logs ORDER BY created_at DESC, id DESC LIMIT ?
+            """, (limit,)).fetchall()
+            return [dict(r) for r in rows]
+
 

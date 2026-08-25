@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, render_template
+from flask import Flask, request, jsonify, render_template, session, g
 import json
 import time
 import os
@@ -12,7 +12,7 @@ import ipaddress
 import logging
 import socket
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import wraps
 from urllib.request import urlopen, Request
 from urllib.error import URLError
@@ -43,13 +43,15 @@ try:
     from storage import (
         init_db, IncidentRepository, EventLogRepository,
         MaintenanceRepository, DependencyRepository, EndpointRepository, DeletedTargetRepository,
-        AvailabilityBucketRepository, AggregationLeaseRepository
+        AvailabilityBucketRepository, AggregationLeaseRepository,
+        UserRepository, AcknowledgmentRepository, AuditLogRepository
     )
 except ImportError:
     from alarm.storage import (
         init_db, IncidentRepository, EventLogRepository,
         MaintenanceRepository, DependencyRepository, EndpointRepository, DeletedTargetRepository,
-        AvailabilityBucketRepository, AggregationLeaseRepository
+        AvailabilityBucketRepository, AggregationLeaseRepository,
+        UserRepository, AcknowledgmentRepository, AuditLogRepository
     )
 
 try:
@@ -62,9 +64,17 @@ except ImportError:
     )
 
 try:
-    from auth import API_KEY, require_api_key, require_webhook_secret, get_api_key, get_webhook_secret
+    from auth import (
+        API_KEY, require_api_key, require_webhook_secret, get_api_key, get_webhook_secret,
+        get_session_secret, hash_password, verify_password, get_current_authenticated_user,
+        has_permission, require_permission, require_auth, require_admin, ROLE_PERMISSIONS
+    )
 except ImportError:
-    from alarm.auth import API_KEY, require_api_key, require_webhook_secret, get_api_key, get_webhook_secret
+    from alarm.auth import (
+        API_KEY, require_api_key, require_webhook_secret, get_api_key, get_webhook_secret,
+        get_session_secret, hash_password, verify_password, get_current_authenticated_user,
+        has_permission, require_permission, require_auth, require_admin, ROLE_PERMISSIONS
+    )
 
 init_db()
 
@@ -93,6 +103,15 @@ except (TypeError, ValueError):
 _AVAIL_FRESHNESS_TOLERANCE_SEC = 150.0  # 60.0 * 2.5
 
 app = Flask(__name__)
+app.secret_key = get_session_secret()
+app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+app.config['SESSION_COOKIE_NAME'] = 'infrawatch_session'
+if os.environ.get("SESSION_COOKIE_SECURE", "0") == "1":
+    app.config['SESSION_COOKIE_SECURE'] = True
+# Flask defaults PERMANENT_SESSION_LIFETIME to 31 days; a NOC login on a
+# shared workstation shouldn't stay valid that long unattended.
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(hours=int(os.environ.get("INFRAWATCH_SESSION_HOURS", "24")))
 # Static assets (JS/CSS/mp3) are safe to let browsers cache briefly — only the
 # dynamic/live JSON endpoints need the no-cache headers below.
 app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 300
@@ -325,6 +344,7 @@ def load_endpoints():
     return data
 
 DEFAULT_JOB_FILTER = os.environ.get("JOB_FILTER", "all")
+ALERTNAME_TARGET_DOWN = "TargetDown"
 
 # Minimal shape check for the Add Target form — not full RFC validation, just
 # enough to reject obvious garbage (e.g. a bare number) before it's written to
@@ -569,9 +589,13 @@ def _cached_is_safe_endpoint_url(url):
         future = _DNS_CHECK_EXECUTOR.submit(is_safe_endpoint_url, url)
         ok, reason = future.result(timeout=_SAFE_CHECK_TIMEOUT_SEC)
     except TimeoutError:
-        ok, reason = True, "DNS check timed out; treated as safe (re-checked next cycle)"
+        # Fail open but do NOT cache it — a slow/hanging lookup is transient;
+        # caching "safe" for the full TTL would let a deliberately-stalled
+        # DNS response buy an attacker a trusted window instead of being
+        # re-checked on the very next call like the comment above promises.
+        return True, "DNS check timed out; treated as safe (re-checked next cycle)"
     except Exception:
-        ok, reason = True, "DNS check errored; treated as safe (re-checked next cycle)"
+        return True, "DNS check errored; treated as safe (re-checked next cycle)"
     with _SAFE_CANDIDATE_CACHE_LOCK:
         _SAFE_CANDIDATE_CACHE[url] = (now, ok, reason)
     return ok, reason
@@ -729,9 +753,9 @@ _RATE_LAST_PRUNE = [0.0]
 _RATE_PRUNE_INTERVAL = 60.0
 
 def _client_identity():
-    # An operator's API key (mutation routes) identifies them across tabs/
-    # devices sharing one budget; anonymous/read requests fall back to
-    # remote IP. Matches the credential lookup in auth.py's require_api_key.
+    # Session user identity, M2M API key, or fallback to remote IP.
+    if session.get("user_id"):
+        return f"user:{session.get('user_id')}"
     header = request.headers.get("X-API-Key") or request.headers.get("Authorization", "")
     if header.startswith("Bearer "):
         header = header[len("Bearer "):]
@@ -751,13 +775,19 @@ def rate_limit(max_calls, per_seconds):
             with _RATE_BUCKETS_LOCK:
                 if now - _RATE_LAST_PRUNE[0] > _RATE_PRUNE_INTERVAL:
                     _RATE_LAST_PRUNE[0] = now
-                    current_window = int(now // per_seconds)
-                    stale = [k for k in _RATE_BUCKETS if k[2] < current_window]
+                    # Each key carries its own route's per_seconds (k[3]), so
+                    # staleness is judged against that window's own end time —
+                    # not a window index recomputed from whichever route
+                    # happened to trigger this prune pass (that mixed windows
+                    # across routes with different per_seconds and could wipe
+                    # another route's bucket mid-window, resetting its quota
+                    # early).
+                    stale = [k for k in _RATE_BUCKETS if (k[2] + 1) * k[3] <= now]
                     for k in stale:
                         _RATE_BUCKETS.pop(k, None)
 
                 window = int(now // per_seconds)
-                key = (f.__name__, _client_identity(), window)
+                key = (f.__name__, _client_identity(), window, per_seconds)
                 count = _RATE_BUCKETS.get(key, 0) + 1
                 _RATE_BUCKETS[key] = count
 
@@ -961,6 +991,260 @@ def record_alert_event(name, severity, instance, summary, job, event_time, is_no
 
         return True
 
+# ── Authentication & User Management API ──────────────────────────────────────
+@app.route('/api/auth/status', methods=['GET'])
+def auth_status_api():
+    try:
+        user_count = UserRepository.count_users()
+    except Exception:
+        user_count = 0
+    initialized = user_count > 0
+    current_user = get_current_authenticated_user()
+    return jsonify({
+        "ok": True,
+        "initialized": initialized,
+        "authenticated": current_user is not None,
+        "user": current_user
+    })
+
+@app.route('/api/auth/setup', methods=['POST'])
+@rate_limit(10, 60)
+def auth_setup_api():
+    data = request.json or {}
+    username = str(data.get("username") or "").strip()
+    password = str(data.get("password") or "")
+    confirm = str(data.get("confirm_password") or "")
+    display_name = str(data.get("display_name") or username).strip()
+
+    if not username or len(username) < 3:
+        return jsonify({"ok": False, "error": "Username must be at least 3 characters"}), 400
+    if not re.match(r'^[a-zA-Z0-9_\-\.]+$', username):
+        return jsonify({"ok": False, "error": "Username contains invalid characters"}), 400
+    if not password or len(password) < 6:
+        return jsonify({"ok": False, "error": "Password must be at least 6 characters"}), 400
+    if confirm and password != confirm:
+        return jsonify({"ok": False, "error": "Passwords do not match"}), 400
+
+    pw_hash = hash_password(password)
+    user = UserRepository.create_first_admin(username=username, password_hash=pw_hash, display_name=display_name)
+    if not user:
+        return jsonify({"ok": False, "error": "System already initialized with an administrator"}), 409
+
+    # Automatically create session and log in the first admin
+    session["user_id"] = user["id"]
+    session.permanent = True
+    UserRepository.update_last_login(user["id"])
+
+    AuditLogRepository.record_action(
+        actor_username=username,
+        actor_role="admin",
+        action="SYSTEM_SETUP",
+        resource="user:admin",
+        details="Initial administrator account created"
+    )
+    user_info = get_current_authenticated_user()
+    return jsonify({"ok": True, "user": user_info})
+
+@app.route('/api/auth/login', methods=['POST'])
+@rate_limit(20, 60)
+def auth_login_api():
+    data = request.json or {}
+    username = str(data.get("username") or "").strip()
+    password = str(data.get("password") or "")
+
+    if not username or not password:
+        return jsonify({"ok": False, "error": "Username and password are required"}), 400
+
+    user_with_hash = UserRepository.get_by_username(username, include_password_hash=True)
+    if not user_with_hash or not user_with_hash.get("is_active"):
+        return jsonify({"ok": False, "error": "Invalid username or password"}), 401
+
+    if not verify_password(password, user_with_hash.get("password_hash", "")):
+        return jsonify({"ok": False, "error": "Invalid username or password"}), 401
+
+    session["user_id"] = user_with_hash["id"]
+    session.permanent = True
+    UserRepository.update_last_login(user_with_hash["id"])
+
+    user_info = get_current_authenticated_user()
+    AuditLogRepository.record_action(
+        actor_username=user_info["username"],
+        actor_role=user_info["role"],
+        action="USER_LOGIN",
+        resource=f"user:{user_info['username']}",
+        details="User logged in via web session"
+    )
+    return jsonify({"ok": True, "user": user_info})
+
+@app.route('/api/auth/logout', methods=['POST'])
+def auth_logout_api():
+    user = get_current_authenticated_user()
+    if user and not user.get("is_m2m"):
+        AuditLogRepository.record_action(
+            actor_username=user["username"],
+            actor_role=user["role"],
+            action="USER_LOGOUT",
+            resource=f"user:{user['username']}",
+            details="User logged out"
+        )
+    session.clear()
+    return jsonify({"ok": True})
+
+@app.route('/api/auth/me', methods=['GET'])
+@require_auth
+def auth_me_api():
+    return jsonify({"ok": True, "user": g.current_user})
+
+@app.route('/api/auth/users', methods=['GET'])
+@require_permission("users.manage")
+def list_users_api():
+    return jsonify({"ok": True, "users": UserRepository.list_users()})
+
+@app.route('/api/auth/users', methods=['POST'])
+@require_permission("users.manage")
+def create_user_api():
+    data = request.json or {}
+    username = str(data.get("username") or "").strip()
+    password = str(data.get("password") or "")
+    role = str(data.get("role") or "viewer").strip().lower()
+    display_name = str(data.get("display_name") or username).strip()
+
+    if not username or len(username) < 3:
+        return jsonify({"ok": False, "error": "Username must be at least 3 characters"}), 400
+    if not re.match(r'^[a-zA-Z0-9_\-\.]+$', username):
+        return jsonify({"ok": False, "error": "Username contains invalid characters"}), 400
+    if not password or len(password) < 6:
+        return jsonify({"ok": False, "error": "Password must be at least 6 characters"}), 400
+    if role not in ("admin", "viewer"):
+        return jsonify({"ok": False, "error": "Role must be admin or viewer"}), 400
+
+    if UserRepository.get_by_username(username):
+        return jsonify({"ok": False, "error": "Username already exists"}), 409
+
+    pw_hash = hash_password(password)
+    user = UserRepository.create_user(username=username, password_hash=pw_hash, role=role, display_name=display_name)
+    AuditLogRepository.record_action(
+        actor_username=g.current_user.get("username", "admin"),
+        actor_role=g.current_user.get("role", "admin"),
+        action="CREATE_USER",
+        resource=f"user:{username}",
+        details=f"Created user with role {role}"
+    )
+    return jsonify({"ok": True, "user": user})
+
+@app.route('/api/auth/users/<int:user_id>', methods=['PATCH'])
+@require_permission("users.manage")
+def update_user_api(user_id):
+    target = UserRepository.get_by_id(user_id)
+    if not target:
+        return jsonify({"ok": False, "error": "User not found"}), 404
+
+    data = request.json or {}
+    role = data.get("role")
+    is_active = data.get("is_active")
+    display_name = data.get("display_name")
+    password = data.get("password") or None
+
+    if role is not None:
+        role = str(role).strip().lower()
+        if role not in ("admin", "viewer"):
+            return jsonify({"ok": False, "error": "Role must be admin or viewer"}), 400
+    if password is not None and len(password) < 6:
+        return jsonify({"ok": False, "error": "Password must be at least 6 characters"}), 400
+
+    # Don't let the last active admin lock everyone (including themselves) out
+    losing_admin = target["role"] == "admin" and target["is_active"] and (
+        (role is not None and role != "admin") or (is_active is not None and not is_active)
+    )
+    if losing_admin:
+        other_active_admins = sum(
+            1 for u in UserRepository.list_users()
+            if u["id"] != user_id and u["role"] == "admin" and u["is_active"]
+        )
+        if other_active_admins == 0:
+            return jsonify({"ok": False, "error": "Cannot remove the last active admin"}), 400
+
+    pw_hash = hash_password(password) if password else None
+    updated = UserRepository.update_user(
+        user_id, role=role, is_active=is_active, display_name=display_name, password_hash=pw_hash
+    )
+    if not updated:
+        return jsonify({"ok": False, "error": "No changes to apply"}), 400
+
+    AuditLogRepository.record_action(
+        actor_username=g.current_user.get("username", "admin"),
+        actor_role=g.current_user.get("role", "admin"),
+        action="UPDATE_USER",
+        resource=f"user:{target['username']}",
+        details=f"role={role if role is not None else target['role']}, is_active={is_active if is_active is not None else target['is_active']}"
+    )
+    return jsonify({"ok": True, "user": UserRepository.get_by_id(user_id)})
+
+# ── Alert Acknowledgment API ──────────────────────────────────────────────────
+@app.route('/api/alerts/ack', methods=['POST'])
+@rate_limit(30, 60)
+@require_permission("alerts.ack")
+def acknowledge_alert_api():
+    data = request.json or {}
+    instances = data.get("instances")
+    instance = data.get("instance") or data.get("target")
+
+    target_list = []
+    if isinstance(instances, list):
+        target_list = [str(x).strip() for x in instances if str(x).strip()]
+    elif instance:
+        target_list = [str(instance).strip()]
+
+    if not target_list:
+        # Acknowledge all currently down instances
+        state = build_canonical_monitoring_state("all")
+        target_list = [t["instance"] for t in state.get("targets", []) if t.get("health") != "up" and not t.get("maintenance") and not t.get("acknowledged")]
+
+    if not target_list:
+        return jsonify({"ok": True, "message": "No active down targets to acknowledge", "acknowledged": []})
+
+    username = g.current_user.get("username", "operator")
+    acked = AcknowledgmentRepository.acknowledge_instances(target_list, username=username)
+
+    AuditLogRepository.record_action(
+        actor_username=g.current_user.get("username", "operator"),
+        actor_role=g.current_user.get("role", "admin"),
+        action="ACK_ALERT",
+        resource=",".join(target_list[:5]),
+        details=f"Acknowledged {len(target_list)} down instance(s)"
+    )
+    return jsonify({"ok": True, "acknowledged": acked})
+
+@app.route('/api/alerts/unack', methods=['POST'])
+@rate_limit(30, 60)
+@require_permission("alerts.ack")
+def unacknowledge_alert_api():
+    data = request.json or {}
+    instance = str(data.get("instance") or data.get("target") or "").strip()
+    if not instance:
+        return jsonify({"ok": False, "error": "Instance is required"}), 400
+
+    AcknowledgmentRepository.unacknowledge_instance(instance)
+    AuditLogRepository.record_action(
+        actor_username=g.current_user.get("username", "operator"),
+        actor_role=g.current_user.get("role", "admin"),
+        action="UNACK_ALERT",
+        resource=instance,
+        details="Unacknowledged instance outage"
+    )
+    return jsonify({"ok": True})
+
+# ── Audit Trail API ───────────────────────────────────────────────────────────
+@app.route('/api/audit/logs', methods=['GET'])
+@require_permission("audit.read")
+def get_audit_logs_api():
+    try:
+        limit = int(request.args.get('limit', 100))
+    except (TypeError, ValueError):
+        limit = 100
+    logs = AuditLogRepository.get_recent_logs(limit=limit)
+    return jsonify({"ok": True, "logs": logs})
+
 # ── Webhook ───────────────────────────────────────────────────────────────────
 @app.route('/webhook', methods=['POST'])
 @require_webhook_secret
@@ -1102,7 +1386,7 @@ def get_endpoints_api():
 
 @app.route('/api/endpoints', methods=['POST'])
 @rate_limit(20, 60)
-@require_api_key
+@require_permission('endpoints.write')
 def add_endpoint_api():
     global LAST_WORKING_PROMETHEUS_URL
     body = request.json or {}
@@ -1128,8 +1412,9 @@ def add_endpoint_api():
             EndpointRepository.create_endpoint(name=url, url=url, is_active=set_active)
             if set_active:
                 EndpointRepository.select_endpoint(url)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"Error adding endpoint {url}: {e}", flush=True)
+            return jsonify({"ok": False, "error": "Failed to save endpoint"}), 500
 
         if set_active:
             LAST_WORKING_PROMETHEUS_URL = url
@@ -1139,11 +1424,19 @@ def add_endpoint_api():
         _ENDPOINTS_CACHE["data"] = None
         data = load_endpoints()
         _EP_STATUS_CACHE["data"] = None
+
+    AuditLogRepository.record_action(
+        actor_username=g.current_user.get("username", "admin"),
+        actor_role=g.current_user.get("role", "admin"),
+        action="ADD_ENDPOINT",
+        resource=url,
+        details=f"Added endpoint (set_active={set_active})"
+    )
     return jsonify({"ok": True, "active": data["active"], "endpoints": data["endpoints"]})
 
 @app.route('/api/endpoints/select', methods=['POST'])
 @rate_limit(20, 60)
-@require_api_key
+@require_permission('endpoints.write')
 def select_endpoint_api():
     global LAST_WORKING_PROMETHEUS_URL
     body = request.json or {}
@@ -1169,11 +1462,18 @@ def select_endpoint_api():
         with PROMETHEUS_CACHE_LOCK:
             PROMETHEUS_CACHE.clear()
 
+    AuditLogRepository.record_action(
+        actor_username=g.current_user.get("username", "admin"),
+        actor_role=g.current_user.get("role", "admin"),
+        action="SELECT_ENDPOINT",
+        resource=url,
+        details="Selected active Prometheus endpoint"
+    )
     return jsonify({"ok": True, "active": url})
 
 @app.route('/api/endpoints', methods=['DELETE'])
 @rate_limit(20, 60)
-@require_api_key
+@require_permission('endpoints.write')
 def delete_endpoint_api():
     global LAST_WORKING_PROMETHEUS_URL
     body = request.json or {}
@@ -1202,6 +1502,13 @@ def delete_endpoint_api():
                 PROMETHEUS_CACHE.clear()
         _EP_STATUS_CACHE["data"] = None
 
+    AuditLogRepository.record_action(
+        actor_username=g.current_user.get("username", "admin"),
+        actor_role=g.current_user.get("role", "admin"),
+        action="DELETE_ENDPOINT",
+        resource=url,
+        details="Deleted Prometheus endpoint"
+    )
     return jsonify({"ok": True, "active": data["active"], "endpoints": data["endpoints"]})
 
 # Standalone diagnostic utility — lists Prometheus job names for curl/ops use.
@@ -1263,7 +1570,7 @@ def get_targets_api():
 
 @app.route('/api/targets', methods=['POST'])
 @rate_limit(20, 60)
-@require_api_key
+@require_permission('targets.write')
 def add_target_api():
     data = request.json or {}
     url = data.get('url', '').strip()
@@ -1284,11 +1591,18 @@ def add_target_api():
             current.append(url)
             save_website_targets(current)
 
+    AuditLogRepository.record_action(
+        actor_username=g.current_user.get("username", "admin"),
+        actor_role=g.current_user.get("role", "admin"),
+        action="ADD_TARGET",
+        resource=url,
+        details="Added website/IP target"
+    )
     return jsonify({"ok": True, "targets": current})
 
 @app.route('/api/targets', methods=['DELETE'])
 @rate_limit(20, 60)
-@require_api_key
+@require_permission('targets.write')
 def delete_target_api():
     data = request.json or {}
     url = data.get('url', '').strip()
@@ -1306,6 +1620,13 @@ def delete_target_api():
             deleted.append(url)
             save_deleted_targets(deleted)
 
+    AuditLogRepository.record_action(
+        actor_username=g.current_user.get("username", "admin"),
+        actor_role=g.current_user.get("role", "admin"),
+        action="DELETE_TARGET",
+        resource=url,
+        details="Deleted website/IP target"
+    )
     return jsonify({"ok": True})
 
 # ── Maintenance windows API ─────────────────────────────────────────────────
@@ -1320,7 +1641,7 @@ def list_maintenance_api():
 
 @app.route('/api/maintenance', methods=['POST'])
 @rate_limit(20, 60)
-@require_api_key
+@require_permission('maintenance.write')
 def create_maintenance_api():
     data = request.json or {}
     target = (data.get('target') or '').strip()
@@ -1352,11 +1673,19 @@ def create_maintenance_api():
                 "end": end,
                 "created_at": int(time.time()),
             }
+
+    AuditLogRepository.record_action(
+        actor_username=g.current_user.get("username", "admin"),
+        actor_role=g.current_user.get("role", "admin"),
+        action="CREATE_MAINTENANCE",
+        resource=f"{scope}:{target}",
+        details=f"Created maintenance window {window.get('id')} ({reason})"
+    )
     return jsonify({"ok": True, "window": window})
 
 @app.route('/api/maintenance/<window_id>', methods=['DELETE'])
 @rate_limit(20, 60)
-@require_api_key
+@require_permission('maintenance.write')
 def delete_maintenance_api(window_id):
     with _WEBHOOK_LOCK:
         try:
@@ -1365,6 +1694,14 @@ def delete_maintenance_api(window_id):
             deleted = False
         if not deleted:
             return jsonify({"ok": False, "error": "Maintenance window not found"}), 404
+
+    AuditLogRepository.record_action(
+        actor_username=g.current_user.get("username", "admin"),
+        actor_role=g.current_user.get("role", "admin"),
+        action="DELETE_MAINTENANCE",
+        resource=window_id,
+        details="Deleted maintenance window"
+    )
     return jsonify({"ok": True})
 
 # ── Alert Correlation (Phase 12) ─────────────────────────────────────────────
@@ -1400,7 +1737,7 @@ def list_dependencies_api():
 
 @app.route('/api/dependencies', methods=['POST'])
 @rate_limit(20, 60)
-@require_api_key
+@require_permission('dependencies.write')
 def create_dependency_api():
     data = request.json or {}
     child = (data.get('child') or '').strip()
@@ -1415,11 +1752,19 @@ def create_dependency_api():
             dep = DependencyRepository.create_dependency(parent=parent, child=child)
         except Exception:
             dep = {"id": f"dep_{int(time.time() * 1000)}", "child": child, "parent": parent, "created_at": int(time.time())}
+
+    AuditLogRepository.record_action(
+        actor_username=g.current_user.get("username", "admin"),
+        actor_role=g.current_user.get("role", "admin"),
+        action="CREATE_DEPENDENCY",
+        resource=f"{parent}->{child}",
+        details=f"Created dependency: {child} depends on {parent}"
+    )
     return jsonify({"ok": True, "dependency": dep})
 
 @app.route('/api/dependencies/<dep_id>', methods=['DELETE'])
 @rate_limit(20, 60)
-@require_api_key
+@require_permission('dependencies.write')
 def delete_dependency_api(dep_id):
     with _WEBHOOK_LOCK:
         try:
@@ -1428,6 +1773,14 @@ def delete_dependency_api(dep_id):
             deleted = False
         if not deleted:
             return jsonify({"ok": False, "error": "Dependency not found"}), 404
+
+    AuditLogRepository.record_action(
+        actor_username=g.current_user.get("username", "admin"),
+        actor_role=g.current_user.get("role", "admin"),
+        action="DELETE_DEPENDENCY",
+        resource=dep_id,
+        details="Deleted dependency link"
+    )
     return jsonify({"ok": True})
 
 # ── Telegram Notifications API ───────────────────────────────────────────────
@@ -1437,7 +1790,7 @@ def delete_dependency_api(dep_id):
 # viewer.
 @app.route('/api/telegram', methods=['GET'])
 @rate_limit(20, 60)
-@require_api_key
+@require_permission('telegram.read')
 def get_telegram_api():
     config = get_telegram_config()
     token = config.get("bot_token", "")
@@ -1455,7 +1808,7 @@ def get_telegram_api():
 
 @app.route('/api/telegram', methods=['POST'])
 @rate_limit(20, 60)
-@require_api_key
+@require_permission('telegram.write')
 def save_telegram_api():
     data = request.json or {}
     updated = {}
@@ -1473,18 +1826,32 @@ def save_telegram_api():
         updated["min_severity"] = str(data["min_severity"]).strip().lower()
 
     if save_telegram_config(updated):
+        AuditLogRepository.record_action(
+            actor_username=g.current_user.get("username", "admin"),
+            actor_role=g.current_user.get("role", "admin"),
+            action="UPDATE_TELEGRAM",
+            resource="telegram_config",
+            details="Updated Telegram notification settings"
+        )
         return jsonify({"ok": True, "message": "Telegram configuration saved"})
     return jsonify({"ok": False, "error": "Failed to save configuration"}), 500
 
 @app.route('/api/telegram/test', methods=['POST'])
 @rate_limit(10, 60)
-@require_api_key
+@require_permission('telegram.write')
 def test_telegram_api():
     data = request.json or {}
     token = data.get("bot_token")
     cid = data.get("chat_id")
     ok, msg = test_telegram_connection(token, cid)
     if ok:
+        AuditLogRepository.record_action(
+            actor_username=g.current_user.get("username", "admin"),
+            actor_role=g.current_user.get("role", "admin"),
+            action="TEST_TELEGRAM",
+            resource="telegram_test",
+            details="Dispatched test notification to Telegram"
+        )
         return jsonify({"ok": True, "message": "Test notification sent successfully to Telegram"})
     return jsonify({"ok": False, "error": msg}), 400
 
@@ -1704,7 +2071,9 @@ def build_canonical_monitoring_state(job_param=None):
             "summary": {
                 "total": 0, "up": 0, "down": 0, "slow": 0, "maintenance": 0,
                 "suppressed": 0, "alarmable_down": 0, "alarmable_alerts": 0,
-                "has_alarm": True, "system_status": "CRITICAL"
+                "unacknowledged_down": 0, "acknowledged_down": 0,
+                "is_acknowledged": False, "has_alarm": True,
+                "has_unacknowledged_alarm": True, "system_status": "CRITICAL"
             },
             "active_alerts": [],
             "targets": []
@@ -1853,6 +2222,18 @@ def build_canonical_monitoring_state(job_param=None):
         item['dependencyId'] = dep_id_map.get(item['instance'])
         item['is_suppressed'] = bool(item.get('suppressedBy') or item.get('maintenance'))
 
+    # Attach global alert acknowledgments from SQLite
+    try:
+        active_acks = AcknowledgmentRepository.get_active_acknowledgments()
+    except Exception:
+        active_acks = {}
+
+    for item in result:
+        ack_rec = active_acks.get(item['instance'])
+        item['acknowledged'] = bool(ack_rec)
+        item['acknowledged_by'] = ack_rec['acknowledged_by'] if ack_rec else None
+        item['acknowledged_at'] = ack_rec['acknowledged_at'] if ack_rec else None
+
     # Derive authoritative target-level severity & effective_status
     for item in result:
         is_down = item['health'] != 'up'
@@ -1890,6 +2271,17 @@ def build_canonical_monitoring_state(job_param=None):
         else:
             item['effective_status'] = "up"
 
+    # Auto-clean acknowledgments for targets that have recovered (health == 'up').
+    # `result` is filtered by job_param, so it only has full down-state visibility
+    # on the unfiltered ("all") sweep -- running this on a job-scoped view would
+    # see every other job's down instances as "absent" and wipe their acks.
+    if not job_param or job_param.lower() in ('all', '*'):
+        try:
+            active_down_set = {t['instance'] for t in result if t['health'] != 'up'}
+            AcknowledgmentRepository.clear_resolved(active_down_set)
+        except Exception:
+            pass
+
     # Compute authoritative global system metrics & status
     total = len(result)
     up_count = sum(1 for t in result if t['health'] == 'up')
@@ -1899,6 +2291,8 @@ def build_canonical_monitoring_state(job_param=None):
     supp_count = sum(1 for t in result if t.get('suppressedBy'))
     alarmable_down = sum(1 for t in result if t['is_alarmable'] and t['health'] != 'up')
     alarmable_alerts = sum(len(t.get('active_alerts', [])) for t in result if t['is_alarmable'])
+    unacked_down = sum(1 for t in result if t['is_alarmable'] and t['health'] != 'up' and not t.get('acknowledged'))
+    acked_down = sum(1 for t in result if t['is_alarmable'] and t['health'] != 'up' and t.get('acknowledged'))
 
     has_critical = (alarmable_down > 0 or any(
         a.get('severity') == 'critical' for t in result if t['is_alarmable'] for a in t.get('active_alerts', [])
@@ -1914,6 +2308,10 @@ def build_canonical_monitoring_state(job_param=None):
     else:
         system_status = "NORMAL"
 
+    has_alarm = (alarmable_down > 0 or alarmable_alerts > 0)
+    # Global ACK state: true if all alarmable down targets are acknowledged
+    is_globally_acknowledged = (alarmable_down > 0 and unacked_down == 0)
+
     summary = {
         "total": total,
         "up": up_count,
@@ -1923,7 +2321,11 @@ def build_canonical_monitoring_state(job_param=None):
         "suppressed": supp_count,
         "alarmable_down": alarmable_down,
         "alarmable_alerts": alarmable_alerts,
-        "has_alarm": (alarmable_down > 0 or alarmable_alerts > 0),
+        "unacknowledged_down": unacked_down,
+        "acknowledged_down": acked_down,
+        "is_acknowledged": is_globally_acknowledged,
+        "has_alarm": has_alarm,
+        "has_unacknowledged_alarm": (unacked_down > 0),
         "system_status": system_status
     }
 
@@ -2897,7 +3299,6 @@ def health():
 # off automatically — Alertmanager, when present, is the source of truth.
 ALERT_POLL_INTERVAL_SECONDS = float(os.environ.get("ALERT_POLL_INTERVAL", "15"))
 WEBHOOK_ACTIVE_WINDOW_SECONDS = 120
-ALERTNAME_TARGET_DOWN = "TargetDown"
 
 _poller_state = {}  # instance -> 'up' | 'down', seeded from status.json at startup
 _maintenance_active_prev = set()  # instance-scoped maintenance windows active as of the last poll tick

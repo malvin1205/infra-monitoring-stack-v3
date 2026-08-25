@@ -1,29 +1,64 @@
-"""API key / webhook secret auth for state-changing endpoints.
+"""Authentication & Role-Based Authorization for InfraWatch.
 
-Automatic first-run provisioning:
-If INFRAWATCH_API_KEY / WEBHOOK_SECRET are not provided via environment variables,
-cryptographically secure 64-character hex tokens are automatically generated and
-persisted to local key files (.api_key and .webhook_secret) inside the alarm
-storage directory. This ensures zero-setup fresh installations while preserving
-full authentication protection across container restarts and reboots.
+Three Authentication Domains:
+1. HUMAN (Browser):
+   - Secure Session Cookie (HttpOnly, SameSite=Lax, Secure)
+   - First-run Admin Setup -> Username + Password -> Login/Logout
+   - Role-Based Access Control (Admin / Viewer)
+2. MACHINE / AUTOMATION (M2M):
+   - X-API-Key or Authorization: Bearer <key>
+   - Auto-provisioned in .api_key or INFRAWATCH_API_KEY
+   - Grants full administrative access for automated tooling/scripts
+3. WEBHOOK (Alertmanager):
+   - X-Webhook-Secret
+   - Auto-provisioned in .webhook_secret or WEBHOOK_SECRET
 
-Precedence:
-  1. Explicit environment variable (INFRAWATCH_API_KEY / API_KEY, WEBHOOK_SECRET)
-  2. Persisted token file (.api_key, .webhook_secret)
-  3. Automatically generated secure token (secrets.token_hex(32)) persisted to file
+Precedence for credentials:
+  1. Explicit environment variable
+  2. Persisted token file
+  3. Automatically generated secure token persisted to file
 """
 import hmac
 import logging
 import os
 import secrets
 from functools import wraps
-from typing import Optional
-from flask import request, jsonify
+from typing import Optional, Dict, Any, Set
+from flask import request, jsonify, session, g
+from werkzeug.security import generate_password_hash, check_password_hash
 
 logger = logging.getLogger("infrawatch.auth")
 
 DEFAULT_API_KEY_FILE = os.path.join(os.path.dirname(__file__), ".api_key")
 DEFAULT_WEBHOOK_SECRET_FILE = os.path.join(os.path.dirname(__file__), ".webhook_secret")
+DEFAULT_SESSION_SECRET_FILE = os.path.join(os.path.dirname(__file__), ".session_secret")
+
+# ── Role & Permission Definitions ─────────────────────────────────────────────
+ROLE_PERMISSIONS: Dict[str, Set[str]] = {
+    "admin": {
+        "dashboard.read",
+        "targets.read",
+        "targets.write",
+        "endpoints.read",
+        "endpoints.write",
+        "maintenance.read",
+        "maintenance.write",
+        "dependencies.read",
+        "dependencies.write",
+        "telegram.read",
+        "telegram.write",
+        "users.manage",
+        "alerts.ack",
+        "audit.read",
+    },
+    "viewer": {
+        "dashboard.read",
+        "targets.read",
+        "endpoints.read",
+        "maintenance.read",
+        "dependencies.read",
+    }
+}
 
 
 def _load_env_file():
@@ -88,29 +123,28 @@ def _persist_token(filepath: str, token: str) -> bool:
 
 
 def get_api_key_filepath() -> str:
-    """Return the configured path for the persisted API key file."""
     return os.environ.get("INFRAWATCH_API_KEY_FILE") or DEFAULT_API_KEY_FILE
 
 
 def get_webhook_secret_filepath() -> str:
-    """Return the configured path for the persisted webhook secret file."""
     return os.environ.get("INFRAWATCH_WEBHOOK_SECRET_FILE") or DEFAULT_WEBHOOK_SECRET_FILE
+
+
+def get_session_secret_filepath() -> str:
+    return os.environ.get("INFRAWATCH_SESSION_SECRET_FILE") or DEFAULT_SESSION_SECRET_FILE
 
 
 def get_or_create_api_key() -> str:
     """Resolve API key: Environment -> Persisted file -> Auto-generate."""
-    # 1. Explicit environment variable
     env_key = os.environ.get("INFRAWATCH_API_KEY") or os.environ.get("API_KEY")
     if env_key and env_key.strip():
         return env_key.strip()
 
-    # 2. Persisted key file
     key_path = get_api_key_filepath()
     persisted = _load_persisted_token(key_path)
     if persisted:
         return persisted
 
-    # 3. Auto-generate secure 32-byte (64 hex characters) token
     generated = secrets.token_hex(32)
     _persist_token(key_path, generated)
     logger.info("Automatic API key provisioning: generated new API key and saved to %s", key_path)
@@ -119,26 +153,39 @@ def get_or_create_api_key() -> str:
 
 def get_or_create_webhook_secret() -> str:
     """Resolve Webhook secret: Environment -> Persisted file -> Auto-generate."""
-    # 1. Explicit environment variable
     env_secret = os.environ.get("WEBHOOK_SECRET")
     if env_secret and env_secret.strip():
         return env_secret.strip()
 
-    # 2. Persisted secret file
     secret_path = get_webhook_secret_filepath()
     persisted = _load_persisted_token(secret_path)
     if persisted:
         return persisted
 
-    # 3. Auto-generate secure 32-byte (64 hex characters) token
     generated = secrets.token_hex(32)
     _persist_token(secret_path, generated)
     logger.info("Automatic webhook secret provisioning: generated new webhook secret and saved to %s", secret_path)
     return generated
 
 
+def get_or_create_session_secret() -> str:
+    """Resolve Session secret for Flask cookie signing: Environment -> Persisted file -> Auto-generate."""
+    env_secret = os.environ.get("INFRAWATCH_SESSION_SECRET") or os.environ.get("SECRET_KEY")
+    if env_secret and env_secret.strip():
+        return env_secret.strip()
+
+    secret_path = get_session_secret_filepath()
+    persisted = _load_persisted_token(secret_path)
+    if persisted:
+        return persisted
+
+    generated = secrets.token_hex(32)
+    _persist_token(secret_path, generated)
+    logger.info("Automatic session secret provisioning: generated new session secret and saved to %s", secret_path)
+    return generated
+
+
 def get_api_key() -> str:
-    """Get active API key."""
     global API_KEY
     key = get_or_create_api_key()
     API_KEY = key
@@ -146,34 +193,149 @@ def get_api_key() -> str:
 
 
 def get_webhook_secret() -> str:
-    """Get active Webhook secret."""
     global WEBHOOK_SECRET
     secret = get_or_create_webhook_secret()
     WEBHOOK_SECRET = secret
     return secret
 
 
+def get_session_secret() -> str:
+    global SESSION_SECRET
+    sec = get_or_create_session_secret()
+    SESSION_SECRET = sec
+    return sec
+
+
 # Module-level variables for backwards compatibility
 API_KEY = get_api_key()
 WEBHOOK_SECRET = get_webhook_secret()
+SESSION_SECRET = get_session_secret()
 
 
+# ── Password Hashing Helpers ──────────────────────────────────────────────────
+def hash_password(password: str) -> str:
+    """Generate a secure cryptographic password hash using standard Werkzeug security."""
+    return generate_password_hash(password)
+
+
+def verify_password(password: str, password_hash: str) -> bool:
+    """Verify a plaintext password against a stored password hash."""
+    if not password or not password_hash:
+        return False
+    return check_password_hash(password_hash, password)
+
+
+# ── Credential Extraction & Current User Resolution ───────────────────────────
 def _provided_key() -> str:
     header = request.headers.get("X-API-Key") or request.headers.get("Authorization", "")
     if header.startswith("Bearer "):
         header = header[len("Bearer "):]
-    return header
+    return header.strip()
+
+
+def get_current_authenticated_user() -> Optional[Dict[str, Any]]:
+    """Resolves the current authenticated user from either:
+    1. Machine API Key (X-API-Key / Authorization: Bearer) -> Admin identity
+    2. Human Session (Flask session cookie user_id) -> Database user record
+    """
+    # 1. Check Machine API Key
+    provided = _provided_key()
+    if provided:
+        current_key = get_api_key()
+        if current_key and hmac.compare_digest(provided, current_key):
+            return {
+                "id": 0,
+                "username": "m2m:api_key",
+                "display_name": "API Key Automation",
+                "role": "admin",
+                "is_active": 1,
+                "is_m2m": True,
+                "permissions": sorted(list(ROLE_PERMISSIONS["admin"]))
+            }
+
+    # 2. Check Human Session Cookie
+    user_id = session.get("user_id")
+    if user_id is not None:
+        try:
+            try:
+                from storage import UserRepository
+            except ImportError:
+                from alarm.storage import UserRepository
+            user = UserRepository.get_by_id(user_id, include_password_hash=False)
+            if user and user.get("is_active"):
+                role = user.get("role", "viewer")
+                perms = ROLE_PERMISSIONS.get(role, ROLE_PERMISSIONS["viewer"])
+                user_dict = dict(user)
+                user_dict["is_m2m"] = False
+                user_dict["permissions"] = sorted(list(perms))
+                return user_dict
+        except Exception as e:
+            logger.error("Failed to load user from session: %s", e)
+
+    return None
+
+
+def has_permission(user: Optional[Dict[str, Any]], permission: Optional[str] = None) -> bool:
+    """Check if the user has the required permission."""
+    if not user:
+        return False
+    if not permission:
+        return True
+    if user.get("role") == "admin":
+        return True
+    role = user.get("role", "viewer")
+    perms = ROLE_PERMISSIONS.get(role, set())
+    return permission in perms
+
+
+# ── Unified Authorization Decorators ──────────────────────────────────────────
+def require_permission(permission: Optional[str] = None):
+    """Enforces that the incoming request is authenticated (via session or API key)
+    and has the specified permission. Injects g.current_user for the route handler.
+    """
+    def decorator(f):
+        @wraps(f)
+        def decorated(*args, **kwargs):
+            user = get_current_authenticated_user()
+            if not user:
+                return jsonify({"ok": False, "error": "Unauthorized"}), 401
+            if permission and not has_permission(user, permission):
+                return jsonify({"ok": False, "error": f"Forbidden: '{permission}' permission required"}), 403
+            g.current_user = user
+            return f(*args, **kwargs)
+        return decorated
+    return decorator
+
+
+def require_auth(f):
+    """Requires authentication (session or API key) with any valid active role."""
+    return require_permission(None)(f)
+
+
+def require_admin(f):
+    """Requires full admin role."""
+    return require_permission("users.manage")(f)
 
 
 def require_api_key(f):
+    """Backward-compatible decorator for existing endpoints.
+    Accepts valid Machine API Key OR authenticated human session with required permission.
+    """
     @wraps(f)
     def decorated(*args, **kwargs):
         current_key = get_api_key()
         if not current_key:
             return jsonify({"ok": False, "error": "Server auth not configured (INFRAWATCH_API_KEY unset)"}), 500
-        provided = _provided_key()
-        if not provided or not hmac.compare_digest(provided, current_key):
+
+        user = get_current_authenticated_user()
+        if not user:
             return jsonify({"ok": False, "error": "Unauthorized"}), 401
+
+        # Check if caller has write permissions for mutations (or is admin)
+        if user.get("role") != "admin":
+            return jsonify({"ok": False, "error": "Forbidden: Admin permission required"}), 403
+
+        g.current_user = user
         return f(*args, **kwargs)
     return decorated
 
@@ -192,3 +354,4 @@ def require_webhook_secret(f):
             return jsonify({"ok": False, "error": "Unauthorized"}), 401
         return f(*args, **kwargs)
     return decorated
+

@@ -17,8 +17,14 @@ CONFIG_FILE = os.path.join(os.path.dirname(__file__), "telegram_config.json")
 # Asynchronous worker pool for non-blocking notifications
 _EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="tg-alert")
 
-# Local timezone offset (WIB / UTC+7 default, can be overridden)
-TZ_OFFSET_HOURS = int(os.environ.get("ALERT_TZ_OFFSET_HOURS", "7"))
+# Local timezone offset (WIB / UTC+7 default, can be overridden). A bad value
+# (e.g. "UTC+7", empty string) must not crash the whole app at import time --
+# fall back to the default instead.
+try:
+    TZ_OFFSET_HOURS = float(os.environ.get("ALERT_TZ_OFFSET_HOURS", "7"))
+except (ValueError, TypeError):
+    logger.warning("Invalid ALERT_TZ_OFFSET_HOURS=%r, falling back to 7 (WIB)", os.environ.get("ALERT_TZ_OFFSET_HOURS"))
+    TZ_OFFSET_HOURS = 7
 LOCAL_TZ = timezone(timedelta(hours=TZ_OFFSET_HOURS))
 
 

@@ -156,6 +156,47 @@
         <span id="selfHealthDot" style="position:absolute; top:5px; right:5px; width:7px; height:7px; border-radius:50%; background: var(--success);"></span>
       </button>
 
+      <!-- User / Auth Badge & Actions -->
+      <div id="userAuthWrap" class="user-auth-wrap" style="position: relative;">
+        <button id="userMenuBtn" class="user-menu-btn" type="button" title="User account" aria-haspopup="true" aria-expanded="false">
+          <span class="user-avatar" id="userAvatar">G</span>
+          <span class="user-name" id="userNameLabel">Guest</span>
+          <span class="user-role-pill" id="userRolePill">Viewer</span>
+        </button>
+        <div id="userDropdown" class="user-dropdown hidden">
+          <div class="user-dropdown-header">
+            <div class="user-dropdown-name" id="dropdownUserName">Guest User</div>
+            <div class="user-dropdown-role" id="dropdownUserRole">Read-Only Viewer</div>
+          </div>
+          <div class="user-dropdown-divider"></div>
+          <button id="headerManageUsersBtn" class="dropdown-item hidden" type="button">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right: 8px; flex-shrink: 0;">
+              <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
+              <circle cx="9" cy="7" r="4"/>
+              <path d="M23 21v-2a4 4 0 0 0-3-3.87"/>
+              <path d="M16 3.13a4 4 0 0 1 0 7.75"/>
+            </svg>
+            Manage Users
+          </button>
+          <button id="headerLoginBtn" class="dropdown-item" type="button">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right: 8px; flex-shrink: 0;">
+              <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/>
+              <polyline points="10 17 15 12 10 7"/>
+              <line x1="15" y1="12" x2="3" y2="12"/>
+            </svg>
+            Log In
+          </button>
+          <button id="headerLogoutBtn" class="dropdown-item hidden" type="button">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right: 8px; flex-shrink: 0;">
+              <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+              <polyline points="16 17 21 12 16 7"/>
+              <line x1="21" y1="12" x2="9" y2="12"/>
+            </svg>
+            Log Out
+          </button>
+        </div>
+      </div>
+
       <button class="icon-action" id="themeToggleBtn" aria-label="Toggle theme">
         <svg id="themeIconDark" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
           <path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/>
@@ -372,7 +413,7 @@
         <div class="host-skeleton" aria-hidden="true"></div>
       </div>
 
-      <!-- Pagination (TV wallboard — max 80 cards/page) -->
+      <!-- Pagination (TV wallboard — adaptive cards/page, see calculateGridCapacity in alarm.js) -->
       <div class="host-pagination hidden" id="hostPagination">
         <span class="hp-info" id="hpInfo">Showing 0 of 0 hosts</span>
         <div class="hp-controls">
@@ -392,106 +433,105 @@
     </section>
   </main>
 
-  <!-- ── Side Drawer ────────────────────────────────────── -->
-  <!-- ── Semi-Fullscreen Target Detail Modal ────────────────────────────────────── -->
+  <!-- ── Side Drawer / Semi-Fullscreen Target Detail Modal ──────────────────── -->
   <div class="drawer-backdrop hidden" id="sideDrawerOverlay" aria-hidden="true"></div>
   <aside class="side-drawer" id="sideDrawer" role="dialog" aria-modal="true" aria-label="Target Details Modal">
 
     <!-- Modal Header -->
-    <div class="drawer-header" style="padding: 16px 20px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; background: rgba(15, 23, 42, 0.95);">
-      <div class="drawer-host-info" style="display: flex; align-items: center; gap: 12px;">
+    <div class="drawer-header">
+      <div class="drawer-host-info">
         <span class="drawer-dot" id="drawerStatusDot"></span>
-        <div style="display: flex; align-items: center; gap: 8px;">
-          <h3 class="drawer-ip" id="drawerTargetTitle" style="margin: 0; font-size: 17px; font-weight: 700; font-family: var(--font-mono); color: var(--text-primary);">—</h3>
-          <span class="drawer-job-text" id="drawerJobBadge" style="font-size: 11px; padding: 2px 8px; border-radius: 4px; background: rgba(255,255,255,0.06); color: var(--text-secondary); border: 1px solid var(--border);">—</span>
-          <span class="drawer-status-pill" id="drawerStatusPill" style="margin-left: 6px;">—</span>
+        <div class="drawer-title-group">
+          <h3 class="drawer-ip" id="drawerTargetTitle">—</h3>
+          <span class="drawer-job-text" id="drawerJobBadge">—</span>
+          <span class="drawer-status-pill" id="drawerStatusPill">—</span>
         </div>
       </div>
 
-      <div class="drawer-actions-top" style="display: flex; align-items: center; gap: 10px;">
-        <button class="btn btn-sm btn-secondary" id="drawerRefreshBtn" type="button" title="Refresh Target Data" style="display: flex; align-items: center; gap: 6px; font-size: 12px;">
+      <div class="drawer-actions-top">
+        <button class="btn btn-sm btn-secondary" id="drawerRefreshBtn" type="button" title="Refresh Target Data">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg>
           <span>Refresh</span>
         </button>
-        <button class="drawer-close" id="closeDrawerBtn" aria-label="Close details" style="background: rgba(255,255,255,0.06); border: 1px solid var(--border); color: var(--text-secondary); width: 32px; height: 32px; border-radius: 6px; display: flex; align-items: center; justify-content: center; cursor: pointer;">
+        <button class="drawer-close" id="closeDrawerBtn" aria-label="Close details">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
         </button>
       </div>
     </div>
 
     <!-- Modal Tabs Navigation -->
-    <div class="modal-nav-tabs" id="modalTabsNav">
-      <button class="modal-nav-tab active" data-tab="overview" type="button">
+    <div class="modal-nav-tabs" id="modalTabsNav" role="tablist">
+      <button class="modal-nav-tab active" data-tab="overview" type="button" role="tab" aria-selected="true">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
         <span>Overview</span>
       </button>
-      <button class="modal-nav-tab" data-tab="history" type="button">
+      <button class="modal-nav-tab" data-tab="history" type="button" role="tab" aria-selected="false">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
         <span>History</span>
       </button>
-      <button class="modal-nav-tab" data-tab="events" type="button">
+      <button class="modal-nav-tab" data-tab="events" type="button" role="tab" aria-selected="false">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
         <span>Events</span>
       </button>
-      <button class="modal-nav-tab" data-tab="maintenance" type="button">
+      <button class="modal-nav-tab" data-tab="maintenance" type="button" role="tab" aria-selected="false">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>
         <span>Maintenance</span>
       </button>
-      <button class="modal-nav-tab" data-tab="raw" type="button">
+      <button class="modal-nav-tab" data-tab="raw" type="button" role="tab" aria-selected="false">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>
         <span>Settings</span>
       </button>
     </div>
 
     <!-- Modal Body Content -->
-    <div class="drawer-body" style="flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 16px; background: #0b1120;">
+    <div class="drawer-body">
 
       <div class="drawer-error-row hidden" id="drawerErrorRow"></div>
 
       <!-- ── TAB PANE 1: OVERVIEW ───────────────────────── -->
-      <div class="modal-tab-pane" id="tabPaneOverview" style="display: flex; flex-direction: column; gap: 16px;">
+      <div class="modal-tab-pane" id="tabPaneOverview">
         
         <!-- Row 1: Key Metrics Grid -->
-        <div class="drawer-metrics" style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px;">
-          <div class="dm-card" style="background: var(--bg-card); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px;">
-            <span class="dm-label" style="font-size: 11px; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.04em;">Status</span>
-            <div style="display: flex; align-items: center; gap: 8px; margin-top: 6px;">
-              <span class="dm-value" id="drawerStatusText" style="font-size: 16px; font-weight: 700;">—</span>
+        <div class="drawer-metrics-grid">
+          <div class="dm-card">
+            <span class="dm-label">Status</span>
+            <div style="display: flex; align-items: center; gap: 8px; margin-top: 4px;">
+              <span class="dm-value" id="drawerStatusText">—</span>
             </div>
-            <span style="font-size: 11px; color: var(--text-muted); margin-top: 4px; display: block;">Last check: <span id="drawerLastCheck">—</span></span>
+            <span class="dm-meta">Last check: <span id="drawerLastCheck">—</span></span>
           </div>
 
-          <div class="dm-card" style="background: var(--bg-card); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px;">
-            <span class="dm-label" style="font-size: 11px; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.04em;">Latency</span>
-            <div class="dm-value" id="drawerLatency" style="font-size: 16px; font-weight: 700; margin-top: 6px;">—</div>
-            <span style="font-size: 11px; color: var(--text-muted); margin-top: 4px; display: block;">Probe: <strong id="drawerHttpCode">—</strong></span>
+          <div class="dm-card">
+            <span class="dm-label">Latency</span>
+            <div class="dm-value" id="drawerLatency" style="margin-top: 4px;">—</div>
+            <span class="dm-meta">Probe: <strong id="drawerHttpCode">—</strong></span>
           </div>
 
-          <div class="dm-card" style="background: var(--bg-card); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px;">
-            <span class="dm-label" style="font-size: 11px; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.04em;">Probe State</span>
-            <div class="dm-value" id="drawerProbeState" style="font-size: 16px; font-weight: 700; margin-top: 6px;">—</div>
-            <span style="font-size: 11px; color: var(--text-muted); margin-top: 4px; display: block;" id="drawerProbeDetail">—</span>
+          <div class="dm-card">
+            <span class="dm-label">Probe State</span>
+            <div class="dm-value" id="drawerProbeState" style="margin-top: 4px;">—</div>
+            <span class="dm-meta" id="drawerProbeDetail">—</span>
           </div>
 
-          <div class="dm-card" style="background: var(--bg-card); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px;">
-            <span class="dm-label" id="drawerUptimeLabel" style="font-size: 11px; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.04em;">Uptime (Realtime)</span>
-            <div class="dm-value" id="drawerUptimeVal" style="font-size: 16px; font-weight: 700; color: #22C55E; margin-top: 6px;">—</div>
-            <span style="font-size: 11px; color: var(--text-muted); margin-top: 4px; display: block;" id="drawerUptimeSince">—</span>
+          <div class="dm-card">
+            <span class="dm-label" id="drawerUptimeLabel">Uptime (Realtime)</span>
+            <div class="dm-value" id="drawerUptimeVal" style="color: var(--success); margin-top: 4px;">—</div>
+            <span class="dm-meta" id="drawerUptimeSince">—</span>
           </div>
         </div>
 
         <!-- Row 2: Charts Grid (Response Time Trend + Availability 24h) -->
-        <div style="display: grid; grid-template-columns: 1.5fr 1fr; gap: 14px;">
+        <div class="drawer-charts-grid">
           <!-- Response Time Trend -->
-          <div class="drawer-section" style="background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; padding: 14px;">
-            <div class="drawer-section-title-wrap" style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px;">
-              <div class="drawer-section-title" id="drawerSparklineTitle" style="margin-bottom: 0; font-size: 13px; font-weight: 700;">RESPONSE TIME TREND <span id="drawerSparklineRange" class="modal-title-sub">(24h)</span></div>
+          <div class="drawer-section-card">
+            <div class="drawer-section-title-wrap">
+              <div class="drawer-section-title" id="drawerSparklineTitle">RESPONSE TIME TREND <span id="drawerSparklineRange" class="modal-title-sub">(24h)</span></div>
               <span class="sparkline-badge" id="drawerSparklineBadge" style="font-size: 11px; padding: 2px 8px; border-radius: 12px; background: rgba(34,197,94,0.15); color: #22C55E; font-weight: 600; display: none;">Normal</span>
             </div>
 
             <!-- Response Time Trend Toolbar (Range Selectors + Reset Zoom) -->
-            <div class="sp-toolbar" style="display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; flex-wrap: wrap;">
-              <div class="sp-range-group" id="spRangeGroup" style="display: flex; align-items: center; gap: 3px; background: rgba(15,23,42,0.4); padding: 3px; border-radius: 6px; border: 1px solid var(--border);">
+            <div class="sp-toolbar">
+              <div class="sp-range-group" id="spRangeGroup">
                 <button class="sp-range-btn" data-range="5m" type="button">5m</button>
                 <button class="sp-range-btn" data-range="15m" type="button">15m</button>
                 <button class="sp-range-btn" data-range="1h" type="button">1h</button>
@@ -499,101 +539,104 @@
                 <button class="sp-range-btn active" data-range="24h" type="button">24h</button>
                 <button class="sp-range-btn" data-range="7d" type="button">7d</button>
               </div>
-              <button id="sparklineResetZoomBtn" class="btn btn-sm btn-secondary" type="button" style="display: none; font-size: 11px; padding: 2px 8px; color: #38BDF8; border-color: rgba(56,189,248,0.3); background: rgba(56,189,248,0.1);">
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right: 4px;"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>Reset Zoom
+              <button id="sparklineResetZoomBtn" class="sp-reset-zoom-btn" type="button" style="display: none;">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
+                <span>Reset Zoom</span>
               </button>
             </div>
 
             <!-- Summary Stats Header Bar -->
-            <div class="sparkline-stats-bar" id="drawerSparklineStatsBar" style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-bottom: 8px;">
-              <div class="sp-stat-item" style="background: rgba(15,23,42,0.6); border: 1px solid var(--border); border-radius: 6px; padding: 4px 6px; text-align: center;">
-                <div style="font-size: 9px; color: var(--text-secondary); text-transform: uppercase;">Current</div>
-                <div style="font-size: 11px; font-weight: 700; color: var(--text-primary);" id="spStatNow">—</div>
+            <div class="sparkline-stats-grid" id="drawerSparklineStatsBar">
+              <div class="sp-stat-card">
+                <div class="sp-stat-card-label">Current</div>
+                <div class="sp-stat-card-val" id="spStatNow">—</div>
               </div>
-              <div class="sp-stat-item" style="background: rgba(15,23,42,0.6); border: 1px solid var(--border); border-radius: 6px; padding: 4px 6px; text-align: center;">
-                <div style="font-size: 9px; color: var(--text-secondary); text-transform: uppercase;">Avg</div>
-                <div style="font-size: 11px; font-weight: 700; color: var(--text-primary);" id="spStatAvg">—</div>
+              <div class="sp-stat-card">
+                <div class="sp-stat-card-label">Avg</div>
+                <div class="sp-stat-card-val" id="spStatAvg">—</div>
               </div>
-              <div class="sp-stat-item" style="background: rgba(15,23,42,0.6); border: 1px solid var(--border); border-radius: 6px; padding: 4px 6px; text-align: center;">
-                <div style="font-size: 9px; color: var(--text-secondary); text-transform: uppercase;">p95</div>
-                <div style="font-size: 11px; font-weight: 700; color: var(--accent);" id="spStatP95">—</div>
+              <div class="sp-stat-card">
+                <div class="sp-stat-card-label">p95</div>
+                <div class="sp-stat-card-val" style="color: var(--accent);" id="spStatP95">—</div>
               </div>
-              <div class="sp-stat-item" style="background: rgba(15,23,42,0.6); border: 1px solid var(--border); border-radius: 6px; padding: 4px 6px; text-align: center;">
-                <div style="font-size: 9px; color: var(--text-secondary); text-transform: uppercase;">Max</div>
-                <div style="font-size: 11px; font-weight: 700; color: #EF4444;" id="spStatMax">—</div>
+              <div class="sp-stat-card">
+                <div class="sp-stat-card-label">Max</div>
+                <div class="sp-stat-card-val" style="color: var(--critical);" id="spStatMax">—</div>
               </div>
             </div>
 
             <!-- Interactive Sparkline Container -->
             <div class="sparkline-wrap" id="drawerSparkline">
-              <div class="de-empty" style="padding: 15px; font-size: 12px; color: var(--text-secondary); text-align: center;">Loading response time trend data...</div>
+              <div class="de-empty">Loading response time trend data...</div>
             </div>
           </div>
 
           <!-- Availability (Last 24 Hours) Bar Chart -->
-          <div class="drawer-section" style="background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; padding: 14px; display: flex; flex-direction: column; justify-content: space-between;">
-            <div class="drawer-section-title" style="font-size: 13px; font-weight: 700; margin-bottom: 10px;">AVAILABILITY (LAST 24 HOURS)</div>
-            <div id="drawerAvailabilityBars" style="display: flex; align-items: flex-end; gap: 3px; height: 110px; padding: 8px 0; border-bottom: 1px dashed var(--border);">
-              <!-- Rendered via JS -->
+          <div class="drawer-section-card" style="justify-content: space-between;">
+            <div>
+              <div class="drawer-section-title">AVAILABILITY (LAST 24 HOURS)</div>
+              <div id="drawerAvailabilityBars" class="drawer-avail-bars-wrap">
+                <!-- Rendered via JS -->
+              </div>
+              <div id="drawerAvailabilityTimeLabels" class="drawer-avail-labels">
+                <span>-24h</span>
+                <span>-18h</span>
+                <span>-12h</span>
+                <span>-6h</span>
+                <span>Now</span>
+              </div>
             </div>
-            <div id="drawerAvailabilityTimeLabels" style="display: flex; justify-content: space-between; font-size: 10px; color: var(--text-secondary); margin-top: 6px;">
-              <span>-24h</span>
-              <span>-18h</span>
-              <span>-12h</span>
-              <span>-6h</span>
-              <span>Now</span>
-            </div>
-            <div style="display: flex; justify-content: center; gap: 16px; font-size: 11px; color: var(--text-secondary); margin-top: 8px;">
-              <span style="display: flex; align-items: center; gap: 4px;"><span style="width: 8px; height: 8px; border-radius: 2px; background: #22C55E;"></span> Up</span>
-              <span style="display: flex; align-items: center; gap: 4px;"><span style="width: 8px; height: 8px; border-radius: 2px; background: #EF4444;"></span> Down</span>
+            <div class="drawer-avail-legend">
+              <span class="drawer-avail-legend-item"><span style="width: 8px; height: 8px; border-radius: 2px; background: var(--success);"></span> Up</span>
+              <span class="drawer-avail-legend-item"><span style="width: 8px; height: 8px; border-radius: 2px; background: var(--critical);"></span> Down</span>
             </div>
           </div>
         </div>
 
         <!-- Row 3: Details Bottom Grid (Target Info, Recent Events, Probe Summary) -->
-        <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 14px;">
+        <div class="drawer-details-grid">
           
           <!-- Target Info -->
-          <div class="drawer-section" style="background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; padding: 14px;">
-            <div class="drawer-section-title" style="font-size: 13px; font-weight: 700; margin-bottom: 10px;">TARGET INFO</div>
-            <div class="drawer-info-list" style="border: none; background: transparent;">
-              <div class="dil-row" style="padding: 6px 0; border-bottom: 1px solid rgba(255,255,255,0.05);">
-                <span class="dil-label" style="font-size: 12px;">IP Address</span>
-                <span class="dil-value" id="drawerInfoIp" style="font-family: var(--font-mono); font-size: 12px;">—</span>
+          <div class="drawer-section-card">
+            <div class="drawer-section-title">TARGET INFO</div>
+            <div class="drawer-info-list">
+              <div class="dil-row">
+                <span class="dil-label">IP Address</span>
+                <span class="dil-value" id="drawerInfoIp">—</span>
               </div>
-              <div class="dil-row" style="padding: 6px 0; border-bottom: 1px solid rgba(255,255,255,0.05);">
-                <span class="dil-label" style="font-size: 12px;">Job</span>
-                <span class="dil-value" id="drawerInfoJob" style="font-size: 12px;">—</span>
+              <div class="dil-row">
+                <span class="dil-label">Job</span>
+                <span class="dil-value" id="drawerInfoJob">—</span>
               </div>
-              <div class="dil-row" style="padding: 6px 0; border-bottom: 1px solid rgba(255,255,255,0.05);">
-                <span class="dil-label" style="font-size: 12px;">Protocol</span>
-                <span class="dil-value" id="drawerInfoProtocol" style="font-size: 12px;">—</span>
+              <div class="dil-row">
+                <span class="dil-label">Protocol</span>
+                <span class="dil-value" id="drawerInfoProtocol">—</span>
               </div>
-              <div class="dil-row" style="padding: 6px 0; border-bottom: 1px solid rgba(255,255,255,0.05);">
-                <span class="dil-label" style="font-size: 12px;">Module</span>
-                <span class="dil-value" id="drawerInfoModule" style="font-size: 12px;">—</span>
+              <div class="dil-row">
+                <span class="dil-label">Module</span>
+                <span class="dil-value" id="drawerInfoModule">—</span>
               </div>
-              <div class="dil-row" style="padding: 6px 0; border-bottom: 1px solid rgba(255,255,255,0.05);">
-                <span class="dil-label" style="font-size: 12px;">Scrape URL</span>
-                <a id="drawerTargetUrlLink" href="#" target="_blank" rel="noopener" class="dil-link" style="font-size: 11px; max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">—</a>
+              <div class="dil-row">
+                <span class="dil-label">Scrape URL</span>
+                <a id="drawerTargetUrlLink" href="#" target="_blank" rel="noopener" class="dil-link">—</a>
               </div>
-              <div class="dil-row" style="padding: 6px 0; border-bottom: 1px solid rgba(255,255,255,0.05);">
-                <span class="dil-label" style="font-size: 12px;">Last Scrape</span>
-                <span class="dil-value" id="drawerLastScrape" style="font-size: 12px;">—</span>
+              <div class="dil-row">
+                <span class="dil-label">Last Scrape</span>
+                <span class="dil-value" id="drawerLastScrape">—</span>
               </div>
-              <div class="dil-row" style="padding: 6px 0;">
-                <span class="dil-label" style="font-size: 12px;">Next Scrape</span>
-                <span class="dil-value" id="drawerNextScrape" style="font-size: 12px;">—</span>
+              <div class="dil-row">
+                <span class="dil-label">Next Scrape</span>
+                <span class="dil-value" id="drawerNextScrape">—</span>
               </div>
             </div>
           </div>
 
           <!-- Recent Events -->
-          <div class="drawer-section" style="background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; padding: 14px; display: flex; flex-direction: column; justify-content: space-between;">
+          <div class="drawer-section-card" style="justify-content: space-between;">
             <div>
-              <div class="drawer-section-title" style="font-size: 13px; font-weight: 700; margin-bottom: 10px;">RECENT EVENTS</div>
-              <div id="drawerRecentEventsList" style="display: flex; flex-direction: column; gap: 8px;">
-                <div class="de-empty" style="font-size: 12px; color: var(--text-secondary);">Loading event logs...</div>
+              <div class="drawer-section-title">RECENT EVENTS</div>
+              <div id="drawerRecentEventsList" style="display: flex; flex-direction: column; gap: 6px; margin-top: 4px;">
+                <div class="de-empty">Loading event logs...</div>
               </div>
             </div>
             <button class="btn btn-sm btn-link" id="btnViewAllEvents" type="button" style="align-self: flex-start; margin-top: 10px; font-size: 11px; color: var(--accent); padding: 0; background: none; border: none; cursor: pointer;">
@@ -602,36 +645,36 @@
           </div>
 
           <!-- Probe Summary -->
-          <div class="drawer-section" style="background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; padding: 14px;">
-            <div class="drawer-section-title" style="font-size: 13px; font-weight: 700; margin-bottom: 10px;">PROBE SUMMARY <span id="spSummaryRangeLabel" style="font-weight: 400; color: var(--text-secondary); text-transform: none;">(24h)</span></div>
-            <div class="dil-row" style="padding: 0 0 8px;">
-              <span class="dil-label" style="font-size: 12px;">Historical SLA</span>
+          <div class="drawer-section-card">
+            <div class="drawer-section-title">PROBE SUMMARY <span id="spSummaryRangeLabel" style="font-weight: 400; color: var(--text-muted); text-transform: none;">(24h)</span></div>
+            <div class="dil-row" style="padding: 0 0 6px;">
+              <span class="dil-label">Historical SLA</span>
               <span class="sla-badge" id="spSummarySlaBadge">—</span>
             </div>
-            <div class="drawer-info-list" style="border: none; background: transparent;">
-              <div class="dil-row" style="padding: 6px 0; border-bottom: 1px solid rgba(255,255,255,0.05);">
-                <span class="dil-label" style="font-size: 12px;">Observed Coverage</span>
-                <span class="dil-value" id="spSummaryTotalProbes" style="font-weight: 700; font-size: 12px;">—</span>
+            <div class="drawer-info-list">
+              <div class="dil-row">
+                <span class="dil-label">Observed Coverage</span>
+                <span class="dil-value" id="spSummaryTotalProbes" style="font-weight: 700;">—</span>
               </div>
-              <div class="dil-row" style="padding: 6px 0; border-bottom: 1px solid rgba(255,255,255,0.05);">
-                <span class="dil-label" style="font-size: 12px;">Successful</span>
-                <span class="dil-value" id="spSummarySuccess" style="color: #22C55E; font-weight: 700; font-size: 12px;">—</span>
+              <div class="dil-row">
+                <span class="dil-label">Successful</span>
+                <span class="dil-value" id="spSummarySuccess" style="color: var(--success); font-weight: 700;">—</span>
               </div>
-              <div class="dil-row" style="padding: 6px 0; border-bottom: 1px solid rgba(255,255,255,0.05);">
-                <span class="dil-label" style="font-size: 12px;">Failed</span>
-                <span class="dil-value" id="spSummaryFailed" style="color: #EF4444; font-weight: 700; font-size: 12px;">—</span>
+              <div class="dil-row">
+                <span class="dil-label">Failed</span>
+                <span class="dil-value" id="spSummaryFailed" style="color: var(--critical); font-weight: 700;">—</span>
               </div>
-              <div class="dil-row" style="padding: 6px 0; border-bottom: 1px solid rgba(255,255,255,0.05);">
-                <span class="dil-label" style="font-size: 12px;">MTTR (24h)</span>
-                <span class="dil-value" id="spSummaryMttr" style="font-size: 12px;">—</span>
+              <div class="dil-row">
+                <span class="dil-label">MTTR (24h)</span>
+                <span class="dil-value" id="spSummaryMttr">—</span>
               </div>
-              <div class="dil-row" style="padding: 6px 0; border-bottom: 1px solid rgba(255,255,255,0.05);">
-                <span class="dil-label" style="font-size: 12px;">Longest Outage</span>
-                <span class="dil-value" id="spSummaryLongestOutage" style="font-size: 12px;">—</span>
+              <div class="dil-row">
+                <span class="dil-label">Longest Outage</span>
+                <span class="dil-value" id="spSummaryLongestOutage">—</span>
               </div>
-              <div class="dil-row" style="padding: 6px 0;">
-                <span class="dil-label" style="font-size: 12px;">Last Outage</span>
-                <span class="dil-value" id="spSummaryLastOutage" style="font-size: 12px;">None</span>
+              <div class="dil-row">
+                <span class="dil-label">Last Outage</span>
+                <span class="dil-value" id="spSummaryLastOutage">None</span>
               </div>
             </div>
           </div>
@@ -641,38 +684,38 @@
       </div>
 
       <!-- ── TAB PANE 2: HISTORY ────────────────────────── -->
-      <div class="modal-tab-pane hidden" id="tabPaneHistory" style="display: flex; flex-direction: column; gap: 16px;">
-        <div class="drawer-section" style="background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; padding: 16px;">
-          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+      <div class="modal-tab-pane hidden" id="tabPaneHistory">
+        <div class="drawer-section-card">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
             <div>
-              <div class="drawer-section-title" style="font-size: 14px; font-weight: 700; margin: 0;">Target Response Time History & Performance</div>
+              <div class="drawer-section-title" style="margin: 0;">Target Response Time History & Performance</div>
               <div style="font-size: 11px; color: var(--text-secondary); margin-top: 2px;">Latency and availability history datapoints for the active range.</div>
             </div>
-            <div id="historyRangeTag" style="font-size: 11px; padding: 3px 10px; background: rgba(56,189,248,0.1); color: var(--accent); border-radius: 12px; font-weight: 600; border: 1px solid rgba(56,189,248,0.2);">History (24h)</div>
+            <div id="historyRangeTag" style="font-size: 11px; padding: 3px 10px; background: var(--accent-bg); color: var(--accent); border-radius: 12px; font-weight: 600; border: 1px solid rgba(56,189,248,0.2);">History (24h)</div>
           </div>
 
           <!-- History Interactive Full Chart Container -->
-          <div class="sparkline-wrap" id="drawerHistoryChart" style="margin-bottom: 16px;">
+          <div class="sparkline-wrap" id="drawerHistoryChart" style="margin-bottom: 14px;">
             <div class="de-empty" style="padding: 25px; text-align: center;">Loading latency history chart...</div>
           </div>
 
           <!-- History Summary Grid -->
-          <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 16px;">
-            <div style="background: rgba(15,23,42,0.6); border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px;">
-              <div style="font-size: 10px; color: var(--text-secondary); text-transform: uppercase;">Minimum Latency</div>
-              <div style="font-size: 14px; font-weight: 700; color: #22C55E; margin-top: 2px;" id="histMinVal">—</div>
+          <div class="history-stats-grid">
+            <div class="history-stat-card">
+              <div class="history-stat-label">Minimum Latency</div>
+              <div class="history-stat-value" style="color: var(--success);" id="histMinVal">—</div>
             </div>
-            <div style="background: rgba(15,23,42,0.6); border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px;">
-              <div style="font-size: 10px; color: var(--text-secondary); text-transform: uppercase;">Average Latency</div>
-              <div style="font-size: 14px; font-weight: 700; color: var(--text-primary); margin-top: 2px;" id="histAvgVal">—</div>
+            <div class="history-stat-card">
+              <div class="history-stat-label">Average Latency</div>
+              <div class="history-stat-value" id="histAvgVal">—</div>
             </div>
-            <div style="background: rgba(15,23,42,0.6); border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px;">
-              <div style="font-size: 10px; color: var(--text-secondary); text-transform: uppercase;">95th Percentile</div>
-              <div style="font-size: 14px; font-weight: 700; color: var(--accent); margin-top: 2px;" id="histP95Val">—</div>
+            <div class="history-stat-card">
+              <div class="history-stat-label">95th Percentile</div>
+              <div class="history-stat-value" style="color: var(--accent);" id="histP95Val">—</div>
             </div>
-            <div style="background: rgba(15,23,42,0.6); border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px;">
-              <div style="font-size: 10px; color: var(--text-secondary); text-transform: uppercase;">Maximum Spike</div>
-              <div style="font-size: 14px; font-weight: 700; color: #EF4444; margin-top: 2px;" id="histMaxVal">—</div>
+            <div class="history-stat-card">
+              <div class="history-stat-label">Maximum Spike</div>
+              <div class="history-stat-value" style="color: var(--critical);" id="histMaxVal">—</div>
             </div>
           </div>
 
@@ -682,7 +725,7 @@
               <div style="font-size: 12px; font-weight: 700; color: var(--text-primary);">Detailed Datapoints Log</div>
               <div id="histPointsCountBadge" style="font-size: 11px; color: var(--text-secondary); font-family: var(--font-mono);">—</div>
             </div>
-            <div id="drawerHistoryDatapointsList" style="max-height: 320px; overflow-y: auto; display: flex; flex-direction: column; gap: 4px;">
+            <div id="drawerHistoryDatapointsList" class="history-datapoints-list">
               <div class="de-empty" style="padding: 10px; font-size: 12px;">Loading detailed datapoints...</div>
             </div>
           </div>
@@ -690,24 +733,24 @@
       </div>
 
       <!-- ── TAB PANE 3: EVENTS ─────────────────────────── -->
-      <div class="modal-tab-pane hidden" id="tabPaneEvents" style="display: flex; flex-direction: column; gap: 16px;">
-        <div class="drawer-section" style="background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; padding: 16px;">
-          <div class="drawer-section-title" style="display: flex; justify-content: space-between; align-items: center; font-size: 14px; font-weight: 700; margin-bottom: 12px;">
+      <div class="modal-tab-pane hidden" id="tabPaneEvents">
+        <div class="drawer-section-card">
+          <div class="drawer-section-title" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
             <span>Uptime & Downtime Log</span>
-            <span id="eventsCountBadge" style="font-size: 11px; padding: 2px 8px; background: rgba(255,255,255,0.06); border-radius: 10px; font-weight: 400; color: var(--text-secondary);">0 events</span>
+            <span id="eventsCountBadge" style="font-size: 11px; padding: 2px 8px; background: var(--surface-raised); border-radius: 10px; font-weight: 400; color: var(--text-secondary); border: 1px solid var(--border);">0 events</span>
           </div>
-          <div class="drawer-events" id="drawerLogsList" style="max-height: 450px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px;">
+          <div class="drawer-events" id="drawerLogsList">
             <div class="de-empty">Loading event history log...</div>
           </div>
         </div>
       </div>
 
       <!-- ── TAB PANE 4: MAINTENANCE ────────────────────── -->
-      <div class="modal-tab-pane hidden" id="tabPaneMaintenance" style="display: flex; flex-direction: column; gap: 16px;">
-        <div class="drawer-section" id="drawerMaintenanceSection" style="background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; padding: 16px;">
-          <div class="drawer-section-title" style="font-size: 14px; font-weight: 700; margin-bottom: 12px;">Maintenance Mode</div>
+      <div class="modal-tab-pane hidden" id="tabPaneMaintenance">
+        <div class="drawer-section-card" id="drawerMaintenanceSection">
+          <div class="drawer-section-title" style="margin-bottom: 8px;">Maintenance Mode</div>
 
-          <div id="drawerMaintenanceActive" class="hidden" style="display:flex; flex-direction:column; gap:8px; background: var(--bg); border:1px solid var(--border-strong); border-radius: var(--r-md); padding: 12px 14px;">
+          <div id="drawerMaintenanceActive" class="hidden" style="display:flex; flex-direction:column; gap:8px; background: var(--surface-raised); border:1px solid var(--border-strong); border-radius: var(--r-md); padding: 12px 14px;">
             <div style="display:flex; justify-content:space-between; align-items:center; gap:8px;">
               <span style="font-size:12px; font-weight:600; color: var(--text-secondary);">Ends in <span id="drawerMaintCountdown" style="font-family: var(--font-mono); color: var(--text-primary);">—</span></span>
               <button id="drawerMaintEndBtn" class="btn btn-sm btn-secondary" type="button">End Early</button>
@@ -737,11 +780,11 @@
       </div>
 
       <!-- ── TAB PANE 5: RAW METRICS ────────────────────── -->
-      <div class="modal-tab-pane hidden" id="tabPaneRaw" style="display: flex; flex-direction: column; gap: 16px;">
-        <div class="drawer-section" id="drawerDependencySection" style="background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; padding: 16px;">
-          <div class="drawer-section-title" style="font-size: 14px; font-weight: 700; margin-bottom: 12px;">Depends On <em style="font-weight:400; text-transform:none; letter-spacing:normal;">(alert correlation)</em></div>
+      <div class="modal-tab-pane hidden" id="tabPaneRaw">
+        <div class="drawer-section-card" id="drawerDependencySection">
+          <div class="drawer-section-title" style="margin-bottom: 8px;">Depends On <em style="font-weight:400; text-transform:none; letter-spacing:normal;">(alert correlation)</em></div>
 
-          <div id="drawerDependencyActive" class="hidden" style="display:flex; justify-content:space-between; align-items:center; gap:8px; background: var(--bg); border:1px solid var(--border-strong); border-radius: var(--r-md); padding: 10px 14px; font-size:12px;">
+          <div id="drawerDependencyActive" class="hidden" style="display:flex; justify-content:space-between; align-items:center; gap:8px; background: var(--surface-raised); border:1px solid var(--border-strong); border-radius: var(--r-md); padding: 10px 14px; font-size:12px;">
             <span>Depends on <strong id="drawerDependencyParent" style="font-family: var(--font-mono); color: var(--text-primary);">—</strong></span>
             <button id="drawerDependencyRemoveBtn" class="btn btn-sm btn-secondary" type="button">Remove</button>
           </div>
@@ -755,9 +798,9 @@
           <span class="form-help" style="margin-top:6px; display:block;">When both this host and its parent are down, this host is de-emphasized instead of pulsing — its alert still fires and is logged normally.</span>
         </div>
 
-        <div class="drawer-section drawer-danger-section" style="background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; padding: 16px;">
-          <div class="drawer-section-title" style="font-size: 14px; font-weight: 700; color: #EF4444; margin-bottom: 12px;">Target Management</div>
-          <button id="drawerDeleteBtn" class="drawer-del-btn" style="width: 100%; justify-content: center; padding: 10px; background: rgba(239, 68, 68, 0.1); color: #EF4444; border: 1px solid rgba(239, 68, 68, 0.3); border-radius: var(--r-sm); font-size: 13px; font-weight: 500; cursor: pointer; display: flex; align-items: center; gap: 6px;" title="Remove this target from monitoring">
+        <div class="drawer-section-card drawer-danger-section">
+          <div class="drawer-section-title" style="color: var(--critical); margin-bottom: 8px;">Target Management</div>
+          <button id="drawerDeleteBtn" class="drawer-del-btn" style="width: 100%; justify-content: center; padding: 10px; background: var(--critical-bg); color: var(--critical); border: 1px solid var(--critical-border); border-radius: var(--r-sm); font-size: 13px; font-weight: 500; cursor: pointer; display: flex; align-items: center; gap: 6px;" title="Remove this target from monitoring">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
             <span>Remove Target from Monitoring</span>
           </button>
@@ -765,8 +808,8 @@
       </div>
 
       <!-- Modal Bottom Center Close Button -->
-      <div style="display: flex; justify-content: center; margin-top: 4px;">
-        <button id="modalCloseBottomBtn" type="button" class="btn btn-secondary" style="padding: 6px 20px; font-size: 12px; border-radius: 20px; display: flex; align-items: center; gap: 6px; background: rgba(255,255,255,0.06); border: 1px solid var(--border);">
+      <div class="modal-close-bottom-wrap">
+        <button id="modalCloseBottomBtn" type="button" class="modal-close-bottom-btn">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
           <span>Close</span>
         </button>
@@ -1235,6 +1278,155 @@
           <!-- Populated via JS from /health -->
         </div>
         <div class="form-help" id="selfHealthUpdated" style="margin-top: 10px;">—</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- First-Run Administrator Setup Modal -->
+  <div id="setupModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="setupModalTitle">
+    <div class="modal-card" style="max-width: 440px;">
+      <div class="modal-header">
+        <div style="display: flex; align-items: center; gap: 10px;">
+          <div style="width: 36px; height: 36px; border-radius: 50%; background: rgba(59, 130, 246, 0.15); display: flex; align-items: center; justify-content: center; color: var(--accent); flex-shrink: 0;">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+            </svg>
+          </div>
+          <div>
+            <h3 class="modal-title" id="setupModalTitle" style="font-size: 16px; font-weight: 600; color: var(--text-primary);">Initial System Setup</h3>
+            <div style="font-size: 12px; color: var(--text-secondary);">Create Administrator Account</div>
+          </div>
+        </div>
+      </div>
+      <div class="modal-body" style="padding-top: 10px;">
+        <p style="font-size: 13px; color: var(--text-secondary); line-height: 1.5; margin-bottom: 16px;">
+          Welcome to InfraWatch! Create the primary administrator account to secure monitoring operations.
+        </p>
+        <form id="setupForm">
+          <div class="form-group" style="margin-bottom: 12px;">
+            <label for="setupDisplayNameInput" class="form-label" style="display: block; margin-bottom: 6px; font-size: 12px; font-weight: 500; color: var(--text-secondary);">Full / Display Name</label>
+            <input type="text" id="setupDisplayNameInput" class="search-input" style="width: 100%; border-radius: var(--r-sm);" placeholder="System Administrator" autocomplete="name">
+          </div>
+          <div class="form-group" style="margin-bottom: 12px;">
+            <label for="setupUsernameInput" class="form-label" style="display: block; margin-bottom: 6px; font-size: 12px; font-weight: 500; color: var(--text-secondary);">Admin Username *</label>
+            <input type="text" id="setupUsernameInput" class="search-input" style="width: 100%; border-radius: var(--r-sm);" placeholder="admin" required autocomplete="username">
+          </div>
+          <div class="form-group" style="margin-bottom: 12px;">
+            <label for="setupPasswordInput" class="form-label" style="display: block; margin-bottom: 6px; font-size: 12px; font-weight: 500; color: var(--text-secondary);">Password (min. 6 chars) *</label>
+            <input type="password" id="setupPasswordInput" class="search-input" style="width: 100%; border-radius: var(--r-sm);" placeholder="••••••••••••" required autocomplete="new-password">
+          </div>
+          <div class="form-group" style="margin-bottom: 16px;">
+            <label for="setupConfirmPasswordInput" class="form-label" style="display: block; margin-bottom: 6px; font-size: 12px; font-weight: 500; color: var(--text-secondary);">Confirm Password *</label>
+            <input type="password" id="setupConfirmPasswordInput" class="search-input" style="width: 100%; border-radius: var(--r-sm);" placeholder="••••••••••••" required autocomplete="new-password">
+          </div>
+          <div id="setupError" class="form-error hidden" style="margin-bottom: 14px; font-size: 12px; color: var(--critical);"></div>
+          <div style="display: flex; justify-content: flex-end;">
+            <button type="submit" id="setupSubmitBtn" class="btn btn-primary" style="padding: 9px 20px; font-weight: 600; width: 100%;">
+              Initialize & Log In
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <!-- User Login Modal -->
+  <div id="loginModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="loginModalTitle">
+    <div class="modal-card" style="max-width: 380px;">
+      <div class="modal-header">
+        <div style="display: flex; align-items: center; gap: 10px;">
+          <div style="width: 36px; height: 36px; border-radius: 50%; background: rgba(59, 130, 246, 0.15); display: flex; align-items: center; justify-content: center; color: var(--accent); flex-shrink: 0;">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/>
+              <polyline points="10 17 15 12 10 7"/>
+              <line x1="15" y1="12" x2="3" y2="12"/>
+            </svg>
+          </div>
+          <h3 class="modal-title" id="loginModalTitle" style="font-size: 16px; font-weight: 600; color: var(--text-primary);">Operator Login</h3>
+        </div>
+        <button id="closeLoginModalBtn" class="modal-close" type="button" aria-label="Close modal">&times;</button>
+      </div>
+      <div class="modal-body" style="padding-top: 10px;">
+        <form id="loginForm">
+          <div class="form-group" style="margin-bottom: 12px;">
+            <label for="loginUsernameInput" class="form-label" style="display: block; margin-bottom: 6px; font-size: 12px; font-weight: 500; color: var(--text-secondary);">Username</label>
+            <input type="text" id="loginUsernameInput" class="search-input" style="width: 100%; border-radius: var(--r-sm);" placeholder="Username" required autocomplete="username">
+          </div>
+          <div class="form-group" style="margin-bottom: 16px;">
+            <label for="loginPasswordInput" class="form-label" style="display: block; margin-bottom: 6px; font-size: 12px; font-weight: 500; color: var(--text-secondary);">Password</label>
+            <input type="password" id="loginPasswordInput" class="search-input" style="width: 100%; border-radius: var(--r-sm);" placeholder="••••••••••••" required autocomplete="current-password">
+          </div>
+          <div id="loginError" class="form-error hidden" style="margin-bottom: 14px; font-size: 12px; color: var(--critical);"></div>
+          <div style="display: flex; justify-content: flex-end; gap: 8px;">
+            <button id="cancelLoginBtn" class="btn btn-secondary" type="button" style="padding: 8px 16px;">Cancel</button>
+            <button type="submit" id="loginSubmitBtn" class="btn btn-primary" style="padding: 8px 20px; font-weight: 600;">Log In</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <!-- User Management Modal (Admin Only) -->
+  <div id="usersModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="usersModalTitle">
+    <div class="modal-card" style="max-width: 600px; width: 95%;">
+      <div class="modal-header">
+        <div style="display: flex; align-items: center; gap: 8px;">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
+            <circle cx="9" cy="7" r="4"/>
+            <path d="M23 21v-2a4 4 0 0 0-3-3.87"/>
+            <path d="M16 3.13a4 4 0 0 1 0 7.75"/>
+          </svg>
+          <span id="usersModalTitle" class="modal-title" style="font-weight: 700;">User Management</span>
+        </div>
+        <button id="closeUsersModalBtn" class="modal-close" type="button" aria-label="Close user management dialog">&times;</button>
+      </div>
+      <div class="modal-body" style="padding: 20px;">
+        <!-- Users List Section -->
+        <div style="margin-bottom: 20px;">
+          <div style="font-size: 13px; font-weight: 600; margin-bottom: 8px; color: var(--text-primary);">Existing Users</div>
+          <div id="usersListContainer" style="max-height: 180px; overflow-y: auto; border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--bg-surface);">
+            <div style="padding: 12px; text-align: center; color: var(--text-muted); font-size: 12px;">Loading users...</div>
+          </div>
+        </div>
+
+        <div class="user-dropdown-divider" style="margin: 16px 0;"></div>
+
+        <!-- Add User Section -->
+        <div>
+          <div style="font-size: 13px; font-weight: 600; margin-bottom: 12px; color: var(--text-primary);">Create New User</div>
+          <form id="createUserForm">
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px;">
+              <div class="form-group">
+                <label for="newUsernameInput" class="form-label" style="display: block; margin-bottom: 4px; font-size: 12px; font-weight: 500; color: var(--text-secondary);">Username</label>
+                <input type="text" id="newUsernameInput" class="search-input" style="width: 100%; border-radius: var(--r-sm);" placeholder="e.g. operator1" required autocomplete="off">
+              </div>
+              <div class="form-group">
+                <label for="newDisplayNameInput" class="form-label" style="display: block; margin-bottom: 4px; font-size: 12px; font-weight: 500; color: var(--text-secondary);">Display Name</label>
+                <input type="text" id="newDisplayNameInput" class="search-input" style="width: 100%; border-radius: var(--r-sm);" placeholder="e.g. John Doe" autocomplete="off">
+              </div>
+            </div>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px;">
+              <div class="form-group">
+                <label for="newPasswordInput" class="form-label" style="display: block; margin-bottom: 4px; font-size: 12px; font-weight: 500; color: var(--text-secondary);">Password (min 6 chars)</label>
+                <input type="password" id="newPasswordInput" class="search-input" style="width: 100%; border-radius: var(--r-sm);" placeholder="••••••••••••" required minlength="6" autocomplete="new-password">
+              </div>
+              <div class="form-group">
+                <label for="newRoleSelect" class="form-label" style="display: block; margin-bottom: 4px; font-size: 12px; font-weight: 500; color: var(--text-secondary);">Role</label>
+                <select id="newRoleSelect" class="search-input" style="width: 100%; border-radius: var(--r-sm); background: var(--bg-input); color: var(--text-primary); padding: 8px 12px;">
+                  <option value="viewer">Viewer (Read-Only NOC Wallboard)</option>
+                  <option value="admin">Admin (Full Control)</option>
+                </select>
+              </div>
+            </div>
+            <div id="createUserError" class="form-error hidden" style="margin-bottom: 12px; font-size: 12px; color: var(--critical);"></div>
+            <div id="createUserSuccess" class="form-success hidden" style="margin-bottom: 12px; font-size: 12px; color: var(--success);"></div>
+            <div style="display: flex; justify-content: flex-end; gap: 8px;">
+              <button id="cancelUsersModalBtn" class="btn btn-secondary" type="button" style="padding: 8px 16px;">Close</button>
+              <button type="submit" id="createUserSubmitBtn" class="btn btn-primary" style="padding: 8px 20px; font-weight: 600;">Add User</button>
+            </div>
+          </form>
+        </div>
       </div>
     </div>
   </div>

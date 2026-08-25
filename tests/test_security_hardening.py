@@ -11,6 +11,7 @@ import ipaddress
 import os
 import shutil
 import tempfile
+import time
 import unittest
 
 import app as alarm_app
@@ -143,6 +144,28 @@ class RateLimitTests(unittest.TestCase):
             self.client.get('/api/telegram', headers={"X-API-Key": TEST_API_KEY})
         res = self.client.get('/instances')
         self.assertNotEqual(res.status_code, 429)
+
+    def test_pruning_does_not_evict_other_routes_active_window(self):
+        # A route with a long per_seconds window must survive a prune pass
+        # triggered by a *different* route with a short per_seconds -- the
+        # prune must judge each bucket's own staleness, not recompute a
+        # window index using whichever route happened to trigger it.
+        now = time.time()
+        long_key = ("slow_route", "ip:test", int(now // 3600), 3600)  # 1h window, fresh
+        with alarm_app._RATE_BUCKETS_LOCK:
+            alarm_app._RATE_BUCKETS.clear()
+            alarm_app._RATE_BUCKETS[long_key] = 5
+            alarm_app._RATE_LAST_PRUNE[0] = 0.0  # force the next call to prune
+
+        @alarm_app.rate_limit(100, 10)  # a short-window route
+        def fast_route():
+            return "ok"
+        with app.test_request_context('/'):
+            fast_route()
+
+        with alarm_app._RATE_BUCKETS_LOCK:
+            self.assertIn(long_key, alarm_app._RATE_BUCKETS, "still-active long-window bucket must survive a short-window route's prune")
+            self.assertEqual(alarm_app._RATE_BUCKETS[long_key], 5)
 
 
 if __name__ == '__main__':
