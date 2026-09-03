@@ -28,6 +28,7 @@ Dashboard monitoring ketersediaan server, website, dan jaringan secara real-time
 - **Maintenance Mode**: Penjadwalan jendela perawatan per target/job untuk mencegah alarm palsu.
 - **Dependency / Alert Correlation**: Hubungan parent-child antar host untuk meredam alert turunan saat gateway/parent down.
 - **SLA & Availability Engine**: Menghitung persentase uptime (1 jam - 90 hari), sparkline riwayat latensi, dan statistik downtime.
+- **Role-Based Access Control (RBAC)**: Pemisahan role Administrator dan Read-Only Viewer.
 - **Failover Prometheus Endpoint**: Dukungan multiple endpoint Prometheus dengan auto-failover jika server utama tidak dapat diakses.
 - **Synthetic Alert Poller**: Poller background bawaan yang langsung mendeteksi status probe tanpa wajib memasang Alertmanager.
 
@@ -69,22 +70,26 @@ Cek status container:
 docker compose ps
 ```
 
-### 3. Akses Dashboard & Penggunaan di TV NOC
+### 3. Setup Akun Admin Pertama Kali (First-Run)
 
 1. Buka browser dan akses `http://<IP-SERVER>:5000`.
-2. Klik tombol **"Masuk & Aktifkan Audio Alarm"** pada splash screen untuk memberikan izin browser memutar audio sirine otomatis.
-3. Dashboard siap digunakan sebagai wallboard pemantauan.
+2. Saat pertama kali dijalankan, sistem otomatis memunculkan pop-up **"Create Administrator Account"**.
+3. Masukkan **Nama Tampilan**, **Username Admin**, dan **Password** (minimal 6 karakter).
+4. Klik **"Create Admin Account"**. Anda akan langsung login sebagai Administrator.
+5. Klik **"Masuk & Aktifkan Audio Alarm"** pada splash screen untuk mengizinkan pemutaran audio sirine di browser TV NOC.
 
 ---
 
-## Keamanan & API Key
+## Autentikasi & Hak Akses
 
-- **Dashboard Viewer (Read-only)**: Tidak memerlukan login atau API key. Siapapun di jaringan lokal dapat melihat tampilan status dashboard.
-- **Operasi Konfigurasi (Mutasi)**: Menambah/menghapus target, membuat maintenance window, mengubah endpoint Prometheus, atau mengatur Telegram membutuhkan API key.
-- **Otomatisasi Key**: Saat container pertama kali berjalan, sistem otomatis membuat API key di `alarm/.api_key` dan `alarm/.webhook_secret`.
+- **First-Run Admin Setup**: Akun administrator utama dibuat langsung melalui web UI saat instalasi pertama.
+- **Role Administrator**: Memiliki hak penuh untuk menambah/menghapus target, membuat jadwal maintenance, mengubah endpoint Prometheus, mengatur bot Telegram, dan mengelola user lain (`/api/auth/users`).
+- **Role Viewer (Read-only)**: Hanya dapat melihat dashboard monitoring tanpa akses mengubah konfigurasi. Cocok untuk browser yang dipasang di layar TV NOC wallboard.
+- **Machine API Key**: Digunakan untuk automasi skrip atau CI/CD.
+  - Key otomatis dibuat di `alarm/.api_key` dan `alarm/.webhook_secret`.
   - Lihat key: `cat alarm/.api_key`
-  - Masukkan key saat pertama kali diminta oleh browser di web UI (key disimpan di `localStorage` browser Anda).
-  - Atau tentukan key sendiri melalui variabel `INFRAWATCH_API_KEY` di file `.env`.
+  - Atau tentukan key manual melalui variabel `INFRAWATCH_API_KEY` di file `.env`.
+  - Gunakan header `X-API-Key: <key>` atau `Authorization: Bearer <key>` saat memanggil REST API.
 
 ---
 
@@ -96,6 +101,11 @@ docker compose ps
 | `/instances` | `GET` | Data status target, latency, HTTP code, & status maintenance |
 | `/api/availability` | `GET` | Metrik kalkulasi SLA uptime & analisis stabilitas |
 | `/api/target-history` | `GET` | Timeline sparkline latensi dan riwayat status target |
+| `/api/auth/status` | `GET` | Cek status inisialisasi user dan sesi login saat ini |
+| `/api/auth/setup` | `POST` | Setup akun administrator pertama kali |
+| `/api/auth/login` | `POST` | Login user (session-based) |
+| `/api/auth/logout` | `POST` | Logout user |
+| `/api/auth/users` | `GET` 🔒 / `POST` 🔒 | Manajemen daftar user (khusus Admin) |
 | `/api/targets` | `GET` / `POST` 🔒 / `DELETE` 🔒 | Kelola daftar target monitoring (`targets/websites.yml`) |
 | `/api/maintenance` | `GET` / `POST` 🔒 | List & pembuatan jadwal Maintenance Window |
 | `/api/maintenance/<id>` | `DELETE` 🔒 | Hapus jadwal Maintenance Window |
@@ -111,7 +121,7 @@ docker compose ps
 | `/webhook` | `POST` | Webhook receiver dari Alertmanager (opsional) |
 | `/health` | `GET` | Healthcheck konektivitas Prometheus, storage, dan poller |
 
-> 🔒 = Membutuhkan header `X-API-Key: <key>` atau `Authorization: Bearer <key>`.
+> 🔒 = Membutuhkan login sesi Administrator atau header `X-API-Key: <key>` / `Authorization: Bearer <key>`.
 
 ---
 
