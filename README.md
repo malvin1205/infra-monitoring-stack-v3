@@ -140,5 +140,5 @@ docker compose ps
 
 ## Tim & Kontributor
 
-- **dimi** ([@malvin1205](https://github.com/malvin1205)) - Maintainer & Core
-- **Fachriyusuf** ([@Fachriyusuf](https://github.com/Fachriyusuf)) - Contributor
+- **dimi** ([@malvin1205](https://github.com/malvin1205)) - Core
+- **Fachriyusuf** ([@Fachriyusuf](https://github.com/Fachriyusuf)) - Telegram
