@@ -210,6 +210,42 @@ class HybridAvailabilityRegressionTests(unittest.TestCase):
         self.assertAlmostEqual(entry["coverage_percent"], (59.6 / 168.0) * 100.0, places=1)
         self.assertEqual(entry["source"], "fallback")
 
+    def test_unparseable_avail_percent_is_not_treated_as_fully_up(self):
+        # Same shape as test C, but Prometheus's avail% comes back garbage
+        # (e.g. a transient scrape/encoding issue) instead of missing. Must
+        # be treated the same as "no rate signal" (unattributed/unknown) —
+        # NOT silently default to 100% up, which would hide a real outage
+        # that may have occurred during this slice.
+        now = time.time()
+        req_start = now - 7 * 86400.0
+        req_end = now
+        retention_sec = 59.6 * 3600.0
+        prom_p_start = now - retention_sec
+
+        prom_metrics = {
+            "first_ts": prom_p_start,
+            "last_ts": req_end,
+            "count": str(int(retention_sec / 2.0)),
+            "avail": "NaN%garbled",  # unparseable, but not None
+            "incidents": "1",
+            "duration": "14.0",
+        }
+
+        entry = merge_hybrid_target_availability(
+            req_start=req_start,
+            req_end=req_end,
+            target_id="srv-garbled",
+            target_name="srv-garbled",
+            job="blackbox",
+            sqlite_buckets=[],
+            prom_metrics=prom_metrics,
+            expected_interval_sec=2.0,
+        )
+
+        self.assertAlmostEqual(entry["uptime_seconds"], 0.0, delta=1.0,
+                                msg="garbled avail% must not be fabricated into 'fully up' time")
+        self.assertAlmostEqual(entry["downtime_seconds"], 0.0, delta=1.0)
+
     def test_d_sqlite_only_historical_range(self):
         """Test D: Historical range (Day -60 to Day -30), Prometheus has no data,
         SQLite has complete data.
@@ -934,6 +970,23 @@ class PerTargetSlaTargetTests(unittest.TestCase):
         self.assertEqual(by_id["a"]["sla_target_pct"], 99.9)
         self.assertEqual(by_id["b"]["sla_status"], "COMPLIANT")
         self.assertEqual(by_id["b"]["sla_target_pct"], 99.0)
+
+    def test_explicit_zero_percent_sla_target_is_honored_not_replaced_by_default(self):
+        # `entry.get("sla_target_pct") or sla_threshold` used to treat an
+        # explicit 0.0 override as falsy and silently substitute the fleet
+        # default instead — 0% is a real, allowed value
+        # (PUT /api/sla-targets/<instance> permits 0.0 <= pct <= 100.0).
+        entries, summary = merge_hybrid_fleet_availability(
+            req_start=self.H, req_end=self.H + 24 * 3600.0,
+            monitored_instances=["a", "b"],
+            sqlite_buckets=self._buckets("a") + self._buckets("b"),
+            prom_results_map={}, expected_interval_sec=2.0,
+            sla_threshold=99.9,
+            sla_threshold_by_instance={"b": 0.0},
+        )
+        by_id = {e["id"]: e for e in summary["per_server"]["values"]}
+        self.assertEqual(by_id["b"]["sla_target_pct"], 0.0)  # not silently 99.9
+        self.assertEqual(by_id["b"]["sla_status"], "COMPLIANT")  # anything >= 0% passes
 
 
 class IncidentDedupTests(unittest.TestCase):

@@ -644,7 +644,12 @@ def merge_hybrid_target_availability(
             try:
                 avail_rate = max(0.0, min(1.0, float(raw_avail) / 100.0))
             except (ValueError, TypeError):
-                avail_rate = 1.0
+                # Unparseable, not "no signal" — but a garbage value is no
+                # more trustworthy than no value at all. Same "leave it
+                # unattributed" rule as the comment above, not "fully up":
+                # defaulting to 1.0 here would silently inflate availability
+                # for a slice where an actual outage may have occurred.
+                avail_rate = None
         elif s_count is not None:
             avail_rate = 1.0
 
@@ -1486,7 +1491,11 @@ def summarize_entries(
         # SLA eligibility check — eligibility gate is raw coverage (did we
         # observe enough); compliance is the maintenance-excluded availability
         # against this target's own SLA target (falls back to the fleet one).
-        entry_sla_target = float(entry.get("sla_target_pct") or sla_threshold)
+        # `or` would treat an explicit 0% override (a real, allowed value —
+        # see PUT /api/sla-targets/<instance>, 0.0 <= pct <= 100.0) as falsy
+        # and silently fall back to the fleet default instead of honoring it.
+        _raw_sla_target = entry.get("sla_target_pct")
+        entry_sla_target = float(_raw_sla_target) if _raw_sla_target is not None else sla_threshold
         is_eligible = (availability_pct is not None) and (coverage_pct >= min_sla_coverage_pct)
         if not is_eligible:
             sla_status = "INSUFFICIENT_DATA"

@@ -680,6 +680,14 @@ class InstancesPage {
       });
     }
 
+    // Availability Breakdown modal: Overview<->Audit sub-nav, the gear-icon
+    // Node Exporter correlation settings popover, and the per-host audit
+    // table's filter chips/search — all previously present in the markup
+    // with zero JS behind them.
+    this._initAvailSubnav();
+    this._initAvailSettingsPopover();
+    this._initAuditFilters();
+
     // Custom Dropdown for Sorting Hosts in Availability Breakdown Modal
     const availSortTrigger = document.getElementById('availSortTrigger');
     const availSortMenu = document.getElementById('availSortMenu');
@@ -1439,6 +1447,314 @@ class InstancesPage {
     }
   }
 
+  /* ── Availability Breakdown sub-nav (Overview & Ranking <-> Data Quality
+     & Telemetry Audit) ── */
+  _initAvailSubnav() {
+    const btnRanking = document.getElementById('btnSubnavRanking');
+    const btnAudit = document.getElementById('btnSubnavAudit');
+    const paneRanking = document.getElementById('paneAvailRanking');
+    const paneAudit = document.getElementById('paneAvailAudit');
+    const btnReturn = document.getElementById('btnReturnToRanking');
+    const warnBtn = document.getElementById('metricFleetDataWarning');
+    if (!btnRanking || !btnAudit || !paneRanking || !paneAudit) return;
+
+    const showAvailTab = (tab) => {
+      const isAudit = tab === 'audit';
+      paneRanking.classList.toggle('hidden', isAudit);
+      paneAudit.classList.toggle('hidden', !isAudit);
+      btnRanking.classList.toggle('is-active', !isAudit);
+      btnAudit.classList.toggle('is-active', isAudit);
+      btnRanking.setAttribute('aria-selected', String(!isAudit));
+      btnAudit.setAttribute('aria-selected', String(isAudit));
+      if (isAudit) this._renderTelemetryAudit();
+    };
+    this._showAvailTab = showAvailTab;
+
+    btnRanking.addEventListener('click', () => showAvailTab('ranking'));
+    btnAudit.addEventListener('click', () => showAvailTab('audit'));
+    if (btnReturn) btnReturn.addEventListener('click', () => showAvailTab('ranking'));
+    // The fleet card's "Limited data" warning links straight to the audit
+    // view that explains why — same idea as its "View Telemetry Audit ➔"
+    // label already promises.
+    if (warnBtn) warnBtn.addEventListener('click', () => showAvailTab('audit'));
+  }
+
+  /* ── Availability / SLA settings popover (gear icon) — Node Exporter
+     correlation toggle. GET/POST /api/settings/availability. ── */
+  _initAvailSettingsPopover() {
+    const wrap = document.getElementById('availSettingsDd');
+    const btn = document.getElementById('availSettingsBtn');
+    const popover = document.getElementById('availSettingsPopover');
+    const checkbox = document.getElementById('useNodeExporterCheckbox');
+    if (!wrap || !btn || !popover) return;
+
+    const open = () => {
+      popover.classList.remove('hidden');
+      btn.setAttribute('aria-expanded', 'true');
+      this._loadAvailabilitySettings();
+    };
+    const close = () => {
+      if (popover.classList.contains('hidden')) return;
+      popover.classList.add('hidden');
+      btn.setAttribute('aria-expanded', 'false');
+    };
+    this._closeAvailSettingsPopover = close;
+
+    btn.addEventListener('click', e => {
+      e.stopPropagation();
+      if (popover.classList.contains('hidden')) open(); else close();
+    });
+
+    if (checkbox) {
+      checkbox.addEventListener('change', () => this._saveAvailabilitySettings(checkbox.checked));
+    }
+
+    // Same click-outside/Escape convention as the Default Job popover.
+    document.addEventListener('click', e => {
+      if (!wrap.contains(e.target)) close();
+    });
+    document.addEventListener('keydown', e => {
+      if (e.key === 'Escape' && !popover.classList.contains('hidden')) { close(); btn.focus(); }
+    });
+  }
+
+  async _loadAvailabilitySettings() {
+    const checkbox = document.getElementById('useNodeExporterCheckbox');
+    if (!checkbox) return;
+    try {
+      const res = await apiFetch('/api/settings/availability');
+      const data = await res.json();
+      if (data.ok) checkbox.checked = !!data.use_node_exporter_correlation;
+    } catch (e) {
+      // leave checkbox showing whatever it last had — a stale read is
+      // better than an error toast for a settings popover nobody's saving yet
+    }
+  }
+
+  async _saveAvailabilitySettings(enabled) {
+    const checkbox = document.getElementById('useNodeExporterCheckbox');
+    try {
+      const res = await apiFetch('/api/settings/availability', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ use_node_exporter_correlation: enabled })
+      });
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.error || 'Failed to save');
+      this._triggerEventToast(enabled ? 'Node Exporter correlation enabled.' : 'Node Exporter correlation disabled.');
+    } catch (e) {
+      if (checkbox) checkbox.checked = !enabled; // revert the optimistic UI toggle
+      this._triggerEventToast('Failed to save availability settings.');
+    }
+  }
+
+  /* ── Data Quality & Telemetry Audit pane ── */
+  _initAuditFilters() {
+    const chips = Array.from(document.querySelectorAll('.audit-chip[data-filter]'));
+    chips.forEach(chip => {
+      chip.addEventListener('click', () => {
+        this._auditFilter = chip.dataset.filter;
+        chips.forEach(c => c.classList.toggle('is-active', c === chip));
+        this._renderAuditTable();
+      });
+    });
+    const searchInput = document.getElementById('auditSearchInput');
+    if (searchInput) {
+      searchInput.addEventListener('input', () => {
+        this._auditSearchQ = searchInput.value;
+        this._renderAuditTable();
+      });
+    }
+  }
+
+  // Renders the whole audit pane from the SAME /api/availability response
+  // already fetched for the Overview & Ranking pane (this.availabilityBreakdown)
+  // — telemetry_audit/sla/entries[].sla_budget are all already in it, no
+  // second request needed. Runs on every refresh regardless of which
+  // sub-tab is showing, same as the rest of _renderAvailabilityBreakdown —
+  // the "LIMITED DATA" sub-nav badge needs to stay current even before the
+  // operator has clicked into the tab.
+  _renderTelemetryAudit() {
+    // Always kept in sync with the latest data (not gated on the pane being
+    // visible) — the "LIMITED DATA" sub-nav badge needs to reflect current
+    // status even before the operator has clicked into the tab.
+    const data = this.availabilityBreakdown;
+    if (!data) return;
+
+    const audit = data.telemetry_audit || {};
+    const sla = data.sla || {};
+    const fmtPct = v => typeof v === 'number' ? `${v.toFixed(2)}%` : '—';
+    const fmtDur = s => this._formatDowntimeDuration(s || 0).replace(' downtime', '');
+
+    // SLA Availability card — fleet_aggregate is already the
+    // maintenance-excluded figure (see fleet_availability.py), matching
+    // this card's "excl. planned maintenance" label exactly.
+    const fleetAvail = typeof data.fleet_aggregate?.value === 'number' ? data.fleet_aggregate.value : null;
+    const slaCard = document.getElementById('auditSlaCard');
+    const slaValueEl = document.getElementById('auditSlaValue');
+    const slaBadgeEl = document.getElementById('auditSlaBadge');
+    const slaTargetEl = document.getElementById('auditSlaTarget');
+    const slaMaintEl = document.getElementById('auditSlaMaint');
+
+    if (slaValueEl) slaValueEl.textContent = fmtPct(fleetAvail);
+    if (slaTargetEl) slaTargetEl.textContent = `target ${typeof sla.target_pct === 'number' ? sla.target_pct.toFixed(1) : '—'}%`;
+
+    let slaState = 'is-mid', slaLabel = 'INSUFFICIENT DATA';
+    if (sla.has_data) {
+      slaState = sla.window?.breached ? 'is-bad' : 'is-ok';
+      slaLabel = sla.window?.breached ? 'NON-COMPLIANT' : 'COMPLIANT';
+    }
+    if (slaCard) slaCard.className = `audit-sla-card ${slaState}`;
+    if (slaBadgeEl) { slaBadgeEl.textContent = slaLabel; slaBadgeEl.className = `audit-sla-badge ${slaState}`; }
+
+    const maintSec = data.maintenance_excluded_seconds || 0;
+    if (slaMaintEl) {
+      // #auditSlaMaint uses the bare native `hidden` attribute in markup
+      // (no "hidden" class, unlike e.g. #auditSubnavBadge) — toggle the
+      // property, not classList, or this would silently never show.
+      slaMaintEl.hidden = maintSec <= 0;
+      if (maintSec > 0) slaMaintEl.textContent = `${fmtDur(maintSec)} excluded (maintenance)`;
+    }
+
+    // Downtime Budget card
+    const budgetFillEl = document.getElementById('auditBudgetFill');
+    const budgetStateEl = document.getElementById('auditBudgetState');
+    const budgetUsedEl = document.getElementById('auditBudgetUsed');
+    const budgetProjEl = document.getElementById('auditBudgetProjection');
+
+    if (sla.has_data && sla.window) {
+      const usedPct = Math.max(0, sla.window.used_percent || 0);
+      const state = sla.window.breached ? 'is-bad' : (usedPct >= 75 ? 'is-mid' : 'is-ok');
+      if (budgetFillEl) { budgetFillEl.style.width = `${Math.min(100, usedPct)}%`; budgetFillEl.className = `audit-budget-fill ${state}`; }
+      if (budgetStateEl) { budgetStateEl.textContent = sla.window.breached ? 'BREACHED' : `${usedPct.toFixed(0)}% USED`; budgetStateEl.className = `audit-budget-state ${state}`; }
+      if (budgetUsedEl) budgetUsedEl.textContent = `${fmtDur(sla.window.observed_downtime_seconds)} used of ${fmtDur(sla.window.allowed_downtime_seconds)} allowed`;
+      if (budgetProjEl) {
+        budgetProjEl.textContent = sla.projected
+          ? (sla.projected.breach
+            ? `⚠ Projected to breach in ${sla.projected.days}d at current rate`
+            : `On track for ${sla.projected.days}d projection`)
+          : '';
+      }
+    } else {
+      if (budgetFillEl) { budgetFillEl.style.width = '0%'; budgetFillEl.className = 'audit-budget-fill'; }
+      if (budgetStateEl) { budgetStateEl.textContent = '—'; budgetStateEl.className = 'audit-budget-state'; }
+      if (budgetUsedEl) budgetUsedEl.textContent = '— used of —';
+      if (budgetProjEl) budgetProjEl.textContent = '';
+    }
+
+    // Coverage source one-liner
+    const statusEl = document.getElementById('auditStatus');
+    const statusTextEl = document.getElementById('auditStatusText');
+    const statusSrcEl = document.getElementById('auditStatusSrc');
+    const confLevel = audit.confidence_level || 'LOW';
+    const statusState = confLevel === 'HIGH' ? 'is-ok' : (confLevel === 'MODERATE' ? 'is-warn' : 'is-bad');
+    if (statusEl) statusEl.className = `audit-status ${statusState}`;
+    if (statusTextEl) statusTextEl.textContent = audit.root_cause_hint || audit.recommendation || 'No telemetry audit data available for this window.';
+    if (statusSrcEl) statusSrcEl.textContent = audit.storage?.source ? `source: ${audit.storage.source}` : '';
+
+    // Coverage split cards (Observed / Unmonitored / Planned maintenance)
+    const coverageSec = audit.coverage_seconds ?? data.coverage_seconds ?? 0;
+    const missingSec = audit.missing_seconds ?? data.missing_seconds ?? 0;
+    const winSec = audit.requested_window_seconds || data.requested_window_seconds || (coverageSec + missingSec) || 1;
+    const covPct = typeof audit.coverage_percent === 'number' ? audit.coverage_percent : (data.coverage_percent || 0);
+    const missPct = typeof audit.missing_percent === 'number' ? audit.missing_percent : Math.max(0, 100 - covPct);
+
+    const setCoverageCard = (valId, subId, meterId, sec, pct, subText) => {
+      const valEl = document.getElementById(valId);
+      const subEl = document.getElementById(subId);
+      const meterEl = document.getElementById(meterId);
+      if (valEl) valEl.textContent = fmtDur(sec);
+      if (subEl) subEl.textContent = subText || `${pct.toFixed(1)}% of window`;
+      if (meterEl) meterEl.style.width = `${Math.max(0, Math.min(100, pct))}%`;
+    };
+    setCoverageCard('auditMetricObserved', 'auditMetricObservedPct', 'auditMeterObserved', coverageSec, covPct);
+    setCoverageCard('auditMetricMissing', 'auditMetricMissingPct', 'auditMeterMissing', missingSec, missPct);
+
+    const maintCard = document.getElementById('auditMaintCard');
+    const auditGrid = document.getElementById('auditGrid');
+    if (maintSec > 0) {
+      if (maintCard) maintCard.hidden = false;
+      if (auditGrid) auditGrid.classList.add('has-maint');
+      const maintPct = winSec > 0 ? (maintSec / winSec) * 100 : 0;
+      setCoverageCard('auditMetricMaint', 'auditMetricMaintPct', 'auditMeterMaint', maintSec, maintPct, 'excluded from SLA');
+    } else {
+      if (maintCard) maintCard.hidden = true;
+      if (auditGrid) auditGrid.classList.remove('has-maint');
+    }
+
+    // Sub-nav "LIMITED DATA" badge
+    const subnavBadge = document.getElementById('auditSubnavBadge');
+    if (subnavBadge) {
+      const isLimited = confLevel === 'LOW' || data.data_status === 'INSUFFICIENT_DATA' || data.data_status === 'PARTIAL';
+      subnavBadge.classList.toggle('hidden', !isLimited);
+    }
+
+    this._renderAuditTable();
+  }
+
+  _renderAuditTable() {
+    const tbody = document.getElementById('auditTableBody');
+    const countEl = document.getElementById('auditTableHostCount');
+    if (!tbody) return;
+    const entries = this.availabilityBreakdown?.entries || [];
+    const filter = this._auditFilter || 'all';
+    const q = (this._auditSearchQ || '').trim().toLowerCase();
+
+    let rows = entries.filter(e => {
+      const cov = e.coverage_pct ?? e.coverage_percent ?? 0;
+      if (q && !((e.name || e.id || '')).toLowerCase().includes(q)) return false;
+      if (filter === 'breach') return e.sla_status === 'NON_COMPLIANT';
+      if (filter === 'limited') return cov < 50;
+      if (filter === 'optimal') return cov >= 95;
+      return true;
+    });
+
+    if (countEl) countEl.textContent = `${rows.length} host${rows.length !== 1 ? 's' : ''}`;
+
+    if (rows.length === 0) {
+      tbody.innerHTML = `<tr><td colspan="5" class="audit-empty-row">No hosts match this filter</td></tr>`;
+      return;
+    }
+
+    // Worst coverage first — an audit view exists to surface problems, not
+    // to repeat the Overview pane's default ordering.
+    rows = rows.slice().sort((a, b) => (a.coverage_pct ?? a.coverage_percent ?? 0) - (b.coverage_pct ?? b.coverage_percent ?? 0));
+
+    tbody.innerHTML = rows.map(e => {
+      const cov = e.coverage_pct ?? e.coverage_percent ?? 0;
+      const isLim = cov < 50;
+      const sla = this._slaBadgeInfo(e);
+      const slaCls = sla.cls === 'alt-ok' ? 'text-ok' : (sla.cls === 'alt-warning' ? 'text-bad' : 'text-dim');
+      const budget = e.sla_budget || {};
+      const targetPct = typeof e.sla_target_pct === 'number' ? e.sla_target_pct : budget.target_pct;
+      const downtimeSec = e.sla_downtime_seconds ?? e.downtime_seconds ?? 0;
+      const budgetLeftTxt = budget.has_data
+        ? (budget.window?.breached ? 'Breached' : this._formatDowntimeDuration(budget.window?.remaining_seconds || 0).replace(' downtime', ''))
+        : '—';
+      const budgetCls = !budget.has_data ? 'text-dim'
+        : (budget.window?.breached ? 'text-bad' : ((budget.window?.used_percent || 0) >= 75 ? 'text-mid' : 'text-ok'));
+
+      return `<tr>
+        <td>
+          <span class="audit-host-name">${this._esc(e.name || e.id || '—')}</span>
+          <span class="audit-host-job">${this._esc(e.job || '—')}</span>
+        </td>
+        <td>
+          <div class="audit-cov-cell">
+            <span class="audit-cov-pct${isLim ? ' is-lim' : ''}">${cov.toFixed(1)}%</span>
+            <div class="audit-cov-bar-wrap"><div class="audit-cov-bar-fill${isLim ? ' bar-limited' : ''}" style="width:${Math.max(0, Math.min(100, cov))}%;"></div></div>
+          </div>
+        </td>
+        <td class="ta-r mono">
+          <span class="${slaCls}">${typeof e.availability_pct === 'number' ? e.availability_pct.toFixed(2) + '%' : '—'}</span>
+          <span class="audit-tgt"> / ${typeof targetPct === 'number' ? targetPct.toFixed(1) : '—'}%</span>
+        </td>
+        <td class="ta-r mono">${this._formatDowntimeDuration(downtimeSec).replace(' downtime', '')}</td>
+        <td class="ta-r mono"><span class="${budgetCls}">${budgetLeftTxt}</span></td>
+      </tr>`;
+    }).join('');
+  }
+
   /* ── Availability breakdown modal (Historical service health) ── */
   _openAvailabilityBreakdown() {
     if (!this.availabilityBreakdownModal) return;
@@ -1584,12 +1900,17 @@ class InstancesPage {
     // from a few hours of actual samples. Surface that instead of letting
     // the big number imply full-window confidence it doesn't have.
     const warnEl = document.getElementById('metricFleetDataWarning');
+    const warnTextEl = document.getElementById('metricFleetDataWarningText');
     if (warnEl) {
       const covPct = typeof data?.coverage_percent === 'number' ? data.coverage_percent : null;
       const status = data?.data_status;
       const isLimited = status === 'INSUFFICIENT_DATA' || status === 'PARTIAL' || (covPct !== null && covPct < 50);
       if (fleetAvail !== null && isLimited && covPct !== null) {
-        warnEl.textContent = `⚠ Limited data — only ${covPct.toFixed(1)}% of this window observed`;
+        // Set only the text span's content — warnEl is a <button> with an
+        // icon span and a "View Telemetry Audit ➔" action span alongside
+        // this one; overwriting the whole button's textContent used to wipe
+        // both of those out every refresh.
+        if (warnTextEl) warnTextEl.textContent = `⚠ Limited data — only ${covPct.toFixed(1)}% of this window observed`;
         warnEl.hidden = false;
       } else {
         warnEl.hidden = true;
@@ -1897,6 +2218,8 @@ class InstancesPage {
     }).join('');
 
     listEl.innerHTML = rowsHtml;
+
+    this._renderTelemetryAudit();
   }
 
   startPolling(ms) {

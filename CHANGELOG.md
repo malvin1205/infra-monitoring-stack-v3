@@ -6,6 +6,125 @@ Format changelog ini mengacu pada standar [Keep a Changelog](https://keepachange
 
 ---
 
+## [3.6.6] - 2026-09-05
+
+### Data Quality & Telemetry Audit — Wiring yang Hilang Dibangun
+
+**Tujuan**
+Follow-up dari temuan audit 3.6.5: tab "Data Quality & Telemetry Audit" + gear-icon
+settings popover di modal Availability Breakdown punya markup+CSS lengkap tapi NOL
+JavaScript. Bangun wiring-nya penuh.
+
+**Hasil**
+- Sub-nav Overview & Ranking <-> Data Quality & Telemetry Audit sekarang beneran
+  switch pane, termasuk tombol "Back to Overview" dan link dari warning "Limited data"
+  di card Fleet Availability (yang sebelumnya diperbaiki di 3.6.5 tapi tombolnya sendiri
+  belum bisa diklik ke mana-mana).
+- Gear-icon popover (pola persis di-reuse dari popover "Default Job" yang sudah ada:
+  buka/tutup, klik-luar, Escape) — checkbox Node Exporter correlation baca/tulis lewat
+  `GET`/`POST /api/settings/availability` yang sudah ada di backend, revert optimis
+  kalau save gagal (mis. viewer tanpa permission `availability.write`).
+- Seluruh pane Audit (kartu SLA Availability, Downtime Budget, status cakupan,
+  Observed/Unmonitored/Planned-maintenance, tabel per-host dengan filter chip +
+  search) dirender dari `this.availabilityBreakdown` — response `/api/availability`
+  YANG SAMA yang sudah di-fetch buat pane Ranking (`telemetry_audit`, `sla`,
+  `entries[].sla_budget` semua sudah ada di situ), jadi tidak ada request baru sama
+  sekali.
+- **Divalidasi terhadap server nyala + data Prometheus asli** (bukan cuma baca kode):
+  jalanin `alarm/app.py` lokal, curl `/api/availability` sungguhan, cocokkan tiap
+  field (`sla.window.*`, `telemetry_audit.*`, `entries[].sla_budget.*`) satu-satu
+  sama yang dipakai di JS — semua match persis.
+- Ketemu 1 bug pas nulis wiring ini sendiri sebelum sempat kepakai: `#auditSlaMaint`
+  pakai atribut native `hidden` (bukan class), sempat mau ditoggle pakai
+  `classList.toggle('hidden', ...)` yang cuma kerja kalau ada rule CSS `.hidden` buat
+  elemen itu — dicek dulu ke stylesheet, dibetulin ke `el.hidden = bool` sebelum masuk.
+
+**Kendala**
+- Tidak ada browser Chrome ter-koneksi di sesi ini buat verifikasi visual
+  klik-per-klik — verifikasi dilakukan via server nyala + curl + tracing manual
+  field-per-field terhadap response API asli, bukan screenshot. Kalau ada quirk
+  visual/CSS yang cuma kelihatan di browser sungguhan, tolong laporkan.
+
+---
+
+## [3.6.5] - 2026-09-05
+
+### Full-Codebase Audit (`/code-review alarm/ max`) — 8 Bug Dibenerin
+
+**Tujuan**
+Audit menyeluruh seluruh `alarm/` (bukan cuma Incident History/Live Alert Log) buat
+nyari conditional bug & race condition. Dijalankan via code-review agent effort max,
+10 temuan — 8 di-fix + test, 1 di-tolak (regresi ganda dari fix sebelumnya sendiri),
+1 dilaporkan tapi sengaja tidak diubah (butuh keputusan produk).
+
+**Hasil**
+1. **Fix ack-race sebelumnya (3.6.3) ternyata kebablasan**: `DELETE FROM
+   alert_acknowledgments WHERE instance=?` jalan di SETIAP transisi (fire dan resolve),
+   ga peduli host itu punya alert lain yang masih firing dan sudah di-ack. Host dengan
+   TargetDown + alert lain (mis. dari Alertmanager) sekaligus — begitu alert LAIN itu
+   resolve, ack buat TargetDown yang masih down ikut kehapus. Fix: DELETE cuma jalan di
+   resolve, dan cuma kalau `NOT EXISTS` incident lain yang masih firing buat instance itu.
+2. **Telegram `min_severity` — field sudah ada dari awal tapi TIDAK PERNAH ditegakkan
+   di manapun** (dead config). Gate `severity != "warning"` yang saya taruh di
+   `record_alert_event()` minggu lalu ikut kena dampak: dia global buat SEMUA pemanggil
+   (webhook Alertmanager + poller), bukan cuma SlowResponse — alert `severity: warning`
+   asli dari Alertmanager manapun bakal ikut ke-silent-block tanpa log. Fix: pindah ke
+   `_async_send_worker` (telegram_notifier.py) yang sudah baca config di situ, betulan
+   menegakkan `min_severity`, default diubah ke `"critical"` (`telegram_config.json`
+   lokal ikut di-update) — sama-sama nahan SlowResponse seperti diminta, tapi lewat
+   setting asli yang bisa diubah balik via `PUT /api/telegram`, bukan hardcode.
+3. **SlowResponse stuck "Ongoing" selamanya setelah recover pas maintenance** — analisa
+   saya sebelumnya salah: `_slow_poller_state.pop(inst, None)` bikin poller LUPA kalau
+   DB masih nyatet firing, jadi debounce ga akan pernah nemu transisi firing→resolved
+   (butuh state awal `firing=True` biar bisa turun). Fix: seed state dari DB (query
+   active incidents), bukan pop kosong.
+4. **`maintenance_windows_by_instance()` job-scope match `None == None`**: window
+   dengan target kosong/rusak (record lama) match SEMUA instance yang ga ada di
+   `job_map` — downtime asli ke-anggap "maintenance", ke-exclude diam-diam dari SLA.
+   Fix: skip window kalau target kosong (samakan sama guard yang sudah ada di
+   `get_active_maintenance`).
+5. **`avail_rate` fallback ke 1.0 (100% up) kalau Prometheus balikin avail% yang ga
+   bisa di-parse** — kontradiksi langsung sama komentar function sendiri ("jangan
+   default ke fully-up kalau ga ada sinyal rate asli"). Bisa nutupin outage beneran.
+   Fix: `avail_rate = None` (unattributed), bukan 1.0.
+6. **`#metricFleetDataWarning` — `.textContent =` di JS nimpa SELURUH isi tombol**,
+   padahal tombolnya sekarang punya icon span + text span + "View Telemetry Audit ➔"
+   action span. Tiap refresh, icon dan tombol aksi ilang, jadi teks polos. Fix: cuma
+   set `.textContent` span teksnya (`#metricFleetDataWarningText`).
+7. **`entry.get("sla_target_pct") or sla_threshold`** — override SLA target 0% (nilai
+   valid, `PUT /api/sla-targets` izinin 0-100) ke-anggap falsy, diam-diam diganti default
+   fleet. Fix: cek `is not None`, bukan truthiness.
+8. **`_annotate_logs_with_acknowledgment` nempelin ack ke SEMUA baris `firing` historis
+   satu instance**, padahal `event_logs` itu append-only (baris `firing` lama dari
+   outage yang SUDAH lama resolve tetap ber-`event='firing'` selamanya). Host yang
+   pernah flapping 5x lalu down lagi — ack buat outage SEKARANG nempel juga ke 5
+   outage lama yang udah beres. Fix: scan newest-first, cuma baris firing PERTAMA per
+   instance (sebelum ketemu baris resolved yang lebih baru) yang di-anotasi.
+
+**Ditolak**: fleet_aggregate sekarang pakai coverage yang exclude-maintenance
+(`sla_total_uptime/sla_total_coverage`) alih-alih raw — ini BUKAN regresi tak sengaja:
+`total_coverage`/`total_uptime` raw masih dihitung dan bisa direkonstruksi lewat
+`maintenance_excluded_minutes` yang sudah diekspos, dan dokumentasi function sudah
+nyebut `fleet_aggregate` sebagai "metrik SLA enterprise" — konsisten sama exclude
+maintenance secara sengaja. Bukan bug, hanya flagged reviewer karena ga ada field
+"raw fleet-wide" terpisah buat komparasi langsung.
+
+**Dilaporkan, TIDAK diubah**: Data Quality & Telemetry Audit tab + gear-icon settings
+popover (Node Exporter correlation toggle) di Availability Breakdown modal — backend-nya
+(`get_availability_settings`/`save_availability_settings`, `/api/availability/settings`)
+sudah lengkap, tapi NOL wiring JS (klik gear/tab/tombol ga ngapa-ngapain). Ini gap fitur
+besar dari kerjaan sesi lain, bukan bug kecil — butuh konfirmasi user sebelum saya bangun
+seluruh wiring-nya.
+
+**Test baru**: `MaintenanceWindowsByInstanceTests` (3), assertion `total_down_seconds`
++ garbled-avail test di `test_hybrid_availability.py`, SLA-0%-override test, ack-leak
+test (2 arah: alert lain ga ke-unack, occurrence baru ga mewarisi ack), SlowResponse
+maintenance-recovery-via-debounce test, min_severity gate test (3, di
+`test_telegram_alert.py`), log-annotate closed-episode test. Total 266 test + 45
+subtests pass (dijalankan per-batch, hindari OOM lokal).
+
+---
+
 ## [3.6.4] - 2026-09-05
 
 ### Node Exporter Infrastructure Correlation & NOC UI Refinement

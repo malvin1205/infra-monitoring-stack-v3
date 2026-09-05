@@ -859,6 +859,9 @@ def maintenance_windows_by_instance(instances, job_map, windows=None):
             continue
         scope = w.get('scope') or w.get('scope_type')
         target = w.get('target') or w.get('scope_target')
+        if not target:
+            continue  # malformed/legacy record — without this, target==None
+            # matches every instance absent from job_map (None == None below)
         for inst in instances:
             matched = (target == job_map.get(inst)) if scope == 'job' else (target == inst)
             if matched:
@@ -1013,25 +1016,26 @@ def record_alert_event(name, severity, instance, summary, job, event_time, is_no
         save_json(LOGS_FILE, logs[:MAX_LOGS])
         save_with_retention(HISTORY_FILE, HISTORY_ARCHIVE_FILE, history, MAX_HISTORY)
 
-        # Asynchronously dispatch Telegram notification on verified state transition.
-        # severity="warning" (SlowResponse) is intentionally excluded for now —
-        # response-time degradation fires far more often than a real outage,
-        # and whether it's actionable enough for Telegram is still an open
-        # decision pending a few days of real data. Dashboard/history still
-        # get it either way; only the push notification is held back.
+        # Asynchronously dispatch Telegram notification on verified state
+        # transition. min_severity (telegram_notifier.get_telegram_config,
+        # enforced in _async_send_worker) is what actually decides whether
+        # this severity gets pushed — not a check here, so it stays a real,
+        # user-editable setting (PUT /api/telegram) instead of a hardcoded
+        # gate that would silently swallow any other severity="warning"
+        # alert (e.g. a real Alertmanager rule) this function is also shared
+        # with, not just the new SlowResponse alert it was added for.
         try:
-            if severity != "warning":
-                dispatch_alert_async(
-                    name=name,
-                    severity=severity,
-                    instance=instance,
-                    summary=summary,
-                    job=job,
-                    event_time=event_time,
-                    is_now_firing=is_now_firing,
-                    duration_seconds=duration_seconds,
-                    latency_ms=latency_ms
-                )
+            dispatch_alert_async(
+                name=name,
+                severity=severity,
+                instance=instance,
+                summary=summary,
+                job=job,
+                event_time=event_time,
+                is_now_firing=is_now_firing,
+                duration_seconds=duration_seconds,
+                latency_ms=latency_ms
+            )
         except Exception as e:
             logger.error(f"Error dispatching telegram alert: {e}")
 
@@ -1338,21 +1342,37 @@ def _annotate_logs_with_acknowledgment(log_rows):
     """Live Alert Log rows are discrete past events, not ongoing state — an
     acknowledgment isn't a property of one specific historical row, it's a
     property of "is this instance's CURRENT outage acked right now". So this
-    joins each still-relevant 'firing' row against the live acknowledgment
-    table rather than storing ack info per log row. (Incident History uses
-    the durable incidents.acknowledged_by/at columns instead, since a
-    resolved incident needs the info to survive past the live table getting
-    cleared — see AcknowledgmentRepository.clear_resolved.)"""
+    joins each still-open 'firing' row against the live acknowledgment table
+    rather than storing ack info per log row. (Incident History uses the
+    durable incidents.acknowledged_by/at columns instead, since a resolved
+    incident needs the info to survive past the live table getting cleared —
+    see AcknowledgmentRepository.clear_resolved.)
+
+    event_logs is append-only: a 'firing' row's event column stays 'firing'
+    forever, even for an outage that resolved ages ago, so an instance that's
+    flapped several times has several 'firing' rows. log_rows arrives newest
+    first (EventLogRepository.get_logs' ORDER BY time DESC) — the first
+    firing row hit for a given instance, before any resolved row for that
+    same instance is seen, is the only one that's actually still open;
+    everything older belongs to an already-closed episode and must be left
+    alone even if the instance happens to be acknowledged again right now.
+    """
     try:
         ack_map = AcknowledgmentRepository.get_active_acknowledgments()
     except Exception:
         return
     if not ack_map:
         return
+    seen_instances = set()
     for row in log_rows:
-        if row.get('event') != 'firing':
+        inst = row.get('instance')
+        event = row.get('event')
+        if inst is None or inst in seen_instances or event not in ('firing', 'resolved'):
             continue
-        ack = ack_map.get(row.get('instance'))
+        seen_instances.add(inst)  # newest mention of this instance either way
+        if event != 'firing':
+            continue
+        ack = ack_map.get(inst)
         if ack:
             row['acknowledged_by'] = ack['acknowledged_by']
             row['acknowledged_at'] = ack['acknowledged_at']
@@ -3856,9 +3876,31 @@ def _poll_targets_once():
     # extend to jobs if job-wide maintenance flapping becomes a problem.
     windows = load_maintenance_windows()
     active_now = {inst for inst in instances if get_active_maintenance(inst, windows=windows)}
-    for inst in _maintenance_active_prev - active_now:
+    just_ended = _maintenance_active_prev - active_now
+    if just_ended:
+        try:
+            _slow_firing_instances = {
+                a['instance'] for a in IncidentRepository.get_active_incidents()
+                if a.get('name') == ALERTNAME_SLOW_RESPONSE
+            }
+        except Exception:
+            _slow_firing_instances = set()
+    for inst in just_ended:
         _poller_state[inst] = 'up'
-        _slow_poller_state.pop(inst, None)  # fresh debounce streak once monitoring resumes
+        # Seed (not just discard) the debounce state to match what SQLite
+        # actually has open — popping this entirely would make
+        # compute_slow_response_transitions believe nothing was firing for
+        # this instance, so it could never observe a firing->resolved
+        # transition for a SlowResponse incident that's genuinely still
+        # 'firing' in the DB from before the window (same class of bug as
+        # TargetDown above, different mechanism: here it's the poller's own
+        # bookkeeping forgetting the DB's state, not a forced probe reading
+        # matching the real one). Fresh counters either way — a stale streak
+        # from right before maintenance shouldn't count toward the debounce.
+        _slow_poller_state[inst] = {
+            'consec_slow': 0, 'consec_fast': 0,
+            'firing': inst in _slow_firing_instances
+        }
         val = success_map.get(inst)
         if val is not None and str(val) in ('1', '1.0'):
             record_alert_event(

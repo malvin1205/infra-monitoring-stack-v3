@@ -517,22 +517,6 @@ class IncidentRepository:
             # 'resolved' by the guard above) increments the same row instead
             # of inserting a new one, so Incident History reflects real
             # flap counts instead of always reading "occurrences x1".
-            # alert_acknowledgments is keyed by instance (live-only "is the
-            # CURRENT outage on this host acked" state) and is otherwise only
-            # cleared by a poll-driven sweep (app.py's /instances handler,
-            # AcknowledgmentRepository.clear_resolved) that only runs when
-            # something is actually polling /instances and only clears
-            # instances that are no longer down. A resolve -> re-fire cycle
-            # that happens between two such polls (or while nothing is
-            # polling at all — an unattended wallboard tab, say) would leave
-            # a stale ack in place, silently suppressing the alarm AND
-            # showing "Acked by X" on a brand-new, nobody's-looked-at-it-yet
-            # occurrence in both the live dashboard and Live Alert Log.
-            # Clearing it right here, on the actual state transition, closes
-            # that race — the poll-driven sweep still runs too (harmless,
-            # handles instances removed from monitoring entirely).
-            conn.execute("DELETE FROM alert_acknowledgments WHERE instance = ?", (instance,))
-
             duration_seconds = None
             if is_now_firing:
                 conn.execute("""
@@ -581,6 +565,28 @@ class IncidentRepository:
                     INSERT INTO event_logs (event, name, severity, instance, summary, job, time, duration_seconds, latency_ms, fingerprint)
                     VALUES ('resolved', ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (name, severity, instance, summary, job, event_time, duration_seconds, latency_ms, key))
+
+                # alert_acknowledgments is keyed by instance (live-only "is
+                # THIS host's current trouble acked" state), not by incident
+                # key — a host can have more than one alert type firing at
+                # once (e.g. TargetDown + an unrelated Alertmanager rule).
+                # Only clear the live ack once NOTHING is left firing for
+                # this instance (the row above is already 'resolved' by now,
+                # so it's naturally excluded here) — otherwise resolving one
+                # alert would wrongly un-acknowledge another, still-firing,
+                # already-handled one on the same host. This also closes the
+                # original race this replaced: previously the ack was only
+                # cleared by a poll-driven sweep (app.py's /instances
+                # handler, AcknowledgmentRepository.clear_resolved) that
+                # might not run before a resolve -> re-fire happens (or not
+                # run at all, e.g. an unattended wallboard) — clearing it
+                # here, immediately, means a genuinely new occurrence can
+                # never inherit a stale ack from the one that just resolved.
+                conn.execute("""
+                    DELETE FROM alert_acknowledgments WHERE instance = ? AND NOT EXISTS (
+                        SELECT 1 FROM incidents WHERE instance = ? AND status = 'firing'
+                    )
+                """, (instance, instance))
 
             # Retention limits
             conn.execute("""

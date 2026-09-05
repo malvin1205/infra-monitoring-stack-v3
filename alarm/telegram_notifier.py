@@ -64,7 +64,13 @@ def get_telegram_config() -> Dict[str, Any]:
         "chat_id": "",
         "send_firing": True,
         "send_resolved": True,
-        "min_severity": "warning"
+        # "critical" until a human decides otherwise via PUT /api/telegram —
+        # SlowResponse (severity="warning") fires far more often than a real
+        # outage and the operator hasn't yet decided whether that's
+        # actionable enough for a push notification. Dashboard/Incident
+        # History still get every warning either way; only this gate holds
+        # back the Telegram push specifically.
+        "min_severity": "critical"
     }
 
     if os.path.exists(CONFIG_FILE):
@@ -203,6 +209,11 @@ def build_alert_message(
         )
 
 
+# Ranks used only to compare against the configured min_severity gate below
+# — not a general severity taxonomy, just "how loud is this" ordering.
+_SEVERITY_RANK = {"info": 0, "warning": 1, "critical": 2}
+
+
 def _async_send_worker(
     name: str,
     severity: str,
@@ -227,6 +238,14 @@ def _async_send_worker(
     if is_now_firing and not config.get("send_firing", True):
         return
     if not is_now_firing and not config.get("send_resolved", True):
+        return
+
+    # min_severity gate — this existed as a config field long before it was
+    # ever enforced (a saved/GET-able setting that silently did nothing).
+    # Unknown severities rank as "critical" (2) so a misconfigured/unlabeled
+    # alert fails open (gets sent) rather than silently vanishing.
+    min_sev = str(config.get("min_severity", "critical")).strip().lower()
+    if _SEVERITY_RANK.get(str(severity).strip().lower(), 2) < _SEVERITY_RANK.get(min_sev, 2):
         return
 
     text = build_alert_message(

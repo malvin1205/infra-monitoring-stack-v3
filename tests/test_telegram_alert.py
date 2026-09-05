@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -9,6 +10,7 @@ from telegram_notifier import (
     test_telegram_connection as verify_telegram_connection,
     send_telegram_raw,
     build_alert_message,
+    _async_send_worker,
 )
 
 def test_telegram_message_builder():
@@ -47,6 +49,59 @@ def test_telegram_message_builder():
     assert "Status     OPERATIONAL" in resolved_msg
     assert "Downtime   15s" in resolved_msg
     assert "Latency    18.4 ms" in resolved_msg
+
+def _fake_config(min_severity):
+    return {
+        "enabled": True, "bot_token": "x", "chat_id": "y",
+        "send_firing": True, "send_resolved": True,
+        "min_severity": min_severity
+    }
+
+
+def test_default_min_severity_holds_back_warnings():
+    # Was "warning" (i.e. everything passes) despite being a documented gate
+    # that nothing ever enforced — now that it's actually enforced, the
+    # code-level default (no saved telegram_config.json, or one predating
+    # this field) must match the app's stated policy: no Telegram push for
+    # warning-severity alerts (SlowResponse) until a human opts back in.
+    # Isolated from this machine's real telegram_config.json (a live,
+    # gitignored file that may have its own saved min_severity) — this
+    # checks the fallback default, not whatever's on disk right now.
+    with patch("telegram_notifier.CONFIG_FILE", "/nonexistent/telegram_config.json"):
+        config = get_telegram_config()
+    assert config["min_severity"] == "critical"
+
+
+def test_min_severity_gate_blocks_below_threshold():
+    with patch("telegram_notifier.get_telegram_config", return_value=_fake_config("critical")), \
+         patch("telegram_notifier.send_telegram_raw") as mock_send:
+        _async_send_worker(
+            name="SlowResponse", severity="warning", instance="host-a", summary="degraded",
+            job="blackbox", event_time=1.0, is_now_firing=True)
+        mock_send.assert_not_called()
+
+
+def test_min_severity_gate_allows_at_threshold():
+    with patch("telegram_notifier.get_telegram_config", return_value=_fake_config("critical")), \
+         patch("telegram_notifier.send_telegram_raw", return_value=(True, "ok")) as mock_send:
+        _async_send_worker(
+            name="TargetDown", severity="critical", instance="host-a", summary="down",
+            job="blackbox", event_time=1.0, is_now_firing=True)
+        mock_send.assert_called_once()
+
+
+def test_min_severity_is_user_configurable_to_let_warnings_through():
+    # The whole point of fixing this as a real setting instead of a
+    # hardcoded name check: an operator who WANTS warning-severity pushes
+    # (this one, or any future Alertmanager warning rule) can just turn it
+    # back on via PUT /api/telegram, no code change needed.
+    with patch("telegram_notifier.get_telegram_config", return_value=_fake_config("warning")), \
+         patch("telegram_notifier.send_telegram_raw", return_value=(True, "ok")) as mock_send:
+        _async_send_worker(
+            name="SlowResponse", severity="warning", instance="host-a", summary="degraded",
+            job="blackbox", event_time=1.0, is_now_firing=True)
+        mock_send.assert_called_once()
+
 
 def run_tests():
     print("=" * 60)

@@ -17,6 +17,32 @@ except ImportError:
 from conftest import TEST_API_KEY, TEST_WEBHOOK_SECRET
 
 
+class MaintenanceWindowsByInstanceTests(unittest.TestCase):
+    """maintenance_windows_by_instance() carves planned downtime out of the
+    SLA denominator (/api/availability) — a false match here silently hides
+    real downtime from a target's availability figure."""
+
+    def test_malformed_job_window_with_no_target_matches_nothing(self):
+        # A window with no target/scope_target at all (legacy/corrupt record)
+        # must not match every instance missing from job_map via None == None.
+        windows = [{"scope": "job", "start": 0, "end": 9999999999}]
+        result = alarm_app.maintenance_windows_by_instance(["host-a", "host-b"], job_map={}, windows=windows)
+        self.assertEqual(result, {})
+
+    def test_job_scope_still_matches_real_targets(self):
+        windows = [{"scope": "job", "target": "blackbox", "start": 0, "end": 9999999999}]
+        result = alarm_app.maintenance_windows_by_instance(
+            ["host-a", "host-b"], job_map={"host-a": "blackbox", "host-b": "node"}, windows=windows)
+        self.assertIn("host-a", result)
+        self.assertNotIn("host-b", result)
+
+    def test_instance_scope_unaffected(self):
+        windows = [{"scope": "instance", "target": "host-a", "start": 0, "end": 9999999999}]
+        result = alarm_app.maintenance_windows_by_instance(["host-a", "host-b"], job_map={}, windows=windows)
+        self.assertIn("host-a", result)
+        self.assertNotIn("host-b", result)
+
+
 class ComputeStateTransitionsTests(unittest.TestCase):
     """Pure-function tests for the poller's transition detector — no network,
     no files. Covers all cold-start and steady-state transition cases:
@@ -501,6 +527,30 @@ class AcknowledgmentPersistenceTests(unittest.TestCase):
         slow = next(a for a in active if a["name"] == "SlowResponse")
         self.assertIsNone(slow["acknowledged_by"])
 
+    def test_resolving_one_alert_type_does_not_unacknowledge_another_still_firing_one(self):
+        # The other direction of the leak above: TWO alert types firing at
+        # once on the same host, both covered by one instance-scoped ack.
+        # Resolving one of them must not wipe the ack out from under the
+        # other, still-firing, already-handled one.
+        from storage import AcknowledgmentRepository, IncidentRepository
+        alarm_app.record_alert_event(
+            name="TargetDown", severity="critical", instance="10.0.0.5",
+            summary="down", job="blackbox", event_time=1000.0, is_now_firing=True)
+        alarm_app.record_alert_event(
+            name="HighMemoryUsage", severity="warning", instance="10.0.0.5",
+            summary="memory high", job="blackbox", event_time=1000.0, is_now_firing=True)
+        AcknowledgmentRepository.acknowledge_instances(["10.0.0.5"], username="alice", db_path=self.db_path)
+
+        # HighMemoryUsage resolves; TargetDown is still down.
+        alarm_app.record_alert_event(
+            name="HighMemoryUsage", severity="warning", instance="10.0.0.5",
+            summary="memory normal", job="blackbox", event_time=1100.0, is_now_firing=False)
+
+        self.assertIn("10.0.0.5", AcknowledgmentRepository.get_active_acknowledgments(db_path=self.db_path))
+        active = IncidentRepository.get_active_incidents(db_path=self.db_path)
+        target_down = next(a for a in active if a["name"] == "TargetDown")
+        self.assertEqual(target_down["acknowledged_by"], "alice")  # untouched
+
     def test_logs_annotate_marks_only_still_firing_rows(self):
         with patch.object(alarm_app.AcknowledgmentRepository, 'get_active_acknowledgments',
                            return_value={"10.0.0.5": {"acknowledged_by": "alice", "acknowledged_at": 1005.0}}):
@@ -508,6 +558,25 @@ class AcknowledgmentPersistenceTests(unittest.TestCase):
                 {"event": "firing", "instance": "10.0.0.5"},
                 {"event": "firing", "instance": "10.0.0.9"},  # not acked -> untouched
                 {"event": "resolved", "instance": "10.0.0.5"},  # past event -> untouched even though instance matches
+            ]
+            alarm_app._annotate_logs_with_acknowledgment(rows)
+
+        self.assertEqual(rows[0].get("acknowledged_by"), "alice")
+        self.assertNotIn("acknowledged_by", rows[1])
+        self.assertNotIn("acknowledged_by", rows[2])
+
+    def test_logs_annotate_does_not_stamp_an_older_already_closed_episode(self):
+        # event_logs is append-only — an instance that's flapped has several
+        # historical 'firing' rows, only the newest of which (if not yet
+        # followed by an even-newer 'resolved') is the actually-open one.
+        # Rows arrive newest-first, so: firing (now, open) -> resolved (an
+        # earlier close) -> firing (an even earlier, already-closed episode).
+        with patch.object(alarm_app.AcknowledgmentRepository, 'get_active_acknowledgments',
+                           return_value={"10.0.0.5": {"acknowledged_by": "alice", "acknowledged_at": 1005.0}}):
+            rows = [
+                {"event": "firing", "instance": "10.0.0.5", "time": 3000},    # current, open episode
+                {"event": "resolved", "instance": "10.0.0.5", "time": 2000},  # closed a previous episode
+                {"event": "firing", "instance": "10.0.0.5", "time": 1000},    # that previous episode's start
             ]
             alarm_app._annotate_logs_with_acknowledgment(rows)
 
@@ -607,12 +676,46 @@ class MaintenanceRecoveryReconciliationTests(unittest.TestCase):
         self.assertEqual(len(active), 1)  # still exactly one incident, not two
         self.assertEqual(active[0]["occurrences"], 1)  # no phantom re-fire counted
 
+    def test_slow_response_recovering_during_maintenance_resolves_after_debounce(self):
+        # SlowResponse's own version of the bug above: popping its debounce
+        # state entirely at maintenance-end would make
+        # compute_slow_response_transitions believe nothing was firing, so
+        # it could never observe a firing->resolved change for an incident
+        # that's genuinely still 'firing' in SQLite. Seeding firing=True from
+        # the DB instead lets the normal debounce (3 consecutive fast polls)
+        # resolve it correctly, no different from any other resolve.
+        from storage import IncidentRepository
+        alarm_app.record_alert_event(
+            name="SlowResponse", severity="warning", instance="10.0.0.7",
+            summary="degraded", job="blackbox", event_time=1000.0, is_now_firing=True)
+        alarm_app._maintenance_active_prev.add("10.0.0.7")
+
+        # 50ms — comfortably under the 500ms default threshold ("fast").
+        with patch.object(alarm_app, 'get_monitored_instances', return_value=["10.0.0.7"]), \
+             patch.object(alarm_app, 'fetch_all_probe_metrics', return_value=({"10.0.0.7": "1"}, {"10.0.0.7": 0.05}, {})), \
+             patch.object(alarm_app, 'load_maintenance_windows', return_value=[]):
+            alarm_app._poll_targets_once()  # maintenance ends; tick #1 fast
+            self.assertEqual(len(IncidentRepository.get_active_incidents(db_path=self.db_path)), 1,
+                              "must not resolve on the very first fast sample")
+
+            alarm_app._poll_targets_once()  # tick #2 fast
+            self.assertEqual(len(IncidentRepository.get_active_incidents(db_path=self.db_path)), 1)
+
+            alarm_app._poll_targets_once()  # tick #3 fast -> debounce satisfied
+            self.assertEqual(len(IncidentRepository.get_active_incidents(db_path=self.db_path)), 0)
+
+        history = IncidentRepository.get_history(limit=10, db_path=self.db_path)
+        self.assertEqual(history[0]["status"], "resolved")
+
 
 class TelegramSeverityGateTests(unittest.TestCase):
-    """SlowResponse (severity='warning') must reach the dashboard/history
-    (SQLite + JSON) but NOT Telegram — that's still an open decision pending
-    a few days of real data (see /app.py record_alert_event). A critical
-    alert must still dispatch exactly as before."""
+    """record_alert_event() dispatches to Telegram for every severity —
+    the min_severity gate (SlowResponse warnings held back by default) lives
+    inside telegram_notifier._async_send_worker instead (see
+    TelegramMinSeverityTests in test_telegram_alert.py), specifically so
+    this shared function can't silently swallow a real Alertmanager
+    severity="warning" alert too. Dashboard/history get every severity
+    regardless of what Telegram does with it."""
 
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
@@ -638,12 +741,14 @@ class TelegramSeverityGateTests(unittest.TestCase):
             os.environ.pop("INFRAWATCH_DB_PATH", None)
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
-    def test_warning_severity_does_not_dispatch_telegram(self):
+    def test_warning_severity_still_reaches_dispatch_alert_async(self):
+        # Whether it actually SENDS is telegram_notifier's call (min_severity),
+        # not record_alert_event's — it must not be filtered out this early.
         with patch.object(alarm_app, 'dispatch_alert_async') as mock_dispatch:
             alarm_app.record_alert_event(
                 name="SlowResponse", severity="warning", instance="10.0.0.8",
                 summary="degraded", job="blackbox", event_time=1000.0, is_now_firing=True)
-            mock_dispatch.assert_not_called()
+            mock_dispatch.assert_called_once()
 
     def test_critical_severity_still_dispatches_telegram(self):
         with patch.object(alarm_app, 'dispatch_alert_async') as mock_dispatch:
