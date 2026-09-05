@@ -1659,16 +1659,14 @@ class InstancesPage {
     const covPct = typeof audit.coverage_percent === 'number' ? audit.coverage_percent : (data.coverage_percent || 0);
     const missPct = typeof audit.missing_percent === 'number' ? audit.missing_percent : Math.max(0, 100 - covPct);
 
-    const setCoverageCard = (valId, subId, meterId, sec, pct, subText) => {
+    const setCoverageCard = (valId, subId, sec, pct, subText) => {
       const valEl = document.getElementById(valId);
       const subEl = document.getElementById(subId);
-      const meterEl = document.getElementById(meterId);
       if (valEl) valEl.textContent = fmtDur(sec);
       if (subEl) subEl.textContent = subText || `${pct.toFixed(1)}% of window`;
-      if (meterEl) meterEl.style.width = `${Math.max(0, Math.min(100, pct))}%`;
     };
-    setCoverageCard('auditMetricObserved', 'auditMetricObservedPct', 'auditMeterObserved', coverageSec, covPct);
-    setCoverageCard('auditMetricMissing', 'auditMetricMissingPct', 'auditMeterMissing', missingSec, missPct);
+    setCoverageCard('auditMetricObserved', 'auditMetricObservedPct', coverageSec, covPct);
+    setCoverageCard('auditMetricMissing', 'auditMetricMissingPct', missingSec, missPct);
 
     const maintCard = document.getElementById('auditMaintCard');
     const auditGrid = document.getElementById('auditGrid');
@@ -1676,7 +1674,7 @@ class InstancesPage {
       if (maintCard) maintCard.hidden = false;
       if (auditGrid) auditGrid.classList.add('has-maint');
       const maintPct = winSec > 0 ? (maintSec / winSec) * 100 : 0;
-      setCoverageCard('auditMetricMaint', 'auditMetricMaintPct', 'auditMeterMaint', maintSec, maintPct, 'excluded from SLA');
+      setCoverageCard('auditMetricMaint', 'auditMetricMaintPct', maintSec, maintPct, 'excluded from SLA');
     } else {
       if (maintCard) maintCard.hidden = true;
       if (auditGrid) auditGrid.classList.remove('has-maint');
@@ -1852,46 +1850,33 @@ class InstancesPage {
       : (typeof data?.overall === 'number' ? data.overall : null);
 
     const aggEl = document.getElementById('metricFleetAggregate');
-    const splitUpEl = document.getElementById('splitBarUptime');
-    const splitDownEl = document.getElementById('splitBarDowntime');
     const legendUpEl = document.getElementById('legendUptimePct');
     const legendDownEl = document.getElementById('legendDowntimePct');
-    const gaugeCircleEl = document.getElementById('fleetGaugeCircle');
-
-    // Data-driven refresh should update the gauge/split-bar instantly, not
-    // animate through their 0.4-0.6s hover-style CSS transitions on every
-    // range switch. Suspend the transition just for this write, then let it
-    // resume next frame.
-    const transitionedEls = [splitUpEl, splitDownEl, gaugeCircleEl].filter(Boolean);
-    transitionedEls.forEach(el => el.classList.add('no-transition'));
+    // Revamp visuals (presentation only, driven by the same fleet_aggregate value)
+    const ringEl = document.getElementById('avbFleetRing');       // donut ring on the Fleet card
+    const splitUpEl = document.getElementById('avbHealthyUpBar');  // uptime/downtime split bar on the Healthy Hosts card
+    const splitDownEl = document.getElementById('avbHealthyDownBar');
+    const RING_CIRCUMFERENCE = 163.36; // 2 * PI * r, r = 26 (see .avb-ring markup)
 
     if (fleetAvail !== null) {
+      const clamped = Math.max(0, Math.min(100, fleetAvail));
       const upPctStr = `${fleetAvail.toFixed(2)}%`;
       const downPct = Math.max(0, 100 - fleetAvail);
       const downPctStr = `${downPct.toFixed(2)}%`;
 
       if (aggEl) aggEl.textContent = upPctStr;
-      if (splitUpEl) splitUpEl.style.width = `${fleetAvail.toFixed(2)}%`;
-      if (splitDownEl) splitDownEl.style.width = `${downPct.toFixed(2)}%`;
       if (legendUpEl) legendUpEl.textContent = upPctStr;
       if (legendDownEl) legendDownEl.textContent = downPctStr;
-
-      if (gaugeCircleEl) {
-        // Circumference for r=34 is 2 * PI * 34 = 213.63
-        const offset = Math.max(0, Math.min(213.6, 213.6 * (1.0 - (fleetAvail / 100.0))));
-        gaugeCircleEl.style.strokeDashoffset = offset.toFixed(1);
-      }
+      if (ringEl) ringEl.setAttribute('stroke-dashoffset', (RING_CIRCUMFERENCE * (1 - clamped / 100)).toFixed(2));
+      if (splitUpEl) splitUpEl.style.width = `${clamped.toFixed(2)}%`;
+      if (splitDownEl) splitDownEl.style.width = `${(100 - clamped).toFixed(2)}%`;
     } else {
       if (aggEl) aggEl.textContent = '—';
-      if (splitUpEl) splitUpEl.style.width = '0%';
-      if (splitDownEl) splitDownEl.style.width = '0%';
       if (legendUpEl) legendUpEl.textContent = '—';
       if (legendDownEl) legendDownEl.textContent = '—';
-      if (gaugeCircleEl) gaugeCircleEl.style.strokeDashoffset = '213.6';
-    }
-
-    if (transitionedEls.length) {
-      requestAnimationFrame(() => transitionedEls.forEach(el => el.classList.remove('no-transition')));
+      if (ringEl) ringEl.setAttribute('stroke-dashoffset', RING_CIRCUMFERENCE.toFixed(2));
+      if (splitUpEl) splitUpEl.style.width = '0%';
+      if (splitDownEl) splitDownEl.style.width = '0%';
     }
 
     // Fleet-level data confidence warning — the headline % is real math over
@@ -1906,11 +1891,13 @@ class InstancesPage {
       const status = data?.data_status;
       const isLimited = status === 'INSUFFICIENT_DATA' || status === 'PARTIAL' || (covPct !== null && covPct < 50);
       if (fleetAvail !== null && isLimited && covPct !== null) {
-        // Set only the text span's content — warnEl is a <button> with an
-        // icon span and a "View Telemetry Audit ➔" action span alongside
-        // this one; overwriting the whole button's textContent used to wipe
-        // both of those out every refresh.
-        if (warnTextEl) warnTextEl.textContent = `⚠ Limited data — only ${covPct.toFixed(1)}% of this window observed`;
+        // Set only the text span's content — warnEl is a <button> with its
+        // own icon span (ahw-icon, rendered separately) and a "View
+        // telemetry audit" action span alongside this one; overwriting the
+        // whole button's textContent used to wipe both of those out every
+        // refresh, and prefixing this string with its own "⚠" used to draw
+        // the warning glyph twice.
+        if (warnTextEl) warnTextEl.textContent = `Limited data — only ${covPct.toFixed(1)}% of this window observed`;
         warnEl.hidden = false;
       } else {
         warnEl.hidden = true;
@@ -1927,16 +1914,19 @@ class InstancesPage {
     const healthEl = document.getElementById('metricHealthRatio');
     const healthyCountEl = document.getElementById('metricHealthyHostsCount');
 
+    // The headline number is the "N / total" count — that's what an
+    // engineer scans for first — with the percentage as supporting detail
+    // underneath, same as it's already computed for the fleet-wide ratio.
     if (healthRatio !== null) {
-      if (healthEl) healthEl.textContent = `${healthRatio.toFixed(2)}%`;
-      if (healthyCountEl && healthyCount !== null && totalCount !== null) {
-        healthyCountEl.textContent = `${healthyCount} / ${totalCount} hosts`;
-      } else if (healthyCountEl) {
-        healthyCountEl.textContent = `${healthRatio.toFixed(1)}% healthy`;
+      if (healthEl) {
+        healthEl.textContent = (healthyCount !== null && totalCount !== null)
+          ? `${healthyCount} / ${totalCount}`
+          : `${healthRatio.toFixed(2)}%`;
       }
+      if (healthyCountEl) healthyCountEl.textContent = `${healthRatio.toFixed(2)}% healthy`;
     } else {
       if (healthEl) healthEl.textContent = '—';
-      if (healthyCountEl) healthyCountEl.textContent = '— / — hosts';
+      if (healthyCountEl) healthyCountEl.textContent = '— healthy';
     }
 
     // Keep hidden secondary metrics updated for test/DOM compatibility
@@ -2130,30 +2120,27 @@ class InstancesPage {
       const target = dataByInstance.get(h.id) || dataByInstance.get(h.name);
       const roleLabel = this._getHostRoleLabel(target, h);
 
-      // Severity styling & icon
+      // Severity styling — a plain color dot carries the status; the
+      // availability % text/color and badges already say what it means, so
+      // the dot doesn't need its own glyph on top of that.
       let sevClass = 'ara-sev-good';
-      let sevIcon = '<svg viewBox="0 0 16 16" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="3.5 8 6.5 11 12.5 5"></polyline></svg>';
       let pctClass = 'pct-good';
       let barClass = 'bar-fill-good';
 
       if (h.isNoData) {
         sevClass = 'ara-sev-warning';
-        sevIcon = '?';
         pctClass = 'pct-muted';
         barClass = 'bar-fill-warning';
       } else if (h.availability < 60) {
         sevClass = 'ara-sev-critical';
-        sevIcon = '!';
         pctClass = 'pct-critical';
         barClass = 'bar-fill-critical';
       } else if (h.availability < 80) {
         sevClass = 'ara-sev-orange';
-        sevIcon = '!';
         pctClass = 'pct-orange';
         barClass = 'bar-fill-orange';
       } else if (h.availability < 95) {
         sevClass = 'ara-sev-warning';
-        sevIcon = '!';
         pctClass = 'pct-warning';
         barClass = 'bar-fill-warning';
       }
@@ -2174,7 +2161,7 @@ class InstancesPage {
         <div class="ara-row" data-instance="${this._esc(h.id)}" role="button" tabindex="0" title="Click to view host details">
           <!-- Col 1: Host / IP -->
           <div class="ara-host-col">
-            <div class="ara-severity-icon ${sevClass}">${sevIcon}</div>
+            <span class="ara-severity-dot ${sevClass}" aria-hidden="true"></span>
             <div class="ara-host-meta">
               <span class="ara-hostname">${this._esc(h.name)}</span>
               <div class="ara-badges-row">
@@ -2191,20 +2178,12 @@ class InstancesPage {
               <div class="ara-bar-track">
                 <div class="ara-bar-fill ${barClass}" style="width: ${barWidth}%;"></div>
               </div>
-              <div class="ara-bar-ticks">
-                <span>0%</span>
-                <span>50%</span>
-                <span>100%</span>
-              </div>
             </div>
           </div>
 
           <!-- Col 3: Impact -->
           <div class="ara-impact-col">
             <div class="ara-impact-info">
-              <svg class="ara-pulse-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-                <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline>
-              </svg>
               <div class="ara-impact-texts">
                 <span class="ara-incidents-text">${incidentsText}</span>
                 <span class="ara-downtime-text">${downtimeText}</span>

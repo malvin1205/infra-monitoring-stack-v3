@@ -9,6 +9,8 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,300;0,14..32,400;0,14..32,500;0,14..32,600;0,14..32,700;1,14..32,400&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <!-- IBM Plex Sans/Mono: used only inside the Availability Breakdown modal (.avb) -->
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
 
   <link rel="stylesheet" href="{{ url_for('static', filename='css/noc.css') }}?v={{ asset_version('css/noc.css') }}">
 </head>
@@ -849,23 +851,18 @@
 
   <!-- Availability Breakdown Modal -->
   <div id="availabilityBreakdownModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="availabilityBreakdownTitle">
-    <div class="modal-card modal-card-wide avail-modal-card">
+    <div class="modal-card modal-card-wide avail-modal-card avb">
       <div class="avail-modal-header">
         <div class="avail-header-left">
-          <div class="avail-header-icon-box">
-            <svg class="avail-header-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-              <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline>
-            </svg>
-          </div>
           <div class="avail-header-text">
             <h3 class="avail-modal-title" id="availabilityBreakdownTitle">
-              Availability Breakdown 
+              Availability Breakdown
               <span id="availabilityBreakdownRange" class="modal-title-sub hidden">(24h)</span>
               <span id="availUpdatingBadge" class="avail-updating-badge hidden" aria-live="polite">
                 <span class="avail-updating-spinner"></span> Updating…
               </span>
             </h3>
-            <p class="avail-modal-subtitle">Historical availability overview across your infrastructure.</p>
+            <p class="avail-modal-subtitle">Historical availability across your infrastructure.</p>
           </div>
         </div>
         <div class="avail-header-right">
@@ -905,8 +902,10 @@
         </div>
       </div>
 
-      <div class="modal-body avail-modal-body">
-        <!-- Modal Sub-Navigation Bar -->
+      <!-- The one and only scroll container for the modal body. Header, tab
+           bar and footer stay pinned; everything else scrolls in here. -->
+      <div class="avb-scroll">
+        <!-- Tab bar — sticky at the top of the scroll area -->
         <div class="avail-subnav-bar" role="tablist" aria-label="Availability Breakdown Views">
           <button type="button" class="avail-subnav-btn is-active" id="btnSubnavRanking" data-avail-tab="ranking" role="tab" aria-selected="true">
             <svg class="avail-subnav-icon" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
@@ -914,66 +913,70 @@
               <line x1="8" y1="21" x2="16" y2="21"></line>
               <line x1="12" y1="17" x2="12" y2="21"></line>
             </svg>
-            <span>Overview & Ranking</span>
+            <span>Overview &amp; Ranking</span>
           </button>
           <button type="button" class="avail-subnav-btn" id="btnSubnavAudit" data-avail-tab="audit" role="tab" aria-selected="false">
             <svg class="avail-subnav-icon" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
               <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
               <polyline points="9 12 11 14 15 10"></polyline>
             </svg>
-            <span>Data Quality & Telemetry Audit</span>
-            <span class="avail-subnav-badge hidden" id="auditSubnavBadge">LIMITED DATA</span>
+            <span>Data Quality &amp; Telemetry Audit</span>
+            <span class="avail-subnav-badge hidden" id="auditSubnavBadge">Limited data</span>
           </button>
         </div>
 
+        <div class="modal-body avail-modal-body">
         <!-- ── TAB PANE 1: OVERVIEW & RANKING ── -->
         <div class="avail-subnav-pane" id="paneAvailRanking">
           <!-- Top 2 Primary Metric Cards -->
         <div class="avail-hero-grid">
-          <!-- Card 1: Fleet Availability -->
+          <!-- Card 1: Fleet Availability — the one "bold moment": ring + gradient top strip -->
           <div class="avail-hero-card avail-hero-fleet">
             <div class="avail-hero-content">
               <div class="avail-hero-header">
-                <span class="avail-hero-title">FLEET AVAILABILITY</span>
-                <span class="avail-info-btn" title="Overall uptime across all monitored hosts (sum of all uptime durations / sum of all observed durations)" aria-label="Fleet Availability Info">
+                <span class="avail-hero-title">Fleet Availability</span>
+                <span class="avail-info-btn" title="Overall uptime across all monitored hosts (sum of all uptime durations / sum of all observed durations)" aria-label="Fleet Availability info">
                   <svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="16" x2="12" y2="12"></line><line x1="12" y1="8" x2="12.01" y2="8"></line></svg>
                 </span>
               </div>
-              <div class="avail-hero-value" id="metricFleetAggregate">—</div>
-              <div class="avail-hero-desc">Overall uptime across all monitored hosts</div>
-              <button type="button" class="avail-hero-data-warning is-clickable" id="metricFleetDataWarning" hidden aria-label="View Telemetry and Coverage Audit">
-                <span class="ahw-icon">⚠</span>
-                <span class="ahw-text" id="metricFleetDataWarningText">Limited data</span>
-                <span class="ahw-action">View Telemetry Audit ➔</span>
-              </button>
-
-              <div class="avail-split-bar-wrap">
-                <div class="avail-split-bar">
-                  <div class="avail-split-fill-up" id="splitBarUptime" style="width: 100%;"></div>
-                  <div class="avail-split-fill-down" id="splitBarDowntime" style="width: 0%;"></div>
-                </div>
-                <div class="avail-split-legend">
-                  <span class="legend-item"><span class="legend-dot dot-up"></span> Uptime <strong id="legendUptimePct">—</strong></span>
-                  <span class="legend-item"><span class="legend-dot dot-down"></span> Downtime <strong id="legendDowntimePct">—</strong></span>
+              <div class="avb-fleet-body">
+                <svg class="avb-ring" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Fleet availability ring">
+                  <circle class="avb-ring-track" cx="32" cy="32" r="26" fill="none" stroke-width="6"></circle>
+                  <circle class="avb-ring-value" id="avbFleetRing" cx="32" cy="32" r="26" fill="none" stroke-width="6" stroke-linecap="round"
+                          stroke-dasharray="163.36" stroke-dashoffset="163.36" transform="rotate(-90 32 32)"></circle>
+                </svg>
+                <div class="avb-fleet-figures">
+                  <div class="avail-hero-value" id="metricFleetAggregate">—</div>
+                  <div class="avail-hero-desc">Observed uptime across monitored hosts</div>
                 </div>
               </div>
+              <button type="button" class="avail-hero-data-warning is-clickable" id="metricFleetDataWarning" hidden aria-label="View telemetry and coverage audit">
+                <span class="ahw-icon">⚠</span>
+                <span class="ahw-text" id="metricFleetDataWarningText">Limited data</span>
+                <span class="ahw-action">View telemetry audit →</span>
+              </button>
             </div>
           </div>
 
-          <!-- Card 2: Healthy Hosts -->
+          <!-- Card 2: Healthy Hosts — count headline + uptime/downtime split bar -->
           <div class="avail-hero-card avail-hero-healthy">
             <div class="avail-hero-content">
               <div class="avail-hero-header">
-                <span class="avail-hero-title">HEALTHY HOSTS</span>
-                <span class="avail-info-btn" title="Hosts with zero recorded downtime within the observed time range" aria-label="Healthy Hosts Info">
+                <span class="avail-hero-title">Healthy Hosts</span>
+                <span class="avail-info-btn" title="Hosts with zero recorded downtime within the observed time range" aria-label="Healthy Hosts info">
                   <svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="16" x2="12" y2="12"></line><line x1="12" y1="8" x2="12.01" y2="8"></line></svg>
                 </span>
               </div>
               <div class="avail-hero-value" id="metricHealthRatio">—</div>
-              <div class="avail-hero-desc">Hosts with no recorded downtime</div>
+              <div class="avail-hero-desc" id="metricHealthyHostsCount">— healthy</div>
 
-              <div class="avail-healthy-stat">
-                <span class="avail-healthy-count-text" id="metricHealthyHostsCount">— / — hosts</span>
+              <div class="avb-splitbar" role="img" aria-label="Uptime vs downtime split">
+                <span class="avb-splitbar-up" id="avbHealthyUpBar" style="width:100%;"></span>
+                <span class="avb-splitbar-down" id="avbHealthyDownBar" style="width:0%;"></span>
+              </div>
+              <div class="avail-split-legend">
+                <span class="legend-item"><span class="legend-dot dot-up"></span>Uptime <strong id="legendUptimePct">—</strong></span>
+                <span class="legend-item"><span class="legend-dot dot-down"></span>Downtime <strong id="legendDowntimePct">—</strong></span>
               </div>
             </div>
           </div>
@@ -986,11 +989,35 @@
           <span id="metricCoverageRatio">—</span>
         </div>
 
+        <!-- Section: Availability Trend (24h) -->
+        <section class="avb-trend-section" aria-label="Availability trend">
+          <h4 class="avb-sec-title">Availability Trend</h4>
+          <div class="avb-trend-card">
+            <div class="avb-trend-plot">
+              <div class="avb-trend-grid" aria-hidden="true">
+                <span style="--y:0%"><i>100%</i></span>
+                <span style="--y:50%"><i>50%</i></span>
+                <span style="--y:100%"><i>0%</i></span>
+              </div>
+              <div class="avb-trend-empty">
+                <svg viewBox="0 0 48 24" width="52" height="26" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <polyline points="1 18 10 12 18 15 27 6 36 9 47 3"></polyline>
+                </svg>
+                <p>No 24-hour trend series for this window yet.</p>
+                <span>The line chart populates once enough hourly availability buckets are recorded.</span>
+              </div>
+            </div>
+            <div class="avb-trend-xaxis" aria-hidden="true">
+              <span>-24h</span><span>-18h</span><span>-12h</span><span>-6h</span><span>now</span>
+            </div>
+          </div>
+        </section>
+
         <!-- Section: Hosts Requiring Attention -->
         <div class="avail-attention-section">
           <div class="avail-attention-header">
-            <div>
-              <h4 class="avail-attention-title">HOSTS REQUIRING ATTENTION</h4>
+            <div class="avb-sec-titlewrap">
+              <h4 class="avail-attention-title avb-sec-title">Hosts Requiring Attention</h4>
               <p class="avail-attention-subtitle" id="availAttentionSubtitle">Sorted by lowest availability (ascending)</p>
             </div>
             <div class="avail-attention-controls">
@@ -1054,16 +1081,16 @@
 
           <div class="avail-attention-table-wrap">
             <div class="avail-table-header">
-              <button type="button" class="ath-col ath-host ath-sort-btn" data-sort-key="name" title="Click to sort by host name">
-                <span>HOST / IP</span>
+              <button type="button" class="ath-col ath-host ath-sort-btn" data-sort-key="name" title="Sort by host name">
+                <span>Host / IP</span>
                 <span class="ath-sort-arrow" id="sortArrowName"></span>
               </button>
-              <button type="button" class="ath-col ath-avail ath-sort-btn ath-sorted" data-sort-key="avail" title="Click to sort by availability percentage">
-                <span>AVAILABILITY</span>
+              <button type="button" class="ath-col ath-avail ath-sort-btn ath-sorted" data-sort-key="avail" title="Sort by availability">
+                <span>Availability</span>
                 <span class="ath-sort-arrow" id="sortArrowAvail">▲</span>
               </button>
-              <button type="button" class="ath-col ath-impact ath-sort-btn" data-sort-key="impact" title="Click to sort by incidents / downtime">
-                <span>IMPACT</span>
+              <button type="button" class="ath-col ath-impact ath-sort-btn" data-sort-key="impact" title="Sort by incidents / downtime">
+                <span>Impact</span>
                 <span class="ath-sort-arrow" id="sortArrowImpact"></span>
               </button>
             </div>
@@ -1089,7 +1116,7 @@
               </div>
               <div class="avail-calc-item">
                 <strong>Coverage</strong>
-                <span><code>(Observed Duration / Selected Window) × 100%</code>. Hosts with &lt;50% coverage display a <span class="badge-limited-data-sample">LIMITED DATA</span> indicator.</span>
+                <span><code>(Observed Duration / Selected Window) × 100%</code>. Hosts with &lt;50% coverage display a <span class="badge-limited-data-sample">Limited data</span> indicator.</span>
               </div>
               <div class="avail-calc-item">
                 <strong>Fleet Availability</strong>
@@ -1103,11 +1130,11 @@
 
         <!-- ── TAB PANE 2: DATA QUALITY & TELEMETRY AUDIT ─────────── -->
         <div class="avail-subnav-pane hidden" id="paneAvailAudit">
-          <!-- SLA headline + downtime error budget -->
-          <div class="audit-sla-row">
+          <!-- SLA headline + downtime error budget — one card, vertical divider -->
+          <div class="audit-sla-row avb-splitcard">
             <div class="audit-sla-card" id="auditSlaCard">
               <div class="audit-sla-head">
-                <span class="audit-sla-label">SLA AVAILABILITY<span class="audit-sla-sub"> · excl. planned maintenance</span></span>
+                <span class="audit-sla-label">SLA Availability<span class="audit-sla-sub"> · excl. planned maintenance</span></span>
                 <span class="audit-sla-badge" id="auditSlaBadge">—</span>
               </div>
               <div class="audit-sla-value" id="auditSlaValue">—</div>
@@ -1119,7 +1146,7 @@
 
             <div class="audit-sla-card" id="auditBudgetCard">
               <div class="audit-sla-head">
-                <span class="audit-sla-label">DOWNTIME BUDGET<span class="audit-sla-sub" id="auditBudgetScope"> · this window</span></span>
+                <span class="audit-sla-label">Downtime Budget<span class="audit-sla-sub" id="auditBudgetScope"> · this window</span></span>
                 <span class="audit-budget-state" id="auditBudgetState">—</span>
               </div>
               <div class="audit-budget-bar"><div class="audit-budget-fill" id="auditBudgetFill" style="width:0%;"></div></div>
@@ -1138,34 +1165,36 @@
           </div>
 
           <!-- Coverage split -->
-          <div class="audit-grid" id="auditGrid">
-            <div class="audit-card">
-              <div class="audit-card-title">Observed</div>
-              <div class="audit-card-value text-observed" id="auditMetricObserved">—</div>
-              <div class="audit-card-sub" id="auditMetricObservedPct">— of window</div>
-              <div class="audit-card-meter"><div class="audit-card-fill fill-observed" id="auditMeterObserved" style="width:0%;"></div></div>
-            </div>
+          <div class="audit-section">
+            <h4 class="audit-section-title avb-sec-title">Coverage</h4>
+            <div class="audit-grid" id="auditGrid">
+              <div class="audit-card">
+                <div class="audit-card-title">Observed</div>
+                <div class="audit-card-value text-observed" id="auditMetricObserved">—</div>
+                <div class="audit-card-sub" id="auditMetricObservedPct">— of window</div>
+              </div>
 
-            <div class="audit-card">
-              <div class="audit-card-title">Unmonitored</div>
-              <div class="audit-card-value text-missing" id="auditMetricMissing">—</div>
-              <div class="audit-card-sub" id="auditMetricMissingPct">— of window</div>
-              <div class="audit-card-meter"><div class="audit-card-fill fill-missing" id="auditMeterMissing" style="width:0%;"></div></div>
-            </div>
+              <div class="audit-card">
+                <div class="audit-card-title">Unmonitored</div>
+                <div class="audit-card-value text-missing" id="auditMetricMissing">—</div>
+                <div class="audit-card-sub" id="auditMetricMissingPct">— of window</div>
+              </div>
 
-            <div class="audit-card" id="auditMaintCard" hidden>
-              <div class="audit-card-title">Planned maintenance</div>
-              <div class="audit-card-value text-maint" id="auditMetricMaint">—</div>
-              <div class="audit-card-sub" id="auditMetricMaintPct">excluded from SLA</div>
-              <div class="audit-card-meter"><div class="audit-card-fill fill-maint" id="auditMeterMaint" style="width:0%;"></div></div>
+              <div class="audit-card" id="auditMaintCard" hidden>
+                <div class="audit-card-title">Planned maintenance</div>
+                <div class="audit-card-value text-maint" id="auditMetricMaint">—</div>
+                <div class="audit-card-sub" id="auditMetricMaintPct">excluded from SLA</div>
+              </div>
             </div>
           </div>
+
+          <div class="audit-divider"></div>
 
           <!-- Per-host telemetry -->
           <div class="audit-table-card">
             <div class="audit-table-header">
               <div class="audit-table-title-wrap">
-                <span class="audit-table-title">PER-HOST</span>
+                <span class="audit-table-title">Telemetry by Host</span>
                 <span class="audit-table-count" id="auditTableHostCount">0 hosts</span>
               </div>
               <div class="audit-filters-wrap">
@@ -1183,11 +1212,11 @@
               <table class="audit-table">
                 <thead>
                   <tr>
-                    <th>HOST</th>
-                    <th>COVERAGE</th>
-                    <th class="ta-r">SLA AVAIL / TARGET</th>
-                    <th class="ta-r">DOWNTIME (SLA)</th>
-                    <th class="ta-r">BUDGET LEFT</th>
+                    <th>Host</th>
+                    <th>Coverage</th>
+                    <th class="ta-r">SLA / Target</th>
+                    <th class="ta-r">Downtime (SLA)</th>
+                    <th class="ta-r">Budget Left</th>
                   </tr>
                 </thead>
                 <tbody id="auditTableBody">
@@ -1207,7 +1236,8 @@
           </div>
         </div>
         <!-- ── END TAB PANE 2 ── -->
-      </div>
+        </div><!-- /.avail-modal-body -->
+      </div><!-- /.avb-scroll -->
 
       <!-- Modal Footer -->
       <div class="avail-modal-footer">
