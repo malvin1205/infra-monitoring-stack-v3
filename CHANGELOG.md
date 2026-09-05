@@ -6,6 +6,241 @@ Format changelog ini mengacu pada standar [Keep a Changelog](https://keepachange
 
 ---
 
+## [3.6.4] - 2026-09-05
+
+### Node Exporter Infrastructure Correlation & NOC UI Refinement
+
+**Tujuan**
+Membedakan kegagalan probe level aplikasi/service vs infrastruktur host secara otomatis menggunakan metrik Node Exporter sebagai secondary signal, tanpa mengganggu kalkulasi SLA/availability eksisting. Sekaligus perapihan modal & form UI NOC Wallboard serta penguatan suite pengujian preaggregation.
+
+**Hasil**
+- `classify_probe_failure()` (`alarm/fleet_availability.py`): pure function tanpa I/O yang mengklasifikasikan probe yang DOWN menjadi `service_issue` (jika Node Exporter sehat) atau `infrastructure_issue` (jika Node Exporter down/unhealthy), dan `no_node_exporter` jika tidak ada telemetri node exporter. Tidak pernah mengubah ketersediaan atau SLA uptime/downtime.
+- Pengaturan korelasi configurable (`alarm/availability_settings.json`, endpoint `/api/availability/settings` GET/POST dengan permission RBAC `availability.read` dan `availability.write`). Default: `false` (opt-in).
+- Integrasi live target loop di `alarm/app.py`: jika fitur aktif, memetakan status `up{job="node_exporter"}` per target host untuk menyematkan correlation metadata pada target status.
+- Template file `alarm/availability_settings.json.example` dan update `.gitignore` untuk melindungi config lokal.
+- Refactor CSS (`alarm/static/css/noc.css`) dan modal/form HTML (`alarm/templates/alarm.html`) untuk konsistensi design tokens, perbaikan layout modal (User Management, Login, dll), dan standardisasi class `.form-input`, `.form-select`, `.modal-actions`.
+- Suite pengujian baru `tests/test_availability_node_exporter.py` (21 unit & integration tests) dan optimasi mock `fetch_prom_range_map` di `tests/test_availability_preaggregation.py`.
+
+---
+
+## [3.6.3] - 2026-09-05
+
+### "Acknowledged By" — Live Alert Log & Incident History
+
+**Tujuan**
+Tampilkan siapa yang acknowledge suatu alert dan kapan, di kedua tempat (Live Alert Log
+dan Incident History). Sistem ack (`AcknowledgmentRepository`, `/api/acknowledge`) sudah
+ada sebelumnya untuk live dashboard/alarm silencing, tapi datanya cuma live-state (hilang
+begitu instance recover) dan tidak pernah disurface ke log/history.
+
+**Hasil**
+- Kolom baru `acknowledged_by`/`acknowledged_at` di tabel `incidents` — durable, tidak
+  hilang seperti `alert_acknowledgments` (yang di-`clear_resolved()` begitu instance
+  pulih). `AcknowledgmentRepository.acknowledge_instances()`/`unacknowledge_instance()`
+  sekarang juga sinkron langsung ke row `incidents` yang lagi firing, jadi Incident
+  History (Ongoing maupun sudah Resolved) tetap bisa nunjukin siapa yang ack.
+- Occurrence baru (re-fire setelah resolve) otomatis reset ack ke kosong — outage baru
+  butuh ack baru, tidak mewarisi ack dari occurrence sebelumnya.
+- Live Alert Log: ack di-join live dari `alert_acknowledgments` (bukan kolom permanen di
+  `event_logs`, karena ack itu properti "status outage SEKARANG", bukan properti satu
+  baris log historis) — cuma baris `firing` yang masih relevan yang dapat badge ack.
+- Frontend: baris "✓ Acked by {user} · {waktu}" muncul di bawah nama host, warna accent
+  biar kebeda dari sub-text biasa (job/error) — tampil di History (chip) maupun Live
+  Alert Log (chip) kalau ada datanya.
+- Test baru `AcknowledgmentPersistenceTests` (5 test): ack persist ke row firing, ack
+  bertahan setelah resolve + live record dihapus, unacknowledge bersihin row, occurrence
+  baru mulai unacknowledged, dan `_annotate_logs_with_acknowledgment` cuma nandain baris
+  firing yang cocok.
+
+**Kendala**
+- Tidak ada UI baru untuk melakukan acknowledge dari Live Alert Log/Incident History
+  langsung — tombol ack yang sudah ada tetap di alarm/dashboard utama (per-instance).
+  Kalau mau bisa ack langsung dari kedua panel ini, itu scope terpisah.
+
+---
+
+## [3.6.2] - 2026-09-05
+
+### Audit Akurasi — Live Alert Log & Incident History
+
+**Tujuan**
+Permintaan eksplisit: pastikan tidak ada bug tersisa dan data 100% akurat di kedua fitur
+ini. Audit menyeluruh kode backend (`storage.py`, `app.py`) dan frontend (`alarm.js`)
+menemukan 4 bug nyata — semua sudah diperbaiki + diuji.
+
+**Hasil (bug ditemukan & diperbaiki)**
+1. **"Total Down" bukan aggregate, cuma occurrence terakhir**: task #3 minta kolom ini
+   jadi "durasi agregat", tapi `duration_seconds` di-overwrite tiap re-fire (`started_at`
+   ikut ter-reset), jadi host yang flapping 5x cuma nampilin durasi down yang PALING
+   TERAKHIR, bukan total. Tambah kolom `total_down_seconds` yang di-akumulasi
+   (`+= duration_seconds`) tiap kali resolve — dites: 5x occurrence @60s = 300s total,
+   bukan 60s.
+2. **Incident yang recover diam-diam saat maintenance stuck "Ongoing" selamanya**: poller
+   sengaja skip evaluasi instance yang lagi maintenance, lalu paksa state ke 'up' pas
+   window berakhir supaya "kalau masih down, transisi baru muncul" — tapi kalau
+   ternyata SUDAH recover selama maintenance, `compute_state_transitions` melihat
+   forced-'up' == actual-'up' dan TIDAK PERNAH emit resolve event. Row `incidents` di
+   SQLite nyangkut status='firing' permanen — sebelumnya tersembunyi (History cuma
+   nampilin resolved), sekarang jadi kelihatan sebagai "Ongoing" palsu karena task #2
+   round sebelumnya. Fix: begitu window maintenance berakhir, cek state asli langsung,
+   kalau sudah up maka resolve eksplisit (aman, no-op kalau memang tidak ada yang
+   firing).
+3. **`get_history()` bisa diam-diam buang incident Ongoing yang jarang update**: query
+   lama `ORDER BY updated_at DESC LIMIT N` bisa nge-geser incident yang masih firing
+   tapi sudah lama tidak re-trigger keluar dari window kalau ada banyak incident lain
+   yang lebih baru resolve. Fix: fetch semua baris `firing` tanpa limit + baris
+   `resolved` dengan limit terpisah, digabung — incident Ongoing sekarang dijamin
+   selalu muncul berapapun volume incident lain.
+4. **Filter date-range bisa nyembunyiin incident yang lagi Ongoing**: filter lama pakai
+   waktu MULAI incident (`r.time >= since`) — outage yang sudah jalan 2 bulan (mulai
+   sebelum "This Month") hilang dari tampilan default padahal masih aktif SEKARANG.
+   Fix: filter berdasar waktu AKHIR aktivitas — incident Ongoing pakai "sekarang"
+   (selalu masuk window manapun karena semua preset berakhir di "sekarang"), incident
+   resolved pakai `resolved_time`.
+5. **Live Alert Log tidak nampilin severity sama sekali** (regresi dari insiden
+   restore `alarm.js` round sebelumnya + baru kerasa sekarang ada SlowResponse):
+   operator tidak bisa bedain event critical (TargetDown) vs warning (SlowResponse)
+   di Live Alert Log. Tambah badge severity (reuse `.history-sev`/`.history-sev-*`
+   yang sudah ada) di tiap row.
+
+**Test baru**: `test_ongoing_incident_survives_the_limit_even_when_stale`,
+`MaintenanceRecoveryReconciliationTests` (2 test, termasuk skenario "masih down
+setelah maintenance" untuk pastikan fix #2 tidak bikin duplikat incident), plus
+assertion `total_down_seconds` ditambahkan ke test occurrence-dedup yang sudah ada.
+Semua ~246 test + subtests lolos (dijalankan per-batch untuk hindari OOM di environment
+lokal — bukan indikasi masalah pada test itu sendiri).
+
+**Kendala**
+- Backfill `total_down_seconds` untuk baris resolved lama (pre-migrasi) cuma pakai
+  `duration_seconds` yang ada (durasi occurrence terakhir) sebagai pendekatan terbaik —
+  durasi occurrence-occurrence sebelumnya sebelum migrasi ini memang tidak pernah
+  disimpan di mana pun, tidak ada sumber lebih akurat untuk backfill.
+- Tidak menemukan bug lain di jalur SlowResponse debounce, occurrences/first_seen,
+  atau severity filter/status filter — sudah diverifikasi lewat unit test yang ada,
+  bukan cuma review manual.
+
+---
+
+## [3.6.1] - 2026-09-05
+
+### SlowResponse — Alert Warning Baru (Follow-up Task #9)
+
+**Tujuan**
+Isi gap arsitektur yang ditemukan di task #9 round sebelumnya ("0 Warning" karena
+`TargetDown` di poller di-hardcode `severity="critical"` dan tidak ada jalur lain yang
+pernah mengisi `"warning"`) — tanpa asal ubah threshold TargetDown, sesuai 3 syarat yang
+dikonfirmasi user: debounce N=3 poll berturut-turut, belum notify Telegram, threshold
+per-target configurable.
+
+**Hasil**
+- `compute_slow_response_transitions()` (`app.py`, pure function, pola sama seperti
+  `compute_state_transitions()`): fire perlu N=3 sample **berturut-turut** di atas
+  threshold, resolve juga perlu N=3 sample berturut-turut normal — 1 sample noise tidak
+  memicu apapun (persis kelas bug yang sama dengan task #1, dicegah dari awal di alert
+  type baru ini). Target yang DOWN men-supersede slow: streak direset dan SlowResponse
+  yang lagi firing langsung di-resolve, tidak nunggu 3x "normal" yang toh tidak akan
+  pernah datang selama down.
+- Dievaluasi tiap poll tick (15 detik) untuk semua instance yang sedang di-scope
+  (bukan cuma yang lagi transisi TargetDown), lewat `_poll_targets_once` →
+  `record_alert_event(name="SlowResponse", severity="warning", ...)` — pipeline
+  dedupe/history/telegram-gate yang sama dipakai ulang, tidak ada kode baru di situ.
+- **Telegram sengaja di-skip untuk severity="warning"**: gate ditaruh satu tempat di
+  `record_alert_event()` (`if severity != "warning": dispatch_alert_async(...)`) —
+  dashboard/Incident History tetap dapat datanya penuh, cuma notifikasi push yang
+  ditahan sampai keputusan lanjut diambil setelah lihat data riil beberapa hari.
+- **Threshold per-target** (`slow_thresholds` table, default 500ms) via
+  `SlowThresholdRepository` + `/api/slow-thresholds` (GET/PUT/DELETE), pola persis
+  meniru `SlaTargetRepository`/`/api/sla-targets` yang sudah ada — host yang naturally
+  lambat (mis. endpoint luar negeri) bisa di-override tanpa numpang di threshold global.
+- Test baru `ComputeSlowResponseTransitionsTests` (7 test kasus, termasuk skenario
+  persis yang diminta: 2x lambat → 1x normal → 2x lambat = belum fire; 3x lambat
+  berturut-turut = fire 1x bukan 3x) dan `TelegramSeverityGateTests` (3 test,
+  membuktikan warning tidak dispatch Telegram, critical tetap dispatch, warning tetap
+  masuk history).
+- `TargetDown` tidak disentuh sama sekali — tetap hardcode `critical` seperti sebelumnya.
+
+**Kendala**
+- Belum ada UI admin buat set/lihat `slow_thresholds` per-target — baru tersedia lewat
+  API (`/api/slow-thresholds`). Ditambahkan kalau dibutuhkan dari dashboard.
+- Belum ada test end-to-end untuk `_poll_targets_once` (fungsi poller penuh) — mengikuti
+  konvensi test suite yang sudah ada, cuma pure function (`compute_state_transitions`,
+  sekarang juga `compute_slow_response_transitions`) yang di-unit-test langsung; jalur
+  poller penuh butuh mock jaringan Prometheus, di luar scope test ini.
+
+---
+
+## [3.6.0] - 2026-09-05
+
+### Incident History — Perbaikan & Fitur Baru
+
+**Tujuan**
+Perbaikan bug data (occurrences selalu ×1), penambahan kolom Status/First Seen/root-cause,
+klik-row-buka-drawer, filter tanggal/job, sorting, pagination, dan pembersihan angka
+redundan di panel Incident History — sesuai task list Round ini. Acknowledgment/assignment
+sengaja TIDAK termasuk scope.
+
+**Hasil**
+- **Root cause bug #1 (occurrences ×1) ditemukan & diperbaiki**: tabel `incidents` di SQLite
+  menyimpan satu baris per `key` (host+alert) dan meng-*update in place* setiap transisi
+  (`storage.py: IncidentRepository.record_alert_event`) — tapi baris itu tidak pernah
+  menghitung berapa kali key yang sama sempat resolve lalu fire lagi. Kolom baru
+  `occurrences` (increment tiap DOWN→UP→DOWN, gap UP = occurrence baru, definisi ini
+  sama dengan dedupe transisi yang sudah ada) dan `first_seen` (waktu fire pertama,
+  dipertahankan lintas re-fire) ditambahkan lewat migrasi `ALTER TABLE`. Test baru:
+  `IncidentOccurrenceDedupTests` (`tests/test_alert_transitions.py`) membuktikan host
+  flapping 5× dalam satu window menghasilkan 1 baris dengan `occurrences=5`, bukan 5 baris.
+- **Kolom Status (Ongoing/Resolved)**: `get_history()` sekarang mengikutkan incident yang
+  masih firing (sebelumnya query difilter `status='resolved'` saja — incident aktif tidak
+  pernah muncul di History). Badge dot pulsing merah untuk Ongoing, ring abu-abu untuk
+  Resolved. Filter chip All/Ongoing/Resolved digabung ke toolbar filter severity yang sudah
+  ada (bukan baris filter baru).
+- **Kolom First Seen** berdampingan dengan Last Seen; Total Down tetap ada sebagai durasi agregat.
+- **Root cause sub-text**: `http_status_code` dan `last_error` di-snapshot ke tabel
+  `incidents` saat alert fire (dari `classify_scrape_failure()` yang sudah ada di poller),
+  ditampilkan sebagai sub-text di bawah nama host.
+- **Klik row → drawer detail** yang sudah ada (bukan expand inline) — reuse
+  `InstancesPage._openDrawer()`, fallback ke objek minimal kalau host sudah tidak
+  termonitor lagi.
+- **Filter tanggal** (This Month default / 7 Hari / 30 Hari / All Time) dan **filter Job**
+  (dropdown, opsi dari data yang ada) ditambahkan ke toolbar. Stat card ikut ter-update
+  sesuai range yang dipilih (sebelumnya hardcode "this month").
+- **Sorting** (Last Seen default / Total Down / Occurrences) — dropdown kecil dekat
+  Export CSV.
+- **Redundant count dibersihkan**: teks di atas tabel sekarang reaktif terhadap SEMUA
+  filter aktif ("N incidents (filtered)"); stat card "Total Incidents" jadi angka tetap
+  (hanya bereaksi ke date range, bukan ke severity/status/job/search) — sebelumnya
+  keduanya menghitung himpunan yang sama sehingga selalu tampil identik.
+- **Pagination**: hanya `PAGE_SIZE=40` baris pertama yang dirender ke DOM, tombol
+  "Show more" menambah batch berikutnya — bukan render semua row sekaligus.
+
+**Kendala**
+- **Investigasi "0 Warning" (task #9) — dilaporkan, TIDAK diubah** tanpa konfirmasi lebih
+  dulu sesuai instruksi. Temuan: severity bukan bug klasifikasi/threshold yang salah kalibrasi
+  — `severity` untuk `TargetDown` di poller (`app.py: _poll_targets_once`) di-hardcode
+  `"critical"` selalu. Jalur satu-satunya yang bisa mengisi `"warning"` adalah label
+  Alertmanager lewat `/webhook`, dan stack ini memang tidak menjalankan Alertmanager
+  (lihat komentar di `app.py` dekat `_poll_targets_once`) — jadi `/webhook` tidak pernah
+  dipanggil di jalur produksi. "0 Warning" adalah konsekuensi arsitektur (tidak ada
+  produser severity warning), bukan alert yang gagal naik tingkat dari ambang batas.
+  Perlu keputusan produk: tambah tier warning di poller (mis. latency tinggi tapi masih up),
+  atau biarkan begitu — belum diimplementasikan menunggu konfirmasi.
+- **Insiden kerja selama pengerjaan round ini**: draft awal `HistoryPage` sempat ditulis
+  memakai tool yang overwrite seluruh file (`alarm.js`), menghapus ~823 baris pekerjaan
+  belum-commit yang sudah ada sebelum round ini dimulai (grouping "Concept A" untuk Live
+  Alert Log + hardening race-condition alarm audio yang sudah py CSS/HTML-nya tapi belum
+  di-commit). Bagian yang hilang tidak bisa dipulihkan (tidak ada stash/commit/history
+  editor). Atas persetujuan user: `alarm.js` di-restore ke commit terakhir, lalu (a) Live
+  Alert Log direskin ulang ke class `.al-*` yang sudah ada di CSS (tanpa fitur grouping,
+  ditandai `ponytail:` untuk dikerjakan terpisah), dan (b) hardening audio (`playAlarm`
+  token guard, single-play-site policy) direkonstruksi ulang mengikuti spec lengkap di
+  `tests/test_alarm_audio.js` (test ini sekarang lolos lagi). Kerja Incident History di
+  round ini sendiri tidak memakai tool overwrite lagi setelah insiden ini (semua lewat
+  edit bertarget) dan tidak terdampak.
+- Semua 234 test Python + subtests dan self-check `tests/test_alarm_audio.js` lolos
+  setelah pemulihan; tidak ada regresi pada suite yang ada.
+
+---
+
 ## [3.5.0] - 2026-08-24
 
 ### 🛡️ Hardening Keamanan Lanjutan (Security Hardening)

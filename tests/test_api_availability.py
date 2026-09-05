@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import app as app_module
 from app import app
-from storage import init_db
+from storage import init_db, SlaTargetRepository
 
 
 class ApiAvailabilityTests(unittest.TestCase):
@@ -75,6 +75,79 @@ class ApiAvailabilityTests(unittest.TestCase):
 
             ids = {e['id'] for e in data['entries']}
             self.assertEqual(ids, {'host-a', 'host-b'})
+
+            # Phase 4: SLA error-budget block, fleet + per-target.
+            self.assertIn('sla', data)
+            self.assertIn('window', data['sla'])
+            self.assertIn('projected', data['sla'])
+            self.assertEqual(data['sla']['target_pct'], 99.9)
+            for e in data['entries']:
+                self.assertIn('sla_budget', e)
+                self.assertIn('allowed_downtime_seconds', e['sla_budget']['window'])
+
+    def test_availability_sla_target_override(self):
+        """?sla_target= / ?sla_days= override the budget target and projection."""
+        def fake_query_map(query_expr, cache_ttl=5.0, timeout=None):
+            if query_expr in ('probe_success', 'up'):
+                return {'h1': '1'}
+            if 'changes(' in query_expr:
+                return {'h1': '0'}
+            if 'probe_success[' in query_expr or 'up[' in query_expr:
+                return {'h1': '100.0'}
+            return {}
+
+        with patch.object(app_module, 'get_monitored_instances', return_value=['h1']), \
+             patch.object(app_module, 'load_json', return_value=[]), \
+             patch.object(app_module, 'fetch_prom_query_map', side_effect=fake_query_map):
+            app_module.clear_availability_cache()
+            res = self.client.get('/api/availability?minutes=1440&sla_target=99&sla_days=7')
+            data = json.loads(res.data)
+            self.assertEqual(data['sla']['target_pct'], 99.0)
+            self.assertEqual(data['sla']['projected']['days'], 7)
+            # 99% over a 24h window -> 864s allowed downtime
+            self.assertAlmostEqual(data['sla']['window']['allowed_downtime_seconds'], 864.0, delta=2.0)
+
+    def test_per_target_sla_target_crud_and_effect(self):
+        """PUT /api/sla-targets/<inst> overrides that target's SLA target in
+        /api/availability; DELETE reverts it to the default."""
+        hdr = {"X-API-Key": os.environ.get("INFRAWATCH_API_KEY", "test-api-key")}
+
+        def fake_query_map(query_expr, cache_ttl=5.0, timeout=None):
+            if query_expr in ('probe_success', 'up'):
+                return {'h1': '1'}
+            if 'changes(' in query_expr:
+                return {'h1': '0'}
+            if 'probe_success[' in query_expr or 'up[' in query_expr:
+                return {'h1': '99.5'}
+            return {}
+
+        with patch.object(app_module, 'get_monitored_instances', return_value=['h1']), \
+             patch.object(app_module, 'load_json', return_value=[]), \
+             patch.object(app_module, 'fetch_prom_query_map', side_effect=fake_query_map):
+
+            r = self.client.put('/api/sla-targets/h1', json={"target_pct": 99.0}, headers=hdr)
+            self.assertEqual(r.status_code, 200, r.data)
+
+            g = self.client.get('/api/sla-targets', headers=hdr)
+            self.assertEqual(json.loads(g.data)["targets"], {"h1": 99.0})
+
+            app_module.clear_availability_cache()
+            data = json.loads(self.client.get('/api/availability?minutes=1440').data)
+            e = next(x for x in data['entries'] if x['id'] == 'h1')
+            self.assertEqual(e['sla_target_pct'], 99.0)
+            self.assertEqual(e['sla_budget']['target_pct'], 99.0)
+
+            self.client.delete('/api/sla-targets/h1', headers=hdr)
+            self.assertEqual(SlaTargetRepository.get_all(db_path=self.db_path), {})
+            app_module.clear_availability_cache()
+            data = json.loads(self.client.get('/api/availability?minutes=1440').data)
+            e = next(x for x in data['entries'] if x['id'] == 'h1')
+            self.assertEqual(e['sla_target_pct'], 99.9)
+
+    def test_sla_target_put_validates(self):
+        hdr = {"X-API-Key": os.environ.get("INFRAWATCH_API_KEY", "test-api-key")}
+        self.assertEqual(self.client.put('/api/sla-targets/h1', json={"target_pct": 150}, headers=hdr).status_code, 400)
+        self.assertEqual(self.client.put('/api/sla-targets/h1', json={"target_pct": "x"}, headers=hdr).status_code, 400)
 
     def test_availability_route_empty_fleet_is_graceful(self):
         with patch.object(app_module, 'get_monitored_instances', return_value=[]), \

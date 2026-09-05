@@ -1,4 +1,5 @@
 import json
+import math
 import time
 import os
 import tempfile
@@ -8,7 +9,7 @@ from unittest.mock import patch
 
 import app as alarm_app
 from app import app
-from storage import init_db, AvailabilityBucketRepository, AggregationLeaseRepository
+from storage import init_db, AvailabilityBucketRepository, AggregationLeaseRepository, SlaTargetRepository
 
 
 class AvailabilityPreaggregationTests(unittest.TestCase):
@@ -301,13 +302,116 @@ class AvailabilityPreaggregationTests(unittest.TestCase):
             # Invariant 4: Fleet aggregate equals single target availability
             self.assertEqual(data['overall'], entry['availability_pct'])
 
+    def test_sla_target_repository_crud(self):
+        self.assertEqual(SlaTargetRepository.get_all(db_path=self.db_path), {})
+        self.assertIsNone(SlaTargetRepository.get_target("web-1", db_path=self.db_path))
+
+        saved = SlaTargetRepository.set_target("web-1", 99.5, updated_by="alice", db_path=self.db_path)
+        self.assertEqual(saved, 99.5)
+        self.assertEqual(SlaTargetRepository.get_target("web-1", db_path=self.db_path), 99.5)
+
+        # upsert
+        SlaTargetRepository.set_target("web-1", 99.95, db_path=self.db_path)
+        SlaTargetRepository.set_target("api-2", 99.0, db_path=self.db_path)
+        self.assertEqual(SlaTargetRepository.get_all(db_path=self.db_path), {"web-1": 99.95, "api-2": 99.0})
+
+        # clamp
+        self.assertEqual(SlaTargetRepository.set_target("x", 150.0, db_path=self.db_path), 100.0)
+
+        self.assertTrue(SlaTargetRepository.delete_target("web-1", db_path=self.db_path))
+        self.assertFalse(SlaTargetRepository.delete_target("web-1", db_path=self.db_path))
+        self.assertNotIn("web-1", SlaTargetRepository.get_all(db_path=self.db_path))
+
     def test_aggregation_recovery_after_prometheus_outage(self):
         """Background aggregation handles transient Prometheus exceptions without raising or corrupting DB."""
         with patch.object(alarm_app, 'fetch_prom_query_map', side_effect=Exception("Connection refused (mock prom down)")), \
+             patch.object(alarm_app, 'fetch_prom_range_map', side_effect=Exception("Connection refused (mock prom down)")), \
              patch.object(alarm_app, 'get_monitored_instances', return_value=['node-1']):
 
             # Aggregator cycle must not raise
             alarm_app._aggregate_availability_cycle()
+
+    def test_outage_json_column_roundtrip(self):
+        """outage_json accepts a dict on write, comes back as a JSON string;
+        legacy rows without it round-trip as NULL."""
+        now = time.time()
+        base = {
+            "instance": "oj-node", "job": "blackbox",
+            "uptime_seconds": 3480.0, "downtime_seconds": 120.0, "unknown_seconds": 0.0,
+            "coverage_seconds": 3600.0, "sample_count": 240, "availability_pct": 96.67,
+            "incident_count": 2, "avg_latency_ms": 11.0, "updated_at": now,
+        }
+        with_oj = {**base, "bucket_start": now - 3600, "bucket_end": now,
+                   "outage_json": {"d": [40.0, 80.0], "ongoing_end": False}}
+        legacy = {**base, "bucket_start": now - 7200, "bucket_end": now - 3600}
+        AvailabilityBucketRepository.save_buckets([with_oj, legacy], db_path=self.db_path)
+
+        rows = AvailabilityBucketRepository.get_bucket_records(
+            "blackbox", now - 10800, now + 10, instances=["oj-node"], db_path=self.db_path)
+        by_start = {r["bucket_start"]: r for r in rows}
+        self.assertEqual(json.loads(by_start[now - 3600]["outage_json"]),
+                         {"d": [40.0, 80.0], "ongoing_end": False})
+        self.assertIsNone(by_start[now - 7200]["outage_json"])
+
+    def test_aggregator_exact_reconstruction_path(self):
+        """With raw 0/1 range samples available, hourly buckets are built by
+        reconstruct_time_series_intervals(): uptime+downtime == coverage
+        exactly, downtime reflects the real outage (not an avg_over_time
+        smear), incidents come from edges, outage_json is populated, and no
+        bucket is written for an hour that has not started."""
+        now = time.time()
+        hour = math.floor(now / 3600.0) * 3600.0
+        if now - hour < 120:              # need a meaningful slice of the ongoing hour
+            hour -= 3600.0
+        prev_h = hour - 3600.0
+
+        # seed one older bucket so the aggregator takes the steady-state path
+        # (last hour + ongoing hour) rather than a 7-day backfill
+        AvailabilityBucketRepository.save_buckets([{
+            "instance": "srv-exact", "job": "blackbox",
+            "bucket_start": prev_h - 3600.0, "bucket_end": prev_h,
+            "uptime_seconds": 3600.0, "downtime_seconds": 0.0, "unknown_seconds": 0.0,
+            "coverage_seconds": 3600.0, "sample_count": 240, "availability_pct": 100.0,
+            "incident_count": 0, "avg_latency_ms": 10.0, "updated_at": now,
+        }], db_path=self.db_path)
+
+        # prev hour: up, except one ~120s outage; current hour: up so far
+        samples = []
+        for t in range(int(prev_h), int(now), 15):
+            down = (prev_h + 1000.0) <= t < (prev_h + 1120.0)
+            samples.append((float(t), 0 if down else 1))
+
+        def range_map(expr, s, e, step, cache_ttl=5.0, timeout=None):
+            if expr != "probe_success":
+                return {}
+            return {"srv-exact": [(ts, v) for ts, v in samples if s <= ts <= e]}
+
+        with patch.object(alarm_app, 'get_instance_job_map', return_value={"srv-exact": "blackbox"}), \
+             patch.object(alarm_app, 'fetch_prom_range_map', side_effect=range_map), \
+             patch.object(alarm_app, 'fetch_prom_query_map', side_effect=lambda *a, **k: {}), \
+             patch.object(alarm_app.AggregationLeaseRepository, 'acquire_or_renew', return_value=True):
+            alarm_app._aggregate_availability_cycle()
+
+        rows = AvailabilityBucketRepository.get_bucket_records(
+            "blackbox", prev_h - 10, now + 10, instances=["srv-exact"], db_path=self.db_path)
+        by_start = {r["bucket_start"]: r for r in rows}
+
+        self.assertIn(prev_h, by_start)
+        pr = by_start[prev_h]
+        self.assertAlmostEqual(pr["uptime_seconds"] + pr["downtime_seconds"], pr["coverage_seconds"], delta=0.1)
+        self.assertGreater(pr["downtime_seconds"], 60.0)     # the real ~120s outage
+        self.assertLess(pr["downtime_seconds"], 220.0)
+        self.assertGreaterEqual(pr["incident_count"], 1)
+        oj = json.loads(pr["outage_json"])
+        self.assertIn("d", oj)
+        self.assertIn("ongoing_end", oj)
+
+        self.assertIn(hour, by_start)
+        cur = by_start[hour]
+        self.assertLessEqual(cur["coverage_seconds"], (now - hour) + 30.0)   # no future time
+        self.assertAlmostEqual(cur["uptime_seconds"] + cur["downtime_seconds"], cur["coverage_seconds"], delta=0.1)
+
+        self.assertNotIn(hour + 3600.0, by_start)   # next hour has not started
 
 
 if __name__ == '__main__':

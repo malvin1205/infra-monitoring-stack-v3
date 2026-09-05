@@ -17,6 +17,7 @@ __pycache__/
 .DS_Store
 Thumbs.db
 *.log
+infrawatch-ui-concept-reference*.png
 
 # Environment files
 .env
@@ -37,6 +38,8 @@ env/
 # Secrets and local configurations
 alarm/telegram_config.json
 !alarm/telegram_config.json.example
+alarm/availability_settings.json
+!alarm/availability_settings.json.example
 alarm/.api_key
 alarm/.webhook_secret
 alarm/.session_secret

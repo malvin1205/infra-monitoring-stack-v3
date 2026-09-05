@@ -371,6 +371,45 @@ class CanonicalMonitoringStateTests(unittest.TestCase):
             self.assertFalse(target['is_alarmable'])
 
 
+    def test_outage_grace_debounces_transient_down(self):
+        """A target down for less than OUTAGE_GRACE_SECONDS is rendered as down
+        but does NOT drive CRITICAL / has_alarm / is_alarmable. Once it's been
+        down past the grace window, it becomes a confirmed alarmable outage."""
+        raw_targets = {
+            "status": "success",
+            "data": {"activeTargets": [
+                {"labels": {"instance": "blip-1", "job": "blackbox"}, "health": "down", "scrapeUrl": "blip-1"}
+            ]},
+        }
+        common = [
+            patch.object(alarm_app, 'fetch_prometheus_json', return_value=(raw_targets, 'http://prom:9090')),
+            patch.object(alarm_app, 'fetch_all_probe_metrics', return_value=({"blip-1": "0"}, {"blip-1": "0.05"}, {"blip-1": "0"})),
+            patch.object(alarm_app, 'load_website_targets', return_value=[]),
+        ]
+
+        # Down for 5s — inside the 15s grace window.
+        with patch.object(alarm_app, 'fetch_down_since_prom_map', return_value={"blip-1": time.time() - 5}), \
+             common[0], common[1], common[2]:
+            data = json.loads(self.client.get('/instances').data)
+            self.assertEqual(data['system_status'], 'NORMAL')
+            self.assertFalse(data['summary']['has_alarm'])
+            self.assertEqual(data['summary']['alarmable_down'], 0)
+            t = data['targets'][0]
+            self.assertEqual(t['health'], 'down')
+            self.assertTrue(t['pending_outage'])
+            self.assertFalse(t['is_alarmable'])
+
+        # Down for 30s — past the grace window.
+        with patch.object(alarm_app, 'fetch_down_since_prom_map', return_value={"blip-1": time.time() - 30}), \
+             common[0], common[1], common[2]:
+            data = json.loads(self.client.get('/instances').data)
+            self.assertEqual(data['system_status'], 'CRITICAL')
+            self.assertTrue(data['summary']['has_alarm'])
+            self.assertEqual(data['summary']['alarmable_down'], 1)
+            t = data['targets'][0]
+            self.assertFalse(t['pending_outage'])
+            self.assertTrue(t['is_alarmable'])
+
     def test_job_filtered_poll_does_not_clear_other_jobs_acks(self):
         """A job-scoped poll (?job=X) must not wipe acks for down instances in
         other jobs -- clear_resolved only has visibility into the job-filtered

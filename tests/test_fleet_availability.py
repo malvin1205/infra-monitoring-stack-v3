@@ -403,6 +403,83 @@ class FleetAvailabilityTests(unittest.TestCase):
         self.assertAlmostEqual(100.0, res["coverage_percent"] + res["unknown_percent"], places=1)
         self.assertIsNotNone(res["availability_pct"])
 
+    def test_target_telemetry_audit_diagnostics(self):
+        """Test that target availability returns rich telemetry audit and diagnostics."""
+        from fleet_availability import merge_hybrid_target_availability
+        req_start = 1000000.0
+        req_end = req_start + 7200.0  # 2 hours window
+
+        # Target with 30 minutes of observed data in a 2-hour window -> 25% coverage (Limited Data)
+        prom_metrics = {
+            "first_ts": req_end - 1800.0,
+            "last_ts": req_end,
+            "count": 30,
+            "avail": 100.0,
+            "incidents": 0,
+            "duration": 0.05,
+        }
+        entry = merge_hybrid_target_availability(
+            req_start=req_start,
+            req_end=req_end,
+            target_id="host-limited",
+            target_name="host-limited",
+            job="blackbox",
+            sqlite_buckets=[],
+            prom_metrics=prom_metrics,
+            expected_interval_sec=60.0,
+        )
+
+        self.assertTrue(entry["is_limited_data"])
+        self.assertIn("telemetry_audit", entry)
+        audit = entry["telemetry_audit"]
+
+        # Audit invariants
+        self.assertEqual(audit["requested_window_seconds"], 7200.0)
+        self.assertAlmostEqual(audit["observed_seconds"] + audit["missing_seconds"], 7200.0, places=1)
+        self.assertAlmostEqual(audit["coverage_percent"] + audit["missing_percent"], 100.0, places=1)
+        self.assertEqual(audit["confidence_level"], "LOW")
+        self.assertFalse(audit["sla_eligible"])
+        self.assertIn("root_cause_code", audit)
+        self.assertIn("root_cause_hint", audit)
+        self.assertIn("recommendation", audit)
+        self.assertEqual(audit["storage"]["source"], "fallback")
+
+    def test_fleet_telemetry_audit_diagnostics(self):
+        """Test fleet availability aggregate metadata includes fleet-wide telemetry audit."""
+        from fleet_availability import merge_hybrid_fleet_availability
+        req_start = 1000000.0
+        req_end = req_start + 3600.0
+
+        instances = ["srv-1", "srv-2"]
+        prom_results = {
+            "first_ts": {"srv-1": req_start, "srv-2": req_end - 600.0},
+            "last_ts": {"srv-1": req_end, "srv-2": req_end},
+            "count": {"srv-1": 60, "srv-2": 10},
+            "avail": {"srv-1": 100.0, "srv-2": 100.0},
+            "incidents": {"srv-1": 0, "srv-2": 0},
+            "duration": {"srv-1": 0.02, "srv-2": 0.02},
+        }
+
+        entries, summary = merge_hybrid_fleet_availability(
+            req_start=req_start,
+            req_end=req_end,
+            monitored_instances=instances,
+            sqlite_buckets=[],
+            prom_results_map=prom_results,
+            expected_interval_sec=60.0,
+        )
+
+        self.assertEqual(len(entries), 2)
+        self.assertIn("telemetry_audit", summary)
+        fleet_audit = summary["telemetry_audit"]
+
+        self.assertEqual(fleet_audit["counts"]["total_hosts"], 2)
+        self.assertEqual(fleet_audit["counts"]["limited_hosts"], 1)  # srv-2 has only 10m in 60m
+        self.assertIn("recommendation", fleet_audit)
+        self.assertIn("root_cause_hint", fleet_audit)
+        self.assertEqual(summary["hybrid"]["telemetry_audit"], fleet_audit)
+
 
 if __name__ == "__main__":
     unittest.main()
+

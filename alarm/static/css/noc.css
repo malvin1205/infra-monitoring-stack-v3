@@ -908,6 +908,9 @@ html, body {
   position: relative;
 }
 
+/* Dropbar z-index scale (3 tiers, shared by every popover/menu in the app):
+   60 = inline toolbar popover, 100 = dropdown menu, 1000 = fixed-header
+   dropdown (must clear page content scrolled beneath it). */
 .custom-range-popover {
   position: absolute;
   top: calc(100% + 8px);
@@ -922,6 +925,7 @@ html, body {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  animation: sortDropdownIn 0.15s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 
 .custom-range-popover.hidden {
@@ -1045,7 +1049,7 @@ html, body {
   position: absolute;
   top: calc(100% + 6px);
   left: 0;
-  z-index: 70;
+  z-index: 100;
   min-width: 190px;
   max-height: 260px;
   overflow-y: auto;
@@ -1056,6 +1060,7 @@ html, body {
   border: 1px solid var(--border-strong);
   border-radius: var(--r-sm);
   box-shadow: var(--shadow-lg);
+  animation: sortDropdownIn 0.15s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 
 .job-dd-menu.hidden {
@@ -1113,22 +1118,17 @@ html, body {
   position: absolute;
   top: calc(100% + 8px);
   right: 0;
-  z-index: 70;
+  z-index: 60;
   width: 230px;
-  background: rgba(20, 22, 28, 0.72);
-  backdrop-filter: blur(14px) saturate(140%);
-  -webkit-backdrop-filter: blur(14px) saturate(140%);
+  background: var(--surface);
   border: 1px solid var(--border-strong);
   border-radius: var(--r-md);
   box-shadow: var(--shadow-lg);
-  padding: 12px 14px 14px;
+  padding: 14px;
   display: flex;
   flex-direction: column;
   gap: 10px;
-}
-
-[data-theme="light"] .job-default-popover {
-  background: rgba(255, 255, 255, 0.78);
+  animation: sortDropdownIn 0.15s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 
 .job-default-popover.hidden {
@@ -1552,6 +1552,15 @@ html, body {
   display: none;
 }
 
+.form-success {
+  font-size: 12px;
+  color: var(--success);
+}
+
+.form-success.hidden {
+  display: none;
+}
+
 .modal-actions {
   display: flex;
   align-items: center;
@@ -1590,6 +1599,67 @@ html, body {
 .btn-sm {
   padding: 6px 12px;
   font-size: 12px;
+}
+
+.btn-danger {
+  background: var(--critical);
+  color: #ffffff;
+}
+
+.btn-danger:hover {
+  background: #dc2626;
+}
+
+.btn-block {
+  width: 100%;
+}
+
+/* Modal size modifiers — every dialog picks one of these instead of an
+   inline max-width, so "how wide is this class of dialog" stays in one
+   place. Default (.modal-card alone) is 440px. */
+.modal-card-narrow {
+  max-width: 380px;
+}
+
+.modal-card-danger {
+  max-width: 420px;
+  border-color: var(--critical-border, rgba(239, 68, 68, 0.3));
+}
+
+.modal-card-xl {
+  max-width: 600px;
+}
+
+/* Icon + title header, used by dialogs that lead with a status icon
+   (confirm/setup/login). One row layout, one badge, one title size —
+   .modal-title inside keeps its normal 15px/600 regardless of context. */
+.modal-title-group {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.modal-icon-badge {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  background: rgba(56, 189, 248, 0.15);
+  color: var(--accent);
+}
+
+.modal-icon-badge-danger {
+  background: rgba(239, 68, 68, 0.15);
+  color: var(--critical);
+}
+
+.modal-subtitle {
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-top: 2px;
 }
 
 /* ── Availability Breakdown Modal ─────────────────────── */
@@ -1809,7 +1879,6 @@ html, body {
   justify-content: space-between;
   flex: 1;
   min-width: 0;
-  padding-right: 10px;
 }
 
 .avail-hero-header {
@@ -1864,13 +1933,58 @@ html, body {
 .avail-hero-data-warning {
   font-size: 10.5px;
   font-weight: 600;
-  color: var(--warning);
+  color: #fde68a;
   background: var(--warning-bg);
   border: 1px solid var(--warning-border);
-  border-radius: 4px;
-  padding: 3px 6px;
-  margin: -2px 0 8px 0;
-  width: fit-content;
+  border-radius: 6px;
+  padding: 6px 10px;
+  margin: 0 0 10px 0;
+  width: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  column-gap: 6px;
+  row-gap: 3px;
+  line-height: 1.4;
+  text-align: left;
+  text-decoration: none;
+}
+
+.avail-hero-data-warning[hidden] {
+  display: none !important;
+}
+
+.avail-hero-data-warning .ahw-icon {
+  flex-shrink: 0;
+  align-self: center;
+}
+
+.avail-hero-data-warning .ahw-text {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.avail-hero-data-warning.is-clickable {
+  cursor: pointer;
+  background: rgba(245, 158, 11, 0.14);
+  border-color: rgba(245, 158, 11, 0.35);
+  transition: background 0.2s ease, border-color 0.2s ease;
+}
+
+.avail-hero-data-warning.is-clickable:hover {
+  background: rgba(245, 158, 11, 0.22);
+  border-color: rgba(245, 158, 11, 0.55);
+}
+
+.avail-hero-data-warning .ahw-action {
+  flex: 0 0 100%;
+  margin: 1px 0 0 20px;
+  font-size: 9.5px;
+  font-weight: 700;
+  color: #fde68a;
+  text-decoration: underline;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
 }
 
 .avail-split-bar-wrap {
@@ -1939,86 +2053,6 @@ html, body {
   font-weight: 700;
   color: #38bdf8;
   font-variant-numeric: tabular-nums;
-}
-
-.avail-hero-graphic {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 54px;
-  height: 54px;
-  position: relative;
-  flex-shrink: 0;
-  align-self: center;
-}
-
-.avail-gauge-ring {
-  width: 100%;
-  height: 100%;
-  transform: rotate(-90deg);
-}
-
-.gauge-bg {
-  fill: none;
-  stroke: rgba(255, 255, 255, 0.08);
-  stroke-width: 6;
-}
-
-.gauge-fill {
-  fill: none;
-  stroke: #22c55e;
-  stroke-width: 6;
-  stroke-linecap: round;
-  transition: stroke-dashoffset 0.6s ease;
-}
-
-.avail-gauge-icon-wrap {
-  position: absolute;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: #34d399;
-  width: 26px;
-  height: 26px;
-}
-
-.server-rack-svg {
-  width: 17px;
-  height: 17px;
-  color: #34d399;
-}
-
-.gauge-check-badge {
-  position: absolute;
-  right: -2px;
-  bottom: -2px;
-  width: 11px;
-  height: 11px;
-  border-radius: 50%;
-  background: #22c55e;
-  color: #080c14;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  box-shadow: 0 0 4px rgba(34, 197, 94, 0.4);
-}
-
-.avail-shield-container {
-  width: 50px;
-  height: 50px;
-  border-radius: 50%;
-  background: radial-gradient(circle, rgba(56, 189, 248, 0.22) 0%, rgba(56, 189, 248, 0.04) 70%, transparent 100%);
-  border: 1px solid rgba(56, 189, 248, 0.25);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  box-shadow: 0 0 16px rgba(56, 189, 248, 0.12);
-}
-
-.avail-shield-svg {
-  width: 22px;
-  height: 22px;
-  color: #38bdf8;
 }
 
 /* ── Section: Hosts Requiring Attention ─────────────────── */
@@ -2126,9 +2160,7 @@ html, body {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  z-index: 500;
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
+  z-index: 100;
   animation: sortDropdownIn 0.15s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 
@@ -2136,6 +2168,9 @@ html, body {
   display: none !important;
 }
 
+/* Shared entrance for every popover/dropdown-menu (not just the sort menu
+   whose name it kept): custom-range-popover, job-default-popover,
+   job-dd-menu, avail-sort-menu, user-dropdown all use it. */
 @keyframes sortDropdownIn {
   from {
     opacity: 0;
@@ -3303,7 +3338,6 @@ html, body {
   pointer-events: none;
   transform: translate(-50%, -100%);
   background: var(--bg-card);
-  backdrop-filter: blur(10px);
   border: 1px solid var(--border-strong);
   border-radius: var(--r-sm);
   padding: 6px 10px;
@@ -3694,19 +3728,21 @@ html, body {
 
   /* Alert Logs / Incident History / Maintenance Manager modal */
   .log-entry,
-  .history-row,
+  .history-row-full,
   .maint-row {
-    height: 60px;
+    min-height: 60px;
     font-size: 14px;
   }
 
-  .hrd-point-time,
   .maint-target {
     font-size: 15px;
   }
 
-  .hrd-duration-value {
-    font-size: 18px;
+  .history-firstseen,
+  .history-lastseen,
+  .history-downtime,
+  .history-status {
+    font-size: 13px;
   }
 
   .hist-stat-value {
@@ -3996,7 +4032,7 @@ html, body {
   max-height: 90vh;
   display: flex;
   flex-direction: column;
-  border-radius: 10px;
+  border-radius: var(--r-lg);
 }
 
 .logs-modal-card .modal-header {
@@ -4174,14 +4210,29 @@ html, body {
   letter-spacing: 0.04em;
 }
 
-.data-table-head.log-grid,
-.log-entry {
-  grid-template-columns: 84px 92px minmax(120px, 1fr) minmax(120px, 1fr) 84px 72px minmax(160px, 2fr);
+.data-table-head.hist-grid,
+.history-row-full {
+  grid-template-columns: 1fr 92px 82px 100px 100px 100px 90px;
 }
 
-.data-table-head.hist-grid,
-.history-row {
-  grid-template-columns: 84px 104px minmax(120px, 1fr) minmax(120px, 1fr) 84px 72px minmax(160px, 2fr);
+/* Toolbar/meta-row selects reuse .avail-range-select's look (Availability
+   Breakdown's date-range dropdown) without its icon-reserved left padding —
+   no new dropdown component, just the same chrome without the icon gutter. */
+.logs-toolbar #historySortSelect,
+.history-meta-filters .avail-range-select {
+  padding-left: 10px;
+  height: 28px;
+}
+
+.history-meta-row {
+  flex-wrap: wrap;
+  row-gap: 6px;
+}
+
+.history-meta-filters {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .data-table-head.maint-grid,
@@ -4189,7 +4240,7 @@ html, body {
   grid-template-columns: 1fr 1.4fr 140px 90px;
 }
 
-/* List body — thin custom scrollbar, dense flat rows (no per-row card/border) */
+/* List body — thin custom scrollbar */
 .log-stream,
 .history-full-table {
   flex: 1;
@@ -4197,8 +4248,21 @@ html, body {
   overflow-y: auto;
   display: flex;
   flex-direction: column;
+  padding: 10px;
   scrollbar-width: thin;
   scrollbar-color: var(--border-strong) transparent;
+}
+
+/* One wrapper per row (header + its expanded detail, when open) so spacing
+   sits between whole entries, not between a header and its own detail. */
+.al-entry,
+.history-entry {
+  margin-bottom: 7px;
+}
+
+.al-entry:last-child,
+.history-entry:last-child {
+  margin-bottom: 0;
 }
 
 .log-stream::-webkit-scrollbar,
@@ -4222,8 +4286,9 @@ html, body {
   background: var(--text-muted);
 }
 
-.log-entry,
-.history-row,
+/* Maintenance rows keep the original dense grid-table look (out of scope
+   for the Concept A revamp below — split out of the old shared
+   .log-entry/.history-row/.maint-row rule so the two can diverge). */
 .maint-row {
   display: grid;
   gap: 12px;
@@ -4237,220 +4302,429 @@ html, body {
   transition: background var(--t-fast);
 }
 
-.log-entry:nth-child(even) {
-  background: var(--bg-elevated);
-}
-
-.history-row.history-row-alt {
-  background: var(--bg-elevated);
-}
-
-.history-row-full {
-  cursor: pointer;
-}
-
-.log-entry:hover,
-.history-row-full:hover,
 .maint-row:hover {
   background: var(--surface-hover);
 }
 
-.log-time,
-.history-time {
-  color: var(--text-secondary);
-  font-size: 12.5px;
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
+/* ── Live Alert Log — Concept A (grouped flapping timeline) ─────────────
+   One shared "meta bar" strip replaces the old fixed 7-column table head:
+   the row shape now varies (single / grouped / firing / resolved), so a
+   rigid column grid stopped making sense. Loud red is reserved for what's
+   FIRING right now; resolved rows go quiet; a host that fired 2+ times in
+   the grouping window collapses into one expandable group row. */
+.al-meta-bar {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  padding: 2px 6px 8px;
+  flex-shrink: 0;
 }
 
-.log-name,
-.history-name {
+.al-meta-count {
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+  letter-spacing: 0.04em;
+  font-weight: 500;
+}
+
+.al-meta-count strong {
+  color: var(--text-secondary);
   font-weight: 600;
+}
+
+.al-legend {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  font-size: 10.5px;
+  color: var(--text-muted);
+}
+
+.al-legend-item {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.al-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 12px 15px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--border);
+  outline: none;
+  cursor: default;
+}
+
+.al-row-firing {
+  background: linear-gradient(135deg, var(--critical-bg), transparent 70%);
+  border-color: var(--critical-border);
+}
+
+/* A flap group is a caution signal (this host is unstable) even once it's
+   quiet — amber, not the navigational accent blue. If any occurrence in the
+   group is still firing right now, that outranks "unstable": full critical
+   red, same as a plain firing row. */
+.al-row-group {
+  background: linear-gradient(135deg, var(--warning-bg), transparent 70%);
+  border-color: var(--warning-border);
+  cursor: pointer;
+}
+
+.al-row-group-active {
+  background: linear-gradient(135deg, var(--critical-bg), transparent 70%);
+  border-color: var(--critical-border);
+}
+
+.al-row-resolved {
+  opacity: 0.82;
+}
+
+.al-row-group:focus-visible,
+.al-row-resolved:focus-visible {
+  cursor: pointer;
+}
+
+.al-row[tabindex]:focus-visible {
+  outline: 4px solid #FFFFFF;
+  outline-offset: -2px;
+  box-shadow: 0 0 0 8px rgba(56, 189, 248, 0.6), 0 0 25px rgba(255, 255, 255, 0.8);
+}
+
+.al-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  box-sizing: border-box;
+}
+
+.al-dot-firing {
+  background: var(--critical);
+  box-shadow: 0 0 0 5px rgba(239, 68, 68, 0.16);
+}
+
+/* Live Alert Log: green = back to healthy (matches the rest of the app's
+   "up" color). Incident History uses its own .history-dot-resolved instead
+   — a retrospective report keeps the original severity color, a live feed
+   just wants "is it OK now". */
+.al-dot-resolved {
+  border: 1.5px solid var(--success);
+}
+
+.al-expand-icon {
+  flex-shrink: 0;
+  color: #F59E0B;
+  transition: transform var(--t-fast);
+}
+
+.al-row-group-active .al-expand-icon {
+  color: var(--critical);
+}
+
+.al-row-group[aria-expanded="true"] .al-expand-icon {
+  transform: rotate(90deg);
+}
+
+.al-chip {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 150px;
+}
+
+.al-host {
+  font-family: var(--font-mono);
+  font-size: 13.5px;
+  font-weight: 700;
   color: var(--text-primary);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.log-inst,
-.history-instance {
+.al-row-resolved .al-host {
+  font-weight: 600;
   color: var(--text-secondary);
+}
+
+.al-sub {
+  font-size: 10.5px;
+  color: var(--text-muted);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.log-job {
-  display: inline-block;
-  margin-left: 4px;
-  padding: 1px 6px;
-  border-radius: 999px;
-  background: var(--surface-hover);
-  color: var(--text-muted);
+.al-badge {
   font-size: 10.5px;
-  font-weight: 500;
-  vertical-align: middle;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  padding: 4px 10px;
+  border-radius: 6px;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
-.log-col-status,
-.history-col-status {
+.al-badge-firing {
+  color: var(--critical);
+  background: rgba(239, 68, 68, 0.16);
+}
+
+.al-badge-resolved {
+  color: var(--success);
+  background: transparent;
+}
+
+.al-badge-group {
+  color: #F59E0B;
+  background: var(--warning-bg);
+}
+
+.al-badge-group-active {
+  color: var(--critical);
+  background: rgba(239, 68, 68, 0.16);
+}
+
+.al-fill {
+  font-size: 12px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.al-duration {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  color: var(--text-primary);
+  margin-left: auto;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+
+.al-row-resolved .al-duration {
+  color: var(--text-muted);
+}
+
+.al-time {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-muted);
+  width: 66px;
+  text-align: right;
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Expanded contents of a flap group — the individual firing/resolved
+   events that were collapsed into the group row above it. */
+.al-group-body {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 2px 15px 12px 41px;
+}
+
+.al-group-event {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 10px;
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+.al-group-event-firing {
+  color: var(--critical);
+}
+
+/* ── Incident History — same grouping applied retrospectively ─────────── */
+.history-row-full {
+  display: grid;
+  gap: 12px;
+  align-items: center;
+  padding: 12px 16px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--border);
+  background: transparent;
+  cursor: pointer;
+  outline: none;
+}
+
+.history-row-full:hover {
+  background: var(--surface-hover);
+}
+
+.history-row-full:focus-visible {
+  outline: 4px solid #FFFFFF;
+  outline-offset: -2px;
+  box-shadow: 0 0 0 8px rgba(56, 189, 248, 0.6), 0 0 25px rgba(255, 255, 255, 0.8);
+}
+
+/* Loud red is reserved for a row that's firing RIGHT NOW — a resolved
+   incident, however many times it flapped historically, is a retrospective
+   fact, not an active problem, so it stays as quiet as any other resolved
+   row. Same rule as the Live Alert Log. */
+.history-row-active {
+  background: linear-gradient(135deg, var(--critical-bg), transparent 70%);
+  border-color: var(--critical-border);
+}
+
+.history-time {
+  color: var(--text-muted);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
 
-.status-dot {
-  width: 6px;
-  height: 6px;
+.history-chip {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  overflow: hidden;
+}
+
+.history-host {
+  font-family: var(--font-mono);
+  font-weight: 700;
+  font-size: 13.5px;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-row-full:not(.history-row-active) .history-host {
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.history-sub {
+  font-size: 10.5px;
+  color: var(--text-muted);
+  margin-top: 1px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Who acknowledged this incident (and when) — a distinct accent color from
+   .history-sub's muted gray so "someone's already on this" is scannable at
+   wallboard distance without reading the text. */
+.history-ack {
+  font-size: 10.5px;
+  color: var(--accent);
+  margin-top: 1px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-sev {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+/* Severity color is a property of the alert (critical=red, warning=amber),
+   independent of open/resolved — that distinction lives on the status dot
+   (red ring vs green ring) and the row background (.history-row-active),
+   not on the severity label. */
+.history-sev-critical { color: var(--critical); }
+.history-sev-warning { color: #F59E0B; }
+
+.history-occurrences {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+}
+
+.history-downtime {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--text-secondary);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.history-lastseen {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-muted);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.history-firstseen {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Status column — Ongoing (still down, no resolve event yet) vs Resolved.
+   Ongoing gets a pulsing ring on the dot, the same red used everywhere else
+   for "firing now" (.history-row-active), so it reads at wallboard distance
+   without needing to parse the text label. */
+.history-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+
+.history-status-ongoing { color: var(--critical); }
+.history-status-resolved { color: var(--text-muted); }
+
+.history-status-dot {
+  width: 7px;
+  height: 7px;
   border-radius: 50%;
   flex-shrink: 0;
 }
 
-.status-dot-firing { background: var(--critical); }
-.status-dot-resolved { background: var(--success); }
-
-.history-status,
-.log-event {
-  font-size: 12px;
-  text-transform: capitalize;
+.history-status-ongoing .history-status-dot {
+  background: var(--critical);
+  animation: historyOngoingPulse 1.6s ease-in-out infinite;
 }
 
-.history-status-resolved,
-.log-event-resolved {
-  color: var(--success, #22c55e);
-  font-weight: 600;
+.history-status-resolved .history-status-dot {
+  background: transparent;
+  border: 1.5px solid var(--text-muted);
 }
 
-.history-status-firing,
-.log-event-firing {
-  color: var(--critical);
-  font-weight: 600;
+@keyframes historyOngoingPulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.55); }
+  50%      { box-shadow: 0 0 0 5px rgba(239, 68, 68, 0); }
 }
 
-.history-sev,
-.log-sev {
-  display: inline-flex;
+@media (prefers-reduced-motion: reduce) {
+  .history-status-ongoing .history-status-dot { animation: none; }
+}
+
+.history-pager {
+  display: flex;
   align-items: center;
-  padding: 2px 9px;
-  border-radius: 999px;
-  background: var(--surface-hover);
-  color: var(--text-secondary);
-  font-size: 10.5px;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.03em;
+  justify-content: center;
+  gap: 10px;
+  padding: 10px;
+  flex-shrink: 0;
+  border-top: 1px solid var(--border-subtle);
 }
 
-.history-sev.critical,
-.log-sev-critical {
-  background: var(--critical-bg);
-  color: var(--critical);
-}
-
-.history-sev.warning,
-.log-sev-warning {
-  background: var(--warning-bg);
-  color: #F59E0B;
-}
-
-.log-meta,
-.history-col-duration {
-  color: var(--text-secondary);
-  font-size: 12.5px;
-  font-variant-numeric: tabular-nums;
-  text-align: right;
-  white-space: nowrap;
-}
-
-.log-msg,
-.history-col-msg {
-  color: var(--text-secondary);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-/* Recovery-sequence detail — expands under a clicked incident row */
-.history-row-detail {
-  padding: 14px 16px;
-  background: var(--bg-elevated);
-  border-bottom: 1px solid var(--border-subtle);
-  font-size: 12px;
-}
-
-.hrd-sequence {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 10px 14px;
-}
-
-.hrd-point {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-
-.hrd-point-label {
-  font-size: 10.5px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
+.history-pager-label {
+  font-size: 11px;
   color: var(--text-muted);
-}
-
-.hrd-point-time {
-  font-family: var(--font-mono);
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--text-primary);
-}
-
-.hrd-arrow {
-  color: var(--text-muted);
-  font-size: 16px;
-}
-
-.hrd-duration {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  margin-left: auto;
-  padding: 4px 12px;
-  background: var(--success-bg);
-  border: 1px solid var(--success-border);
-  border-radius: var(--r-sm);
-}
-
-.hrd-duration-open {
-  background: var(--warning-bg);
-  border-color: var(--warning-border);
-}
-
-.hrd-duration-label {
-  font-size: 10px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  color: var(--text-muted);
-}
-
-.hrd-duration-value {
-  font-family: var(--font-mono);
-  font-size: 15px;
-  font-weight: 800;
-  color: var(--text-primary);
   font-variant-numeric: tabular-nums;
 }
 
-.hrd-meta {
-  margin-top: 8px;
-  padding-top: 8px;
-  border-top: 1px solid var(--border);
-  font-size: 11.5px;
-  color: var(--text-muted);
-}
 
 /* ── Maintenance Manager ────────────────────────────────────────── */
 .maint-group-label {
@@ -4579,10 +4853,10 @@ html, body {
   background: var(--bg-card);
   border: 1px solid var(--border);
   border-radius: var(--r-md);
-  box-shadow: 0 10px 25px rgba(0, 0, 0, 0.5);
+  box-shadow: var(--shadow-lg);
   padding: 8px 0;
   z-index: 1000;
-  backdrop-filter: blur(12px);
+  animation: sortDropdownIn 0.15s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 
 .user-dropdown-header {
@@ -4653,5 +4927,483 @@ button:disabled.rbac-restricted {
   border-color: rgba(34, 197, 94, 0.4) !important;
   color: #22c55e !important;
 }
+
+/* ── Availability Sub-Navigation Bar ───────────────────────────────────────── */
+.avail-subnav-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px;
+  background: rgba(15, 23, 42, 0.6);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin-bottom: 16px;
+}
+
+.avail-subnav-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  user-select: none;
+}
+
+.avail-subnav-btn:hover {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.avail-subnav-btn.is-active {
+  color: #38bdf8;
+  background: rgba(56, 189, 248, 0.12);
+  border-color: rgba(56, 189, 248, 0.3);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.25);
+}
+
+.avail-subnav-icon {
+  flex-shrink: 0;
+}
+
+.avail-subnav-badge {
+  font-size: 8.5px;
+  font-weight: 800;
+  padding: 2px 6px;
+  border-radius: 10px;
+  background: rgba(245, 158, 11, 0.2);
+  color: #f59e0b;
+  border: 1px solid rgba(245, 158, 11, 0.4);
+  letter-spacing: 0.04em;
+}
+
+.avail-subnav-pane {
+  animation: availPaneFadeIn 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes availPaneFadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* ── Data Quality & Telemetry Audit Styles ─────────────────────────────────── */
+
+/* SLA headline + downtime error-budget cards */
+.audit-sla-row {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 12px;
+  margin-bottom: 14px;
+}
+@media (max-width: 620px) {
+  .audit-sla-row { grid-template-columns: 1fr; }
+}
+
+.audit-sla-card {
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--text-muted);
+  border-radius: 8px;
+  background: var(--surface-raised);
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.audit-sla-card.is-ok  { border-left-color: var(--success); }
+.audit-sla-card.is-mid { border-left-color: #f59e0b; }
+.audit-sla-card.is-bad { border-left-color: var(--critical); }
+
+.audit-sla-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.audit-sla-label {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+}
+.audit-sla-sub {
+  font-weight: 500;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--text-muted);
+  opacity: 0.75;
+}
+
+.audit-sla-badge,
+.audit-budget-state {
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+  padding: 2px 7px;
+  border-radius: 999px;
+  white-space: nowrap;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-secondary);
+}
+.audit-sla-badge.is-ok,  .audit-budget-state.is-ok  { background: rgba(34,197,94,0.16);  color: #22c55e; }
+.audit-sla-badge.is-mid, .audit-budget-state.is-mid { background: rgba(245,158,11,0.16); color: #f59e0b; }
+.audit-sla-badge.is-bad, .audit-budget-state.is-bad { background: rgba(239,68,68,0.16);  color: #ef4444; }
+
+.audit-sla-value {
+  font-size: 24px;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.1;
+  color: var(--text-primary);
+}
+
+.audit-sla-foot {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 10.5px;
+  color: var(--text-secondary);
+  margin-top: auto;
+}
+.audit-sla-maint {
+  color: #f59e0b;
+  font-weight: 600;
+}
+
+.audit-budget-bar {
+  height: 8px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+  margin: 4px 0;
+}
+.audit-budget-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: #22c55e;
+  transition: width 0.3s ease;
+}
+.audit-budget-fill.is-mid { background: #f59e0b; }
+.audit-budget-fill.is-bad { background: #ef4444; }
+
+/* One-line coverage status */
+.audit-status {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  column-gap: 8px;
+  row-gap: 2px;
+  padding: 9px 12px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--text-muted);
+  border-radius: 6px;
+  background: var(--surface-raised);
+  margin-bottom: 14px;
+}
+
+.audit-status.is-ok   { border-left-color: var(--success); }
+.audit-status.is-warn { border-left-color: #f59e0b; }
+.audit-status.is-bad  { border-left-color: var(--critical); }
+
+.audit-status-icon {
+  flex-shrink: 0;
+  align-self: center;
+  color: var(--text-muted);
+}
+.audit-status.is-ok   .audit-status-icon { color: var(--success); }
+.audit-status.is-warn .audit-status-icon { color: #f59e0b; }
+.audit-status.is-bad  .audit-status-icon { color: var(--critical); }
+
+.audit-status-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--text-primary);
+}
+
+.audit-status-src {
+  flex-shrink: 0;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.audit-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 12px;
+  margin-bottom: 14px;
+}
+.audit-grid.has-maint {
+  grid-template-columns: repeat(3, 1fr);
+}
+
+@media (max-width: 620px) {
+  .audit-grid,
+  .audit-grid.has-maint {
+    grid-template-columns: 1fr;
+  }
+}
+
+.audit-card {
+  background: var(--bg-card, #1e293b);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.audit-card-title {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  margin: 0 0 6px 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.audit-card-value {
+  font-size: 18px;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-primary);
+  margin: 0;
+  line-height: 1.25;
+}
+
+.text-observed { color: #38bdf8; }
+.text-missing  { color: #f59e0b; }
+.text-maint    { color: #a78bfa; }
+
+.audit-card-sub {
+  font-size: 10.5px;
+  color: var(--text-secondary);
+  line-height: 1.35;
+  margin: 3px 0 10px 0;
+}
+
+.audit-card-meter {
+  height: 4px;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 9999px;
+  overflow: hidden;
+  margin-top: auto;
+}
+
+.audit-card-fill {
+  height: 100%;
+  border-radius: 9999px;
+  transition: width 0.3s ease;
+}
+
+.fill-observed { background: #38bdf8; }
+.fill-missing  { background: #f59e0b; }
+.fill-maint    { background: #a78bfa; }
+
+/* Per-Host Coverage Table */
+.audit-table-card {
+  background: var(--bg-card, #1e293b);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 16px;
+}
+
+.audit-table-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.audit-table-title-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.audit-table-title {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  color: var(--text-secondary);
+}
+
+.audit-table-count {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-muted);
+}
+
+.audit-filters-wrap {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.audit-filter-chips {
+  display: flex;
+  gap: 4px;
+  background: rgba(0, 0, 0, 0.25);
+  padding: 2px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+}
+
+.audit-chip {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 4px 8px;
+  border-radius: 4px;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.audit-chip:hover {
+  color: var(--text-primary);
+}
+
+.audit-chip.is-active {
+  background: rgba(255, 255, 255, 0.12);
+  color: #fff;
+}
+
+.audit-search-input {
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-primary);
+  font-size: 11px;
+  padding: 5px 10px;
+  outline: none;
+  min-width: 150px;
+}
+
+.audit-search-input:focus {
+  border-color: #38bdf8;
+}
+
+.audit-table-responsive {
+  overflow-x: auto;
+}
+
+.audit-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+}
+
+.audit-table th {
+  text-align: left;
+  padding: 8px 10px;
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+.audit-table td {
+  padding: 9px 10px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+  vertical-align: middle;
+}
+
+.audit-table tr:hover {
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.audit-empty-row {
+  text-align: center;
+  padding: 24px !important;
+  color: var(--text-muted);
+}
+
+.audit-host-name {
+  font-weight: 700;
+  color: var(--text-primary);
+  display: block;
+}
+
+.audit-host-job {
+  font-size: 9.5px;
+  color: var(--text-muted);
+}
+
+.audit-cov-cell {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.audit-cov-pct {
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: #38bdf8;
+  min-width: 44px;
+}
+
+.audit-cov-pct.is-lim {
+  color: #f59e0b;
+}
+
+.audit-cov-bar-wrap {
+  flex: 1;
+  max-width: 140px;
+  height: 4px;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 9999px;
+  overflow: hidden;
+}
+
+.audit-cov-bar-fill {
+  height: 100%;
+  border-radius: 9999px;
+  background: #38bdf8;
+}
+
+.audit-cov-bar-fill.bar-limited {
+  background: #f59e0b;
+}
+
+.audit-table .ta-r { text-align: right; }
+.audit-table .mono { font-variant-numeric: tabular-nums; }
+.audit-table .text-dim { color: var(--text-muted); }
+.audit-table .text-missing { color: #f59e0b; }
+.audit-table .text-ok  { color: #22c55e; }
+.audit-table .text-mid { color: #f59e0b; }
+.audit-table .text-bad { color: #ef4444; }
+.audit-table .audit-tgt { color: var(--text-muted); font-weight: 400; }
+
+.audit-footer-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 14px;
+}
+
 
 

@@ -9,12 +9,48 @@ Menghitung metrik ketersediaan, coverage, dan SLA terverifikasi secara matematis
   5. health_ratio        — persentase target valid yang zero downtime (100% up)
   6. coverage_ratio      — persentase observasi data aktual terhadap requested window
   7. analytics           — total insiden, mean, median (P50), P95, dan max outage duration
+
+
+BUCKET & MERGE INVARIANTS (the contract every path here must preserve)
+─────────────────────────────────────────────────────────────────────
+An `availability_buckets` row, and every dict returned by clip_hourly_bucket()
+/ merge_hybrid_target_availability(), holds ACTUAL OBSERVED SECONDS — never a
+nominal or projected figure. For a completed hour the observed interval is the
+whole [bucket_start, bucket_end]; for the in-progress hour it is only
+[bucket_start, now]. A bucket is stored with a nominal hour end for schema
+convenience, so consumers must clip the *time interval* to `now` and must NOT
+re-scale the already-observed seconds a second time (see clip_hourly_bucket).
+
+For any bucket / clipped result / per-target entry over an effective interval
+of `dur` seconds ending no later than `now`:
+
+  I1  uptime_seconds + downtime_seconds == coverage_seconds        (± 0.05)
+  I2  coverage_seconds <= dur                                      (± 0.05)
+  I3  coverage_seconds <= elapsed  (bucket_end is clipped to now;  no future
+                                    time is ever observed or "unknown")
+  I4  unknown_seconds == dur - coverage_seconds                    (>= 0)
+  I5  availability_pct is None  iff  coverage_seconds == 0 ;
+      otherwise 0 <= availability_pct <= 100  and  == uptime/coverage*100
+  I6  coverage_percent + unknown_percent == 100                    (± 0.05)
+
+availability_pct (= uptime/coverage) and coverage_percent (= coverage/
+requested_window) use DIFFERENT denominators on purpose: the first is the SLA
+number, the second is how much of the window we actually observed. Unmonitored
+time is excluded from the SLA denominator, never counted as downtime.
+
+reconstruct_time_series_intervals() enforces the same I1-I6 from raw samples
+(its own "Mathematical Invariants Enforced" list) and is the exact reference
+for what the bucket path approximates.
 """
 
+import json
+import logging
 import math
 import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple, Union
+
+logger = logging.getLogger("infrawatch.availability")
 
 ServerRecord = Dict[str, Union[str, int, float, datetime]]
 
@@ -48,6 +84,163 @@ def get_min_sla_coverage_percent() -> float:
     return DEFAULT_MIN_SLA_COVERAGE_PERCENT
 
 
+def get_sla_target_pct() -> float:
+    """The SLA availability target a target/fleet is measured against.
+    Overridable via SLA_TARGET_PCT; /api/availability can also override it
+    per-request with ?sla_target=. Default = the compliance threshold (99.9)."""
+    val = os.environ.get("SLA_TARGET_PCT")
+    if val is not None:
+        try:
+            return max(0.0, min(100.0, float(val)))
+        except (TypeError, ValueError):
+            pass
+    return SLA_COMPLIANCE_THRESHOLD
+
+
+# ── Availability / SLA settings persistence ─────────────────────────────────
+# Same JSON-file + get/save pattern as telegram_notifier.get_telegram_config /
+# save_telegram_config -- the app's one existing "settings" mechanism, reused
+# here rather than inventing a second one.
+AVAILABILITY_SETTINGS_FILE = os.path.join(os.path.dirname(__file__), "availability_settings.json")
+
+
+def get_availability_settings() -> Dict[str, Any]:
+    """Load availability/SLA settings. Default (use_node_exporter_correlation
+    = False) preserves today's probe-only behavior exactly -- nothing below
+    reads this setting, callers must gate on it explicitly."""
+    settings: Dict[str, Any] = {"use_node_exporter_correlation": False}
+    if os.path.exists(AVAILABILITY_SETTINGS_FILE):
+        try:
+            with open(AVAILABILITY_SETTINGS_FILE, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+                if isinstance(saved, dict):
+                    settings.update(saved)
+        except Exception as e:
+            logger.warning("Failed to read %s: %s", AVAILABILITY_SETTINGS_FILE, e)
+    settings["use_node_exporter_correlation"] = bool(settings.get("use_node_exporter_correlation", False))
+    return settings
+
+
+def save_availability_settings(new_settings: Dict[str, Any]) -> bool:
+    """Persist availability/SLA settings to availability_settings.json."""
+    try:
+        current = get_availability_settings()
+        current.update(new_settings)
+        with open(AVAILABILITY_SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(current, f, indent=2)
+        return True
+    except Exception as e:
+        logger.error("Failed to save availability settings: %s", e)
+        return False
+
+
+# ── Node Exporter infrastructure correlation (classification only) ─────────
+# Deliberately NOT part of the availability/SLA math above: classify_probe_failure
+# is a pure function that only ever labels an ALREADY-DOWN probe result. It
+# never runs when OFF, never touches availability_pct / uptime_seconds /
+# downtime_seconds / coverage_seconds / weighting / SLA compliance, and never
+# turns a down probe into "up". Callers (the live target loop in app.py) are
+# responsible for finding node_exporter_found/node_exporter_healthy per
+# target (e.g. a Prometheus `up{job="node_exporter"}` reading matched by
+# host) -- this function has no I/O, so it's trivially unit-testable and
+# there is exactly one place ("here") that decides service vs. infrastructure.
+CORRELATION_SERVICE_ISSUE = "service_issue"
+CORRELATION_INFRA_ISSUE = "infrastructure_issue"
+CORRELATION_NO_NODE_EXPORTER = "no_node_exporter"
+
+
+def classify_probe_failure(
+    probe_is_down: bool,
+    node_exporter_found: bool,
+    node_exporter_healthy: Optional[bool],
+) -> Optional[Dict[str, str]]:
+    """Classify a DOWN probe as service-level vs. infrastructure-level using
+    Node Exporter as a secondary signal.
+
+    Returns None when the probe isn't down -- there's nothing to classify,
+    and a healthy probe's availability is never influenced by this function
+    either way. A target with no Node Exporter telemetry gets
+    CORRELATION_NO_NODE_EXPORTER, never CORRELATION_INFRA_ISSUE: missing
+    telemetry is evidence of nothing, and must not be read as an outage.
+    """
+    if not probe_is_down:
+        return None
+    if not node_exporter_found:
+        return {
+            "correlation": CORRELATION_NO_NODE_EXPORTER,
+            "detail": "No Node Exporter telemetry for this target — probe-based classification only.",
+        }
+    if node_exporter_healthy:
+        return {
+            "correlation": CORRELATION_SERVICE_ISSUE,
+            "detail": "Probe is down but Node Exporter reports the host healthy — likely a service/application issue.",
+        }
+    return {
+        "correlation": CORRELATION_INFRA_ISSUE,
+        "detail": "Probe is down and Node Exporter is also unavailable — likely an infrastructure/host issue.",
+    }
+
+
+def sla_budget(
+    observed_downtime_sec: float,
+    observed_seconds: float,
+    target_pct: Optional[float] = None,
+    window_seconds: Optional[float] = None,
+    project_days: int = 30,
+) -> Dict[str, Any]:
+    """SLA error-budget accounting for one target or the fleet.
+
+    `observed_*` should be the maintenance-EXCLUDED (SLA) figures.
+
+      window.*     — allowed vs used vs remaining downtime over the observed
+                     window (allowed = (1 - target/100) * window_seconds,
+                     i.e. the article's downtime table, computed).
+      projected.*  — the observed downtime RATE extrapolated to `project_days`
+                     vs that period's budget: the "are we going to breach"
+                     signal a 24h/7d window can't show on its own.
+    """
+    if target_pct is None:
+        target_pct = get_sla_target_pct()
+    target_pct = _clamp_pct(target_pct)
+    err_frac = max(0.0, 1.0 - target_pct / 100.0)
+
+    obs = max(0.0, float(observed_seconds or 0.0))
+    dt = max(0.0, float(observed_downtime_sec or 0.0))
+    win = float(window_seconds) if window_seconds and float(window_seconds) > 0 else obs
+
+    allowed_win = err_frac * win
+    remaining_win = allowed_win - dt
+    if allowed_win > 0:
+        used_pct = round(min(999.9, (dt / allowed_win) * 100.0), 1)
+    else:
+        used_pct = 0.0 if dt <= 0 else 999.9
+
+    period_sec = max(1, int(project_days)) * 86400.0
+    allowed_period = err_frac * period_sec
+    rate = (dt / obs) if obs > 0 else 0.0
+    projected_dt = rate * period_sec
+
+    return {
+        "target_pct": round(target_pct, 3),
+        "has_data": obs > 0,
+        "window": {
+            "seconds": round(win, 1),
+            "allowed_downtime_seconds": round(allowed_win, 1),
+            "observed_downtime_seconds": round(dt, 1),
+            "remaining_seconds": round(remaining_win, 1),
+            "used_percent": max(0.0, used_pct),
+            "breached": dt > allowed_win + 1e-6,
+        },
+        "projected": {
+            "days": int(project_days),
+            "allowed_downtime_seconds": round(allowed_period, 1),
+            "downtime_seconds": round(projected_dt, 1),
+            "remaining_seconds": round(allowed_period - projected_dt, 1),
+            "breach": projected_dt > allowed_period + 1e-6,
+        },
+    }
+
+
 def _parse_created_at(created_at: Union[str, int, float, datetime]) -> datetime:
     """Normalize created_at (epoch seconds, ISO 8601 string, atau datetime) ke aware UTC datetime."""
     if isinstance(created_at, datetime):
@@ -63,6 +256,25 @@ def _parse_created_at(created_at: Union[str, int, float, datetime]) -> datetime:
 
 def _clamp_pct(value: float) -> float:
     return max(0.0, min(100.0, float(value)))
+
+
+def _num(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _outage_flag(bucket: Dict[str, Any], key: str) -> bool:
+    """Read a boolean flag out of a bucket's outage_json (stored as a JSON
+    string by the aggregator, may be a dict in tests / absent on legacy rows)."""
+    oj = bucket.get("outage_json")
+    if isinstance(oj, str):
+        try:
+            oj = json.loads(oj)
+        except (ValueError, TypeError):
+            return False
+    return bool(oj.get(key)) if isinstance(oj, dict) else False
 
 
 def calculate_percentile(values: List[float], percentile: float) -> Optional[float]:
@@ -155,10 +367,35 @@ def estimate_instance_cadence(
     return None
 
 
-def clip_hourly_bucket(bucket: Dict[str, Any], clip_start: float, clip_end: float) -> Optional[Dict[str, Any]]:
+def clip_hourly_bucket(
+    bucket: Dict[str, Any],
+    clip_start: float,
+    clip_end: float,
+    now: Optional[float] = None,
+) -> Optional[Dict[str, Any]]:
     """
     Proportionally clips an hourly or aggregated SQLite bucket to [clip_start, clip_end].
     Enforces bucket invariants and rejects corrupted / non-chronological records.
+
+    `now` is the wall-clock upper bound (the effective "as of" time of the
+    request). An in-progress hour is stored with a *nominal* hour end
+    (e.g. bucket_start=13:00, bucket_end=14:00) but its uptime/downtime/
+    coverage were only ever accumulated over the elapsed part [13:00, now].
+    The proportional scaling below assumes those totals are spread across the
+    whole [b_start, b_end] span, so without clamping b_end to `now` first it
+    would scale an already-observed 1200s of coverage down a second time
+    (1200 * 1200/3600 = 400s), silently turning elapsed-and-observed time
+    into "unknown". Clamp the bucket's effective interval to `now`; for any
+    completed bucket (b_end <= now) this is a no-op.
+
+    Guarantees on the returned dict (None when the bucket is corrupt or does
+    not intersect [clip_start, min(clip_end, now)]) — see the module-level
+    "BUCKET & MERGE INVARIANTS":
+      uptime_seconds + downtime_seconds == coverage_seconds  (exact)
+      coverage_seconds <= duration_seconds == inter_end - inter_start
+      unknown_seconds  == duration_seconds - coverage_seconds  (>= 0)
+      inter_end <= min(clip_end, now)   (no future time)
+      availability_pct is None iff coverage_seconds == 0, else 0..100
     """
     try:
         b_start = float(bucket.get("bucket_start") if bucket.get("bucket_start") is not None else bucket.get("earliest_bucket_start", 0))
@@ -169,13 +406,17 @@ def clip_hourly_bucket(bucket: Dict[str, Any], clip_start: float, clip_end: floa
     if b_end <= b_start:
         return None
 
+    eff_end = b_end if now is None else min(b_end, float(now))
+    if eff_end <= b_start:
+        return None
+
     inter_start = max(b_start, clip_start)
-    inter_end = min(b_end, clip_end)
+    inter_end = min(eff_end, clip_end)
     inter_dur = max(0.0, inter_end - inter_start)
     if inter_dur <= 0.0:
         return None
 
-    b_dur = max(1.0, b_end - b_start)
+    b_dur = max(1.0, eff_end - b_start)
     ratio = min(1.0, max(0.0, inter_dur / b_dur))
 
     raw_up = max(0.0, float(bucket.get("total_uptime_sec", bucket.get("uptime_seconds", 0.0)) or 0.0))
@@ -214,6 +455,40 @@ def clip_hourly_bucket(bucket: Dict[str, Any], clip_start: float, clip_end: floa
     }
 
 
+def maintenance_overlap_seconds(
+    windows: Optional[List[Tuple[float, float]]],
+    req_start: float,
+    req_end: float,
+) -> float:
+    """Total seconds of [req_start, req_end] covered by the UNION of the given
+    maintenance windows (list of (start_ts, end_ts) already scoped to one
+    target). Overlapping windows are merged so time is never counted twice."""
+    if not windows or req_end <= req_start:
+        return 0.0
+    clipped: List[Tuple[float, float]] = []
+    for w in windows:
+        try:
+            s = max(float(req_start), float(w[0]))
+            e = min(float(req_end), float(w[1]))
+        except (TypeError, ValueError, IndexError):
+            continue
+        if e > s:
+            clipped.append((s, e))
+    if not clipped:
+        return 0.0
+    clipped.sort()
+    total = 0.0
+    cur_s, cur_e = clipped[0]
+    for s, e in clipped[1:]:
+        if s <= cur_e:
+            cur_e = max(cur_e, e)
+        else:
+            total += cur_e - cur_s
+            cur_s, cur_e = s, e
+    total += cur_e - cur_s
+    return total
+
+
 def merge_hybrid_target_availability(
     req_start: float,
     req_end: float,
@@ -226,10 +501,18 @@ def merge_hybrid_target_availability(
     gap_tolerance: float = DEFAULT_GAP_TOLERANCE,
     min_sla_coverage_pct: Optional[float] = None,
     sla_threshold: float = SLA_COMPLIANCE_THRESHOLD,
+    maintenance_windows: Optional[List[Tuple[float, float]]] = None,
 ) -> Dict[str, Any]:
     """
     Computes per-target hybrid availability by merging authoritative Prometheus telemetry
     with historical SQLite hourly buckets without overlap or double counting.
+
+    maintenance_windows: (start_ts, end_ts) pairs scoped to THIS target. The
+    observed fraction of that time is carved out of the SLA denominator
+    (attributed downtime-first): `availability_pct` stays the raw
+    maintenance-included number, while `availability_pct_excl_maintenance`
+    (and the SLA compliance status) exclude planned downtime. No windows ->
+    the two are identical and nothing changes.
     """
     if min_sla_coverage_pct is None:
         min_sla_coverage_pct = get_min_sla_coverage_percent()
@@ -306,7 +589,9 @@ def merge_hybrid_target_availability(
             span_sec = l_ts - f_ts
             cadence_est = span_sec / (s_count - 1)
             if cadence_est <= gap_tolerance * eff_cadence:
-                prom_cov_sec = min(span_sec + cadence_est, window_sec)
+                lead_in = min(cadence_est, max(0.0, f_ts - req_start)) if (f_ts - req_start) <= gap_tolerance * eff_cadence else 0.0
+                lead_out = min(cadence_est, max(0.0, req_end - l_ts)) if (req_end - l_ts) <= gap_tolerance * eff_cadence else 0.0
+                prom_cov_sec = min(span_sec + lead_in + lead_out, window_sec)
             else:
                 prom_cov_sec = min(float(s_count) * eff_cadence, window_sec)
         elif s_count is not None and s_count == 1:
@@ -393,6 +678,13 @@ def merge_hybrid_target_availability(
     sqlite_inc = 0
     sqlite_lat_weighted = 0.0
     overlap_removed_sec = 0.0
+    # Maintenance carve-out accumulators — the coverage inside a maintenance
+    # window (removed from the SLA denominator) and, of that, how much was
+    # downtime (the planned outage that shouldn't count against SLA). Done
+    # per clipped bucket interval, not window-globally, so a window over a
+    # HEALTHY hour excuses no downtime.
+    maint_cov_sec = 0.0
+    maint_down_sec = 0.0
 
     if sqlite_clip_end > sqlite_clip_start:
         for b in sqlite_buckets:
@@ -406,7 +698,7 @@ def merge_hybrid_target_availability(
             except (ValueError, TypeError):
                 pass
 
-            clipped = clip_hourly_bucket(b, sqlite_clip_start, sqlite_clip_end)
+            clipped = clip_hourly_bucket(b, sqlite_clip_start, sqlite_clip_end, now=req_end)
             if clipped:
                 sqlite_up_sec += clipped["uptime_seconds"]
                 sqlite_down_sec += clipped["downtime_seconds"]
@@ -414,8 +706,42 @@ def merge_hybrid_target_availability(
                 sqlite_samples += clipped["sample_count"]
                 sqlite_inc += clipped["incident_count"]
                 sqlite_lat_weighted += clipped["avg_latency_ms"] * clipped["coverage_seconds"]
+                if maintenance_windows:
+                    bm = maintenance_overlap_seconds(
+                        maintenance_windows, clipped["bucket_start"], clipped["bucket_end"])
+                    if bm > 0:
+                        maint_cov_sec += min(clipped["coverage_seconds"], bm)
+                        maint_down_sec += min(clipped["downtime_seconds"], bm)
 
     sqlite_lat = (sqlite_lat_weighted / sqlite_cov_sec) if sqlite_cov_sec > 0 else 0.0
+
+    # 2b. Cross-bucket incident de-dup. reconstruct_time_series_intervals runs
+    # per hour, so an outage straddling an hour boundary is counted once in
+    # each hour's bucket. Where a fully-contained bucket ends still in outage
+    # and the next contiguous bucket begins still in outage, that is one
+    # outage seen twice — drop the duplicate. Only fully-contained buckets
+    # (a partially clipped boundary bucket already carries an approximate
+    # incident count from clip_hourly_bucket). No signal -> no change.
+    if sqlite_inc > 1 and len(sqlite_buckets) > 1:
+        contained = sorted(
+            (b for b in sqlite_buckets
+             if _num(b.get("bucket_start")) >= sqlite_clip_start - 1.0
+             and _num(b.get("bucket_end")) <= sqlite_clip_end + 1.0),
+            key=lambda b: _num(b.get("bucket_start")),
+        )
+        for prev_b, cur_b in zip(contained, contained[1:]):
+            if abs(_num(cur_b.get("bucket_start")) - _num(prev_b.get("bucket_end"))) > 1.0:
+                continue  # not contiguous
+            if _outage_flag(prev_b, "ongoing_end") and _outage_flag(cur_b, "ongoing_start"):
+                sqlite_inc -= 1
+        sqlite_inc = max(0, sqlite_inc)
+
+    # Prometheus-attributed interval [p_start, p_end]: same coarse carve.
+    if maintenance_windows and prom_cov_sec > 0:
+        pm = maintenance_overlap_seconds(maintenance_windows, p_start, p_end)
+        if pm > 0:
+            maint_cov_sec += min(prom_cov_sec, pm)
+            maint_down_sec += min(prom_down_sec, pm)
 
     # 3. Merge non-overlapping intervals — prom_up_sec/prom_down_sec were
     # already computed in step 1 (identical formula there, plus a sane
@@ -426,7 +752,18 @@ def merge_hybrid_target_availability(
     # availability_pct forced to None.
     total_up_sec = round(sqlite_up_sec + prom_up_sec, 2)
     total_down_sec = round(sqlite_down_sec + prom_down_sec, 2)
-    total_cov_sec = round(max(0.0, min(window_sec, total_up_sec + total_down_sec if (prom_cov_sec > 0 or sqlite_cov_sec > 0) else prom_cov_sec)), 2)
+    raw_cov_sum = (total_up_sec + total_down_sec) if (prom_cov_sec > 0 or sqlite_cov_sec > 0) else prom_cov_sec
+    # The SQLite (exact per-hour) + non-overlapping Prometheus contributions
+    # must sum to <= the window. Exceeding it means a real accounting bug
+    # (bucket clip let future/overlapping time through, or the Prometheus
+    # seam double-counted) — the clamp below still keeps the number sane, but
+    # log it instead of silently masking, per issue #3 in the SLA audit.
+    if raw_cov_sum > window_sec + 1.0:
+        logger.warning(
+            "availability over-count for %s: sqlite=%.1fs prom=%.1fs sum=%.1fs > window=%.1fs (clamped)",
+            target_id, sqlite_cov_sec, prom_cov_sec, raw_cov_sum, window_sec,
+        )
+    total_cov_sec = round(max(0.0, min(window_sec, raw_cov_sum)), 2)
     total_unk_sec = round(max(0.0, window_sec - total_cov_sec), 2)
     total_samples = sqlite_samples + (s_count or 0)
     total_inc = sqlite_inc + prom_inc
@@ -441,6 +778,25 @@ def merge_hybrid_target_availability(
     cov_pct = round(_clamp_pct((total_cov_sec / window_sec) * 100.0), 2) if window_sec > 0 else 0.0
     unk_pct = round(_clamp_pct(100.0 - cov_pct), 2)
 
+    # 3b. Maintenance carve-out. `maint_cov_sec` (planned time removed from
+    # the SLA denominator) and `maint_down_sec` (planned downtime not counted
+    # against SLA) were accumulated per bucket / prom interval above, so a
+    # window over a healthy hour excuses coverage but no downtime. Exact
+    # per-outage intersection (sub-hour) is a later refinement; carving at
+    # the bucket-interval granularity is the honest coarse version.
+    # `availability_pct` above stays the raw number; SLA status uses `sla_avail`.
+    maint_excluded_sec = round(min(total_cov_sec, maint_cov_sec), 2)
+    maint_down_excused = round(min(total_down_sec, maint_down_sec, maint_excluded_sec), 2)
+    if maint_excluded_sec > 0:
+        sla_cov_sec = round(max(0.0, total_cov_sec - maint_excluded_sec), 2)
+        sla_down_sec = round(max(0.0, total_down_sec - maint_down_excused), 2)
+        sla_up_sec = round(max(0.0, sla_cov_sec - sla_down_sec), 2)
+        sla_avail = round(_clamp_pct((sla_up_sec / sla_cov_sec) * 100.0), 2) if sla_cov_sec > 0 else total_avail
+    else:
+        sla_up_sec, sla_down_sec, sla_cov_sec = total_up_sec, total_down_sec, total_cov_sec
+        sla_avail = total_avail
+    sla_avail_eff = sla_avail if sla_avail is not None else total_avail
+
     # 4. Source classification
     if sqlite_cov_sec > 0 and prom_cov_sec > 0:
         target_src = "hybrid"
@@ -451,26 +807,112 @@ def merge_hybrid_target_availability(
     else:
         target_src = "nodata"
 
-    # 5. SLA & Data Status
+    # 5. First & Last Seen Timestamps
+    first_seen_ts = None
+    last_seen_ts = None
+    all_starts = []
+    all_ends = []
+    if sqlite_buckets:
+        for b in sqlite_buckets:
+            try:
+                b_st = float(b.get("bucket_start", 0))
+                b_en = float(b.get("bucket_end", 0))
+                if b_st > 0: all_starts.append(b_st)
+                if b_en > 0: all_ends.append(b_en)
+            except (ValueError, TypeError):
+                pass
+    if f_ts > 0: all_starts.append(f_ts)
+    if l_ts > 0: all_ends.append(l_ts)
+    if all_starts: first_seen_ts = min(all_starts)
+    if all_ends: last_seen_ts = max(all_ends)
+
+    # 6. SLA, Diagnostics & Data Status
     if total_cov_sec <= 0 or total_avail is None:
         data_status = "NO_DATA"
         sla_status = "INSUFFICIENT_DATA"
         is_eligible = False
         sla_reason = "Zero observed telemetry in requested window"
+        root_cause_code = "NO_DATA"
+        root_cause_hint = "Belum ada sampel telemetri yang tercatat dalam jendela waktu yang dipilih."
+        recommendation = "Pastikan target aktif dan endpoint blackbox/exporter dapat di-scrape oleh Prometheus."
     else:
         is_eligible = (cov_pct >= min_sla_coverage_pct)
         if not is_eligible:
             data_status = "INSUFFICIENT_DATA"
             sla_status = "INSUFFICIENT_DATA"
             sla_reason = f"Insufficient coverage ({cov_pct}% < {min_sla_coverage_pct}%)"
+            if first_seen_ts and first_seen_ts > (req_start + 1800):
+                root_cause_code = "NEW_TARGET"
+                root_cause_hint = "Target baru aktif dipantau di tengah jendela waktu yang diminta (Late Discovery)."
+                recommendation = "Gunakan jendela waktu yang lebih pendek (misal 6h/24h) agar persentase ketersediaan mencerminkan periode aktif target."
+            elif sqlite_cov_sec <= 0 and prom_cov_sec > 0:
+                root_cause_code = "RETENTION_WINDOW"
+                root_cause_hint = "Telemetri hanya tersedia di buffer memori Prometheus, belum teragregasi penuh ke arsip SQLite."
+                recommendation = "Tunggu proses agregasi berkala atau perkecil jendela waktu sesuai retensi Prometheus aktif."
+            else:
+                root_cause_code = "SCRAPE_GAPS"
+                root_cause_hint = "Ditemukan jeda/kekosongan sampel telemetri pada target selama jendela waktu ini."
+                recommendation = "Periksa stabilitas koneksi jaringan target atau cek log blackbox exporter untuk outage scraping."
         else:
             data_status = "COMPLETE" if cov_pct >= 95.0 else "PARTIAL"
-            if total_avail >= sla_threshold:
+            if cov_pct < 95.0:
+                root_cause_code = "PARTIAL_COVERAGE"
+                root_cause_hint = "Cakupan telemetri memadai untuk analisis awal, namun terdapat jeda observasi minor."
+                recommendation = "Sebagian kecil data tidak teramati; nilai ketersediaan valid dengan tingkat keyakinan moderat."
+            else:
+                root_cause_code = "OPTIMAL"
+                root_cause_hint = "Cakupan telemetri optimal (≥95%) untuk evaluasi performa dan audit SLA."
+                recommendation = "Data telemetri lengkap dan representatif untuk audit SLA resmi."
+
+            _maint_note = f" (excl. {round(maint_excluded_sec / 60.0, 1)}m planned)" if maint_excluded_sec > 0 else ""
+            if sla_avail_eff >= sla_threshold:
                 sla_status = "COMPLIANT"
-                sla_reason = f"Availability ({total_avail}%) >= {sla_threshold}%"
+                sla_reason = f"Availability ({sla_avail_eff}%) >= {sla_threshold}%{_maint_note}"
             else:
                 sla_status = "NON_COMPLIANT"
-                sla_reason = f"Availability ({total_avail}%) < {sla_threshold}%"
+                sla_reason = f"Availability ({sla_avail_eff}%) < {sla_threshold}%{_maint_note}"
+
+    if cov_pct >= 95.0:
+        confidence_level = "HIGH"
+        confidence_score = 100
+        conf_badge = "conf-high"
+    elif cov_pct >= (min_sla_coverage_pct or DEFAULT_MIN_SLA_COVERAGE_PERCENT):
+        confidence_level = "MODERATE"
+        confidence_score = round(cov_pct)
+        conf_badge = "conf-mid"
+    else:
+        confidence_level = "LOW"
+        confidence_score = round(cov_pct)
+        conf_badge = "conf-low"
+
+    telemetry_audit = {
+        "requested_window_seconds": round(window_sec, 1),
+        "observed_seconds": round(total_cov_sec, 1),
+        "missing_seconds": round(total_unk_sec, 1),
+        "maintenance_excluded_seconds": maint_excluded_sec,
+        "coverage_percent": cov_pct,
+        "missing_percent": unk_pct,
+        "first_seen_ts": first_seen_ts,
+        "last_seen_ts": last_seen_ts,
+        "root_cause_code": root_cause_code,
+        "root_cause_hint": root_cause_hint,
+        "confidence_level": confidence_level,
+        "confidence_score": confidence_score,
+        "confidence_badge": conf_badge,
+        "sla_eligible": is_eligible,
+        "sla_status": sla_status,
+        "sla_reason": sla_reason,
+        "recommendation": recommendation,
+        "maintenance_excluded_seconds": maint_excluded_sec,
+        "availability_pct_excl_maintenance": sla_avail,
+        "storage": {
+            "source": target_src,
+            "sqlite_seconds": round(sqlite_cov_sec, 1),
+            "prometheus_seconds": round(prom_cov_sec, 1),
+            "overlap_removed_seconds": round(overlap_removed_sec, 1),
+            "sample_count": total_samples,
+        }
+    }
 
     return {
         "id": target_id,
@@ -487,6 +929,8 @@ def merge_hybrid_target_availability(
         "downtime_seconds": round(total_down_sec, 1),
         "unknown_minutes": round(total_unk_sec / 60.0, 2),
         "unknown_seconds": round(total_unk_sec, 1),
+        "missing_minutes": round(total_unk_sec / 60.0, 2),
+        "missing_seconds": round(total_unk_sec, 1),
         "sqlite_seconds": round(sqlite_cov_sec, 1),
         "prometheus_seconds": round(prom_cov_sec, 1),
         "overlap_removed_seconds": round(overlap_removed_sec, 1),
@@ -496,16 +940,36 @@ def merge_hybrid_target_availability(
         "unknown_percent": unk_pct,
         "is_limited_data": (cov_pct < min_sla_coverage_pct and total_cov_sec > 0),
         "is_no_data": (total_cov_sec <= 0 or total_avail is None),
+        "first_seen_ts": first_seen_ts,
+        "last_seen_ts": last_seen_ts,
+        "root_cause_code": root_cause_code,
+        "root_cause_hint": root_cause_hint,
+        "confidence_level": confidence_level,
+        "confidence_score": confidence_score,
+        "confidence_badge": conf_badge,
+        "recommendation": recommendation,
+        "telemetry_audit": telemetry_audit,
         "sla_eligible": is_eligible,
         "sla_compliant": (sla_status == "COMPLIANT"),
         "sla_status": sla_status,
         "sla_eligibility_reason": sla_reason,
+        "sla_target_pct": round(float(sla_threshold), 3),
         "data_status": data_status,
         "source": target_src,
         "incidents": total_inc,
         "incident_count": total_inc,
         "sample_count": total_samples,
         "avg_latency_ms": round(avg_lat, 1),
+        # SLA (maintenance-excluded) trio — summarize_entries prefers these
+        # for the fleet aggregate / compliance ratio; == raw when no windows.
+        "availability_pct_excl_maintenance": sla_avail,
+        "maintenance_excluded_seconds": maint_excluded_sec,
+        "maintenance_excluded_minutes": round(maint_excluded_sec / 60.0, 2),
+        "sla_uptime_seconds": round(sla_up_sec, 1),
+        "sla_downtime_seconds": round(sla_down_sec, 1),
+        "sla_downtime_minutes": round(sla_down_sec / 60.0, 2),
+        "sla_observed_seconds": round(sla_cov_sec, 1),
+        "sla_observed_minutes": round(sla_cov_sec / 60.0, 2),
     }
 
 
@@ -519,14 +983,23 @@ def merge_hybrid_fleet_availability(
     gap_tolerance: float = DEFAULT_GAP_TOLERANCE,
     min_sla_coverage_pct: Optional[float] = None,
     sla_threshold: float = SLA_COMPLIANCE_THRESHOLD,
+    maintenance_by_instance: Optional[Dict[str, List[Tuple[float, float]]]] = None,
+    sla_threshold_by_instance: Optional[Dict[str, float]] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
     Merges per-target availability for all monitored instances and calculates fleet metrics.
+
+    sla_threshold_by_instance: {instance: target_pct} per-target SLA target
+    overrides; a target missing from the map uses `sla_threshold`.
 
     expected_interval_sec may be a single fleet-wide seconds value, or a
     {instance: seconds} map (e.g. from get_instance_cadence_map) for a mixed
     fleet where jobs scrape at different cadences — a target missing from the
     map falls back to DEFAULT_SCRAPE_INTERVAL_SEC.
+
+    maintenance_by_instance: {instance: [(start_ts, end_ts), ...]} of planned
+    downtime windows scoped to each target; carved out of that target's SLA
+    denominator (see merge_hybrid_target_availability). None = no exclusion.
     """
     period_minutes = max(0.0, (req_end - req_start) / 60.0)
     buckets_by_instance: Dict[str, List[Dict[str, Any]]] = {}
@@ -541,6 +1014,7 @@ def merge_hybrid_fleet_availability(
     tot_overlap_removed = 0.0
     tot_cov_sec = 0.0
     tot_unk_sec = 0.0
+    tot_maint_excluded_sec = 0.0
 
     for inst in monitored_instances:
         target_prom = {
@@ -567,9 +1041,11 @@ def merge_hybrid_fleet_availability(
             expected_interval_sec=inst_interval_sec,
             gap_tolerance=gap_tolerance,
             min_sla_coverage_pct=min_sla_coverage_pct,
-            sla_threshold=sla_threshold,
+            sla_threshold=float((sla_threshold_by_instance or {}).get(inst, sla_threshold)),
+            maintenance_windows=(maintenance_by_instance or {}).get(inst),
         )
         entries.append(entry)
+        tot_maint_excluded_sec += entry.get("maintenance_excluded_seconds", 0.0)
         tot_sqlite_sec += entry.get("sqlite_seconds", 0.0)
         tot_prom_sec += entry.get("prometheus_seconds", 0.0)
         tot_overlap_removed += entry.get("overlap_removed_seconds", 0.0)
@@ -604,10 +1080,69 @@ def merge_hybrid_fleet_availability(
     else:
         fleet_source = "nodata"
 
+    limited_hosts = [e for e in entries if e.get("is_limited_data")]
+    nodata_hosts = [e for e in entries if e.get("is_no_data")]
+    optimal_hosts = [e for e in entries if e.get("coverage_pct", 0) >= 95.0]
+
+    avg_cov_sec = round(tot_cov_sec / max(1, len(monitored_instances)), 1) if monitored_instances else 0.0
+    avg_unk_sec = round(tot_unk_sec / max(1, len(monitored_instances)), 1) if monitored_instances else 0.0
+    req_win_sec = round(period_minutes * 60.0, 1)
+
+    if tot_cov_sec <= 0:
+        fleet_root_code = "NO_DATA"
+        fleet_root_hint = "Belum ada telemetri yang tercatat untuk seluruh host dalam armada pada jendela ini."
+        fleet_recom = "Periksa konektivitas Prometheus dan pastikan exporter aktif mengumpulkan metrik."
+    elif fleet_cov_pct < (min_sla_coverage_pct or DEFAULT_MIN_SLA_COVERAGE_PERCENT):
+        if len(limited_hosts) == len(entries):
+            fleet_root_code = "FLEET_RETENTION_WINDOW"
+            fleet_root_hint = f"Seluruh armada ({len(entries)} host) baru diobservasi {fleet_cov_pct}% dari jendela waktu."
+            fleet_recom = "Gunakan filter rentang waktu yang lebih pendek (misal Last 24 Hours) atau tunggu backfill database SQLite."
+        else:
+            fleet_root_code = "PARTIAL_FLEET_ONBOARDING"
+            fleet_root_hint = f"{len(limited_hosts)} dari {len(entries)} host memiliki data terbatas (<50% coverage)."
+            fleet_recom = "Periksa host-host yang baru onboard pada tabel audit di bawah untuk evaluasi mendalam."
+    elif fleet_cov_pct < 95.0:
+        fleet_root_code = "MODERATE_COVERAGE"
+        fleet_root_hint = f"Cakupan armada mencakup {fleet_cov_pct}% dari jendela waktu. Sebagian host mengalami jeda observasi."
+        fleet_recom = "Data armada representatif untuk tren performa internal."
+    else:
+        fleet_root_code = "OPTIMAL_COVERAGE"
+        fleet_root_hint = "Cakupan telemetri armada optimal (≥95%) untuk pelaporan operasional dan kepatuhan SLA."
+        fleet_recom = "Armada dalam status monitoring prima."
+
+    fleet_audit = {
+        "requested_window_seconds": req_win_sec,
+        "coverage_seconds": avg_cov_sec,
+        "missing_seconds": avg_unk_sec,
+        "maintenance_excluded_seconds": round(tot_maint_excluded_sec, 1),
+        "coverage_percent": fleet_cov_pct,
+        "missing_percent": round(max(0.0, 100.0 - fleet_cov_pct), 2),
+        "data_status": fleet_data_status,
+        "root_cause_code": fleet_root_code,
+        "root_cause_hint": fleet_root_hint,
+        "confidence_level": "HIGH" if fleet_cov_pct >= 95.0 else ("MODERATE" if fleet_cov_pct >= (min_sla_coverage_pct or DEFAULT_MIN_SLA_COVERAGE_PERCENT) else "LOW"),
+        "confidence_score": round(fleet_cov_pct),
+        "recommendation": fleet_recom,
+        "counts": {
+            "total_hosts": len(entries),
+            "limited_hosts": len(limited_hosts),
+            "nodata_hosts": len(nodata_hosts),
+            "optimal_hosts": len(optimal_hosts),
+        },
+        "storage": {
+            "source": fleet_source,
+            "sqlite_seconds": round(tot_sqlite_sec / max(1, len(monitored_instances)), 1) if monitored_instances else 0.0,
+            "prometheus_seconds": round(tot_prom_sec / max(1, len(monitored_instances)), 1) if monitored_instances else 0.0,
+            "overlap_removed_seconds": round(tot_overlap_removed / max(1, len(monitored_instances)), 1) if monitored_instances else 0.0,
+        }
+    }
+
     hybrid_metadata = {
-        "requested_window_seconds": round(period_minutes * 60.0, 1),
-        "coverage_seconds": round(tot_cov_sec / max(1, len(monitored_instances)), 1) if monitored_instances else 0.0,
-        "unknown_seconds": round(tot_unk_sec / max(1, len(monitored_instances)), 1) if monitored_instances else 0.0,
+        "requested_window_seconds": req_win_sec,
+        "coverage_seconds": avg_cov_sec,
+        "unknown_seconds": avg_unk_sec,
+        "missing_seconds": avg_unk_sec,
+        "maintenance_excluded_seconds": round(tot_maint_excluded_sec, 1),
         "sqlite_seconds": round(tot_sqlite_sec / max(1, len(monitored_instances)), 1) if monitored_instances else 0.0,
         "prometheus_seconds": round(tot_prom_sec / max(1, len(monitored_instances)), 1) if monitored_instances else 0.0,
         "overlap_removed_seconds": round(tot_overlap_removed / max(1, len(monitored_instances)), 1) if monitored_instances else 0.0,
@@ -615,9 +1150,10 @@ def merge_hybrid_fleet_availability(
         "availability_percent": summary.get("fleet_aggregate", {}).get("value"),
         "data_status": fleet_data_status,
         "source": fleet_source,
+        "telemetry_audit": fleet_audit,
     }
 
-    return entries, {**summary, "hybrid": hybrid_metadata}
+    return entries, {**summary, "hybrid": hybrid_metadata, "telemetry_audit": fleet_audit}
 
 
 def reconstruct_time_series_intervals(
@@ -892,6 +1428,8 @@ def summarize_entries(
     total_coverage = 0.0
     total_uptime = 0.0
     total_downtime = 0.0
+    sla_total_coverage = 0.0   # maintenance-excluded — drives fleet_aggregate
+    sla_total_uptime = 0.0
     total_incidents = 0
     never_down_count = 0
     scored_count = 0
@@ -909,16 +1447,34 @@ def summarize_entries(
         downtime_minutes = max(0.0, min(coverage_minutes, downtime_raw))
         uptime_minutes = max(0.0, coverage_minutes - downtime_minutes)
         unknown_minutes = max(0.0, period_minutes - coverage_minutes)
+        unknown_seconds = round(unknown_minutes * 60.0, 1)
 
         coverage_pct = round(_clamp_pct((coverage_minutes / period_minutes) * 100.0), 2) if period_minutes > 0 else 0.0
         unknown_pct = round(_clamp_pct(100.0 - coverage_pct), 2)
 
         if raw_avail is not None:
-            availability_pct = round(_clamp_pct(raw_avail), 2)
+            availability_pct_raw = round(_clamp_pct(raw_avail), 2)
         elif coverage_minutes > 0:
-            availability_pct = round(_clamp_pct((uptime_minutes / coverage_minutes) * 100.0), 2)
+            availability_pct_raw = round(_clamp_pct((uptime_minutes / coverage_minutes) * 100.0), 2)
         else:
-            availability_pct = None
+            availability_pct_raw = None
+
+        # Maintenance-excluded (SLA) view: prefer the trio computed by
+        # merge_hybrid_target_availability; fall back to raw for legacy /
+        # server-record entries that don't carry it. == raw when no windows.
+        maint_excluded_minutes = float(entry.get("maintenance_excluded_minutes") or 0.0)
+        _sla_dt = entry.get("sla_downtime_minutes")
+        sla_downtime_minutes = downtime_minutes if _sla_dt is None else max(0.0, min(coverage_minutes, float(_sla_dt)))
+        _sla_obs = entry.get("sla_observed_minutes")
+        sla_observed_minutes = coverage_minutes if _sla_obs is None else max(0.0, min(coverage_minutes, float(_sla_obs)))
+        sla_uptime_minutes = max(0.0, sla_observed_minutes - sla_downtime_minutes)
+        _sla_av = entry.get("availability_pct_excl_maintenance")
+        if _sla_av is not None:
+            availability_pct = round(_clamp_pct(_sla_av), 2)
+        elif sla_observed_minutes > 0:
+            availability_pct = round(_clamp_pct((sla_uptime_minutes / sla_observed_minutes) * 100.0), 2)
+        else:
+            availability_pct = availability_pct_raw
 
         incidents = int(entry.get("incidents", entry.get("incident_count", 0)) or 0)
         if incidents == 0 and downtime_minutes > 0:
@@ -927,17 +1483,20 @@ def summarize_entries(
 
         avg_latency = float(entry.get("avg_latency_ms") or 0.0)
 
-        # SLA eligibility check
+        # SLA eligibility check — eligibility gate is raw coverage (did we
+        # observe enough); compliance is the maintenance-excluded availability
+        # against this target's own SLA target (falls back to the fleet one).
+        entry_sla_target = float(entry.get("sla_target_pct") or sla_threshold)
         is_eligible = (availability_pct is not None) and (coverage_pct >= min_sla_coverage_pct)
         if not is_eligible:
             sla_status = "INSUFFICIENT_DATA"
             sla_reason = "No data" if availability_pct is None else f"Coverage ({coverage_pct}%) < {min_sla_coverage_pct}%"
-        elif availability_pct >= sla_threshold:
+        elif availability_pct >= entry_sla_target:
             sla_status = "COMPLIANT"
-            sla_reason = f"Availability ({availability_pct}%) >= {sla_threshold}%"
+            sla_reason = f"Availability ({availability_pct}%) >= {entry_sla_target}%"
         else:
             sla_status = "NON_COMPLIANT"
-            sla_reason = f"Availability ({availability_pct}%) < {sla_threshold}%"
+            sla_reason = f"Availability ({availability_pct}%) < {entry_sla_target}%"
 
         # Collect outage durations for fleet percentiles
         entry_outages = entry.get("outage_durations_min")
@@ -951,6 +1510,15 @@ def summarize_entries(
             "name": entry.get("name") or entry.get("id"),
             "job": entry.get("job", ""),
             "availability_pct": availability_pct,
+            "availability_pct_raw": availability_pct_raw,
+            "availability_pct_excl_maintenance": availability_pct,
+            "maintenance_excluded_minutes": round(maint_excluded_minutes, 2),
+            "maintenance_excluded_seconds": round(maint_excluded_minutes * 60.0, 1),
+            "sla_downtime_minutes": round(sla_downtime_minutes, 2),
+            "sla_downtime_seconds": round(sla_downtime_minutes * 60.0, 1),
+            "sla_observed_minutes": round(sla_observed_minutes, 2),
+            "sla_observed_seconds": round(sla_observed_minutes * 60.0, 1),
+            "sla_target_pct": round(entry_sla_target, 3),
             "coverage_minutes": round(coverage_minutes, 2),
             "denominator_minutes": round(coverage_minutes, 2),
             "observed_minutes": round(coverage_minutes, 2),
@@ -960,6 +1528,9 @@ def summarize_entries(
             "downtime_minutes": round(downtime_minutes, 2),
             "downtime_seconds": round(downtime_minutes * 60.0, 1),
             "unknown_minutes": round(unknown_minutes, 2),
+            "unknown_seconds": unknown_seconds,
+            "missing_minutes": round(unknown_minutes, 2),
+            "missing_seconds": unknown_seconds,
             "coverage_pct": coverage_pct,
             "coverage_percent": coverage_pct,
             "unknown_pct": unknown_pct,
@@ -978,10 +1549,12 @@ def summarize_entries(
         if availability_pct is not None and coverage_minutes > 0:
             availability_sum += availability_pct
             scored_count += 1
-            total_coverage += coverage_minutes
+            total_coverage += coverage_minutes          # raw — coverage ratio
             total_uptime += uptime_minutes
-            total_downtime += downtime_minutes
-            if downtime_minutes <= 0.0:
+            total_downtime += downtime_minutes          # raw — outage analytics
+            sla_total_coverage += sla_observed_minutes  # maintenance-excluded
+            sla_total_uptime += sla_uptime_minutes
+            if sla_downtime_minutes <= 0.0:
                 never_down_count += 1
 
         if is_eligible:
@@ -992,8 +1565,8 @@ def summarize_entries(
     fleet_average = round(availability_sum / scored_count, 2) if scored_count > 0 else None
 
     fleet_aggregate = (
-        round(_clamp_pct((total_uptime / total_coverage) * 100.0), 2)
-        if total_coverage > 0 else None
+        round(_clamp_pct((sla_total_uptime / sla_total_coverage) * 100.0), 2)
+        if sla_total_coverage > 0 else None
     )
 
     health_ratio = round((never_down_count / scored_count) * 100.0, 2) if scored_count > 0 else None
@@ -1042,9 +1615,10 @@ def summarize_entries(
             "value": fleet_aggregate,
             "uptime_percent": fleet_aggregate,
             "downtime_percent": downtime_split_pct,
-            "total_uptime_minutes": round(total_uptime, 2),
-            "total_downtime_minutes": round(total_downtime, 2),
-            "total_observed_minutes": round(total_coverage, 2),
+            "total_uptime_minutes": round(sla_total_uptime, 2),
+            "total_downtime_minutes": round(max(0.0, sla_total_coverage - sla_total_uptime), 2),
+            "total_observed_minutes": round(sla_total_coverage, 2),
+            "maintenance_excluded_minutes": round(max(0.0, total_coverage - sla_total_coverage), 2),
             "unit": "%",
         },
         "health_ratio": {

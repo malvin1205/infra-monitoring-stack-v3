@@ -78,7 +78,14 @@ def init_db(db_path: Optional[str] = None):
                 resolved_at REAL,
                 duration_seconds REAL,
                 latency_ms REAL,
-                updated_at REAL NOT NULL
+                updated_at REAL NOT NULL,
+                occurrences INTEGER NOT NULL DEFAULT 1,
+                first_seen REAL,
+                http_status_code INTEGER,
+                last_error TEXT,
+                total_down_seconds REAL NOT NULL DEFAULT 0,
+                acknowledged_by TEXT,
+                acknowledged_at REAL
             );
 
             CREATE INDEX IF NOT EXISTS idx_incidents_status ON incidents(status);
@@ -139,6 +146,20 @@ def init_db(db_path: Optional[str] = None):
             CREATE TABLE IF NOT EXISTS deleted_targets (
                 instance TEXT PRIMARY KEY,
                 deleted_at REAL NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS sla_targets (
+                instance TEXT PRIMARY KEY,
+                target_pct REAL NOT NULL,
+                updated_by TEXT,
+                updated_at REAL NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS slow_thresholds (
+                instance TEXT PRIMARY KEY,
+                threshold_ms REAL NOT NULL,
+                updated_by TEXT,
+                updated_at REAL NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS availability_buckets (
@@ -210,6 +231,55 @@ def init_db(db_path: Optional[str] = None):
         # Sanitize any legacy corrupted buckets (e.g. down hosts marked with positive uptime)
         conn.execute("DELETE FROM availability_buckets WHERE uptime_seconds > 0 AND availability_pct = 0.0")
         conn.execute("DELETE FROM availability_buckets WHERE coverage_seconds = 0.0 AND (uptime_seconds > 0 OR downtime_seconds > 0)")
+
+        # outage_json (added in the "one engine" pass): per-hour outage durations
+        # + ongoing-at-hour-end flag, written by the reconstruction-based
+        # aggregator so incident counts can later be de-duplicated across the
+        # hour boundary. Nullable — legacy rows and the approximate fallback
+        # path simply leave it NULL.
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(availability_buckets)").fetchall()}
+        if "outage_json" not in cols:
+            conn.execute("ALTER TABLE availability_buckets ADD COLUMN outage_json TEXT")
+
+        # occurrences/first_seen/http_status_code/last_error (Incident History
+        # revamp): older DBs pre-date these columns. occurrences/first_seen
+        # backfill from what's already known (1 occurrence, first_seen ==
+        # the row's current started_at) — real re-fire counts only start
+        # accumulating from here on, which is honest: earlier flaps were
+        # never counted anywhere, there's nothing truer to backfill.
+        inc_cols = {r[1] for r in conn.execute("PRAGMA table_info(incidents)").fetchall()}
+        if "occurrences" not in inc_cols:
+            conn.execute("ALTER TABLE incidents ADD COLUMN occurrences INTEGER NOT NULL DEFAULT 1")
+        if "first_seen" not in inc_cols:
+            conn.execute("ALTER TABLE incidents ADD COLUMN first_seen REAL")
+            conn.execute("UPDATE incidents SET first_seen = started_at WHERE first_seen IS NULL")
+        if "http_status_code" not in inc_cols:
+            conn.execute("ALTER TABLE incidents ADD COLUMN http_status_code INTEGER")
+        if "last_error" not in inc_cols:
+            conn.execute("ALTER TABLE incidents ADD COLUMN last_error TEXT")
+        # total_down_seconds: cumulative downtime across ALL occurrences of
+        # this key, not just the latest one — "Total Down" is documented as
+        # an aggregate duration (Incident History task #3). duration_seconds
+        # alone gets overwritten by started_at on every re-fire, so a 3x-flap
+        # incident's column was silently only showing its LAST occurrence's
+        # duration. Backfill from duration_seconds (best available truth for
+        # pre-migration rows — their earlier occurrences' individual
+        # durations were never retained anywhere either).
+        if "total_down_seconds" not in inc_cols:
+            conn.execute("ALTER TABLE incidents ADD COLUMN total_down_seconds REAL NOT NULL DEFAULT 0")
+            conn.execute("UPDATE incidents SET total_down_seconds = COALESCE(duration_seconds, 0) WHERE status = 'resolved'")
+        # acknowledged_by/acknowledged_at: alert_acknowledgments (keyed by
+        # instance, live-only) gets deleted the moment a target stops being
+        # down (see AcknowledgmentRepository.clear_resolved), so it can never
+        # answer "who acknowledged THIS past incident" once it's resolved.
+        # These columns are the durable copy — kept in sync in real time by
+        # AcknowledgmentRepository.acknowledge_instances/unacknowledge_instance
+        # while an incident is firing, and simply left alone (frozen) once it
+        # resolves.
+        if "acknowledged_by" not in inc_cols:
+            conn.execute("ALTER TABLE incidents ADD COLUMN acknowledged_by TEXT")
+        if "acknowledged_at" not in inc_cols:
+            conn.execute("ALTER TABLE incidents ADD COLUMN acknowledged_at REAL")
         conn.commit()
 
         # Seed from JSON files only if using the default production DB and table is empty
@@ -351,15 +421,38 @@ class IncidentRepository:
                     "receiver": r["receiver"],
                     "generatorURL": r["generator_url"],
                     "time": r["started_at"],
-                    "latency_ms": r["latency_ms"]
+                    "status": "firing",
+                    "latency_ms": r["latency_ms"],
+                    "occurrences": r["occurrences"],
+                    "first_seen": r["first_seen"],
+                    "http_status_code": r["http_status_code"],
+                    "last_error": r["last_error"],
+                    "total_down_seconds": r["total_down_seconds"],
+                    "acknowledged_by": r["acknowledged_by"],
+                    "acknowledged_at": r["acknowledged_at"]
                 }
                 for r in rows
             ]
 
     @staticmethod
     def get_history(limit: int = 1000, db_path: Optional[str] = None) -> List[Dict[str, Any]]:
+        # Includes BOTH resolved and still-firing incidents — Incident History
+        # shows an "Ongoing" incident (not yet resolved) instead of hiding it
+        # until it clears.
+        #
+        # Firing rows are fetched WITHOUT a limit and resolved rows WITH one,
+        # then combined — a single "ORDER BY updated_at DESC LIMIT N" query
+        # could silently push a long-running-but-quiet ongoing incident (its
+        # updated_at only moves on a re-fire) out of the window once N other,
+        # newer, unrelated incidents resolve — Ongoing rows must never be
+        # allowed to just disappear from the list. Concurrent open incidents
+        # in any real deployment are always a small number, so leaving them
+        # unlimited is safe.
         with db_read(db_path) as conn:
-            rows = conn.execute("""
+            firing_rows = conn.execute("""
+                SELECT * FROM incidents WHERE status = 'firing' ORDER BY updated_at DESC
+            """).fetchall()
+            resolved_rows = conn.execute("""
                 SELECT * FROM incidents WHERE status = 'resolved' ORDER BY updated_at DESC LIMIT ?
             """, (limit,)).fetchall()
             return [
@@ -370,15 +463,22 @@ class IncidentRepository:
                     "instance": r["instance"],
                     "summary": r["summary"],
                     "time": r["started_at"],
-                    "status": "resolved",
+                    "status": r["status"],
                     "job": r["job"],
                     "receiver": r["receiver"],
                     "generatorURL": r["generator_url"],
                     "resolved_time": r["resolved_at"],
                     "duration_seconds": r["duration_seconds"],
-                    "latency_ms": r["latency_ms"]
+                    "latency_ms": r["latency_ms"],
+                    "occurrences": r["occurrences"],
+                    "first_seen": r["first_seen"] if r["first_seen"] is not None else r["started_at"],
+                    "http_status_code": r["http_status_code"],
+                    "last_error": r["last_error"],
+                    "total_down_seconds": r["total_down_seconds"],
+                    "acknowledged_by": r["acknowledged_by"],
+                    "acknowledged_at": r["acknowledged_at"]
                 }
-                for r in rows
+                for r in list(firing_rows) + list(resolved_rows)
             ]
 
     @staticmethod
@@ -394,6 +494,8 @@ class IncidentRepository:
         generatorURL: str = "",
         key: Optional[str] = None,
         latency_ms: Optional[float] = None,
+        http_status_code: Optional[int] = None,
+        last_error: Optional[str] = None,
         db_path: Optional[str] = None
     ) -> bool:
         key = key or f"{name}|{instance}"
@@ -408,24 +510,55 @@ class IncidentRepository:
             if was_firing == is_now_firing:
                 return False  # Idempotent deduplication
 
+            # An "occurrence" is one full DOWN->UP->DOWN cycle for this key —
+            # exactly the transition this dedupe guard already enforces (no
+            # new occurrence without an intervening resolve). A fresh key
+            # starts at 1; re-firing a key that already exists (guaranteed
+            # 'resolved' by the guard above) increments the same row instead
+            # of inserting a new one, so Incident History reflects real
+            # flap counts instead of always reading "occurrences x1".
+            # alert_acknowledgments is keyed by instance (live-only "is the
+            # CURRENT outage on this host acked" state) and is otherwise only
+            # cleared by a poll-driven sweep (app.py's /instances handler,
+            # AcknowledgmentRepository.clear_resolved) that only runs when
+            # something is actually polling /instances and only clears
+            # instances that are no longer down. A resolve -> re-fire cycle
+            # that happens between two such polls (or while nothing is
+            # polling at all — an unattended wallboard tab, say) would leave
+            # a stale ack in place, silently suppressing the alarm AND
+            # showing "Acked by X" on a brand-new, nobody's-looked-at-it-yet
+            # occurrence in both the live dashboard and Live Alert Log.
+            # Clearing it right here, on the actual state transition, closes
+            # that race — the poll-driven sweep still runs too (harmless,
+            # handles instances removed from monitoring entirely).
+            conn.execute("DELETE FROM alert_acknowledgments WHERE instance = ?", (instance,))
+
             duration_seconds = None
             if is_now_firing:
                 conn.execute("""
                     INSERT INTO incidents (
                         key, fingerprint, name, severity, instance, summary, job,
-                        receiver, generator_url, status, started_at, resolved_at, duration_seconds, updated_at, latency_ms
+                        receiver, generator_url, status, started_at, first_seen, occurrences,
+                        resolved_at, duration_seconds, updated_at, latency_ms, http_status_code, last_error
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'firing', ?, NULL, NULL, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'firing', ?, ?, 1, NULL, NULL, ?, ?, ?, ?)
                     ON CONFLICT(key) DO UPDATE SET
                         status = 'firing',
                         severity = excluded.severity,
                         summary = excluded.summary,
-                        started_at = CASE WHEN incidents.status = 'firing' THEN incidents.started_at ELSE excluded.started_at END,
+                        started_at = excluded.started_at,
+                        first_seen = COALESCE(incidents.first_seen, excluded.first_seen),
+                        occurrences = incidents.occurrences + 1,
                         resolved_at = NULL,
                         duration_seconds = NULL,
                         updated_at = excluded.updated_at,
-                        latency_ms = excluded.latency_ms
-                """, (key, key, name, severity, instance, summary, job, receiver, generatorURL, event_time, event_time, latency_ms))
+                        latency_ms = excluded.latency_ms,
+                        http_status_code = excluded.http_status_code,
+                        last_error = excluded.last_error,
+                        acknowledged_by = NULL,
+                        acknowledged_at = NULL
+                """, (key, key, name, severity, instance, summary, job, receiver, generatorURL,
+                      event_time, event_time, event_time, latency_ms, http_status_code, last_error))
 
                 conn.execute("""
                     INSERT INTO event_logs (event, name, severity, instance, summary, job, time, duration_seconds, latency_ms, fingerprint)
@@ -434,10 +567,15 @@ class IncidentRepository:
             else:
                 started_at = row["started_at"] if row else event_time
                 duration_seconds = round(float(event_time - started_at), 1)
+                # total_down_seconds accumulates across every occurrence of
+                # this key — duration_seconds alone only ever reflects the
+                # occurrence that JUST resolved, since started_at gets
+                # overwritten on every re-fire (see the firing branch above).
                 conn.execute("""
-                    UPDATE incidents SET status = 'resolved', resolved_at = ?, duration_seconds = ?, updated_at = ?
+                    UPDATE incidents SET status = 'resolved', resolved_at = ?, duration_seconds = ?,
+                        total_down_seconds = COALESCE(total_down_seconds, 0) + ?, updated_at = ?
                     WHERE key = ?
-                """, (event_time, duration_seconds, event_time, key))
+                """, (event_time, duration_seconds, duration_seconds, event_time, key))
 
                 conn.execute("""
                     INSERT INTO event_logs (event, name, severity, instance, summary, job, time, duration_seconds, latency_ms, fingerprint)
@@ -681,6 +819,90 @@ class DeletedTargetRepository:
             conn.execute("DELETE FROM deleted_targets WHERE instance = ?", (instance,))
 
 
+class SlaTargetRepository:
+    """Per-target SLA availability target (%). Absent -> the deployment
+    default (SLA_TARGET_PCT env / SLA_COMPLIANCE_THRESHOLD) applies."""
+
+    @staticmethod
+    def get_all(db_path: Optional[str] = None) -> Dict[str, float]:
+        with db_read(db_path) as conn:
+            rows = conn.execute("SELECT instance, target_pct FROM sla_targets").fetchall()
+            return {r["instance"]: float(r["target_pct"]) for r in rows}
+
+    @staticmethod
+    def get_target(instance: str, db_path: Optional[str] = None) -> Optional[float]:
+        with db_read(db_path) as conn:
+            row = conn.execute(
+                "SELECT target_pct FROM sla_targets WHERE instance = ?", (instance,)
+            ).fetchone()
+            return float(row["target_pct"]) if row else None
+
+    @staticmethod
+    def set_target(instance: str, target_pct: float, updated_by: Optional[str] = None,
+                   db_path: Optional[str] = None):
+        pct = max(0.0, min(100.0, float(target_pct)))
+        with db_transaction(db_path) as conn:
+            conn.execute(
+                """INSERT INTO sla_targets (instance, target_pct, updated_by, updated_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(instance) DO UPDATE SET
+                       target_pct = excluded.target_pct,
+                       updated_by = excluded.updated_by,
+                       updated_at = excluded.updated_at""",
+                (instance, pct, updated_by, time.time()),
+            )
+        return pct
+
+    @staticmethod
+    def delete_target(instance: str, db_path: Optional[str] = None) -> bool:
+        with db_transaction(db_path) as conn:
+            cur = conn.execute("DELETE FROM sla_targets WHERE instance = ?", (instance,))
+            return cur.rowcount > 0
+
+
+class SlowThresholdRepository:
+    """Per-instance SlowResponse threshold (ms). Absent -> the deployment
+    default (DEFAULT_SLOW_RESPONSE_THRESHOLD_MS) applies — some targets
+    (e.g. a naturally slower overseas endpoint) aren't actually degraded
+    at the global default, they're just always like that."""
+
+    @staticmethod
+    def get_all(db_path: Optional[str] = None) -> Dict[str, float]:
+        with db_read(db_path) as conn:
+            rows = conn.execute("SELECT instance, threshold_ms FROM slow_thresholds").fetchall()
+            return {r["instance"]: float(r["threshold_ms"]) for r in rows}
+
+    @staticmethod
+    def get_threshold(instance: str, db_path: Optional[str] = None) -> Optional[float]:
+        with db_read(db_path) as conn:
+            row = conn.execute(
+                "SELECT threshold_ms FROM slow_thresholds WHERE instance = ?", (instance,)
+            ).fetchone()
+            return float(row["threshold_ms"]) if row else None
+
+    @staticmethod
+    def set_threshold(instance: str, threshold_ms: float, updated_by: Optional[str] = None,
+                       db_path: Optional[str] = None):
+        ms = max(0.0, float(threshold_ms))
+        with db_transaction(db_path) as conn:
+            conn.execute(
+                """INSERT INTO slow_thresholds (instance, threshold_ms, updated_by, updated_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(instance) DO UPDATE SET
+                       threshold_ms = excluded.threshold_ms,
+                       updated_by = excluded.updated_by,
+                       updated_at = excluded.updated_at""",
+                (instance, ms, updated_by, time.time()),
+            )
+        return ms
+
+    @staticmethod
+    def delete_threshold(instance: str, db_path: Optional[str] = None) -> bool:
+        with db_transaction(db_path) as conn:
+            cur = conn.execute("DELETE FROM slow_thresholds WHERE instance = ?", (instance,))
+            return cur.rowcount > 0
+
+
 class AvailabilityBucketRepository:
     @staticmethod
     def save_buckets(buckets: List[Dict[str, Any]], db_path: Optional[str] = None):
@@ -692,11 +914,13 @@ class AvailabilityBucketRepository:
                 INSERT OR REPLACE INTO availability_buckets (
                     instance, job, bucket_start, bucket_end,
                     uptime_seconds, downtime_seconds, unknown_seconds, coverage_seconds,
-                    sample_count, availability_pct, incident_count, avg_latency_ms, updated_at
+                    sample_count, availability_pct, incident_count, avg_latency_ms, updated_at,
+                    outage_json
                 ) VALUES (
                     :instance, :job, :bucket_start, :bucket_end,
                     :uptime_seconds, :downtime_seconds, :unknown_seconds, :coverage_seconds,
-                    :sample_count, :availability_pct, :incident_count, :avg_latency_ms, :updated_at
+                    :sample_count, :availability_pct, :incident_count, :avg_latency_ms, :updated_at,
+                    :outage_json
                 )
             """, [
                 {
@@ -713,6 +937,9 @@ class AvailabilityBucketRepository:
                     "incident_count": int(b.get("incident_count", 0)),
                     "avg_latency_ms": float(b.get("avg_latency_ms", 0.0)),
                     "updated_at": float(b.get("updated_at", now)),
+                    "outage_json": b["outage_json"] if isinstance(b.get("outage_json"), str) else (
+                        json.dumps(b["outage_json"]) if b.get("outage_json") is not None else None
+                    ),
                 }
                 for b in buckets
             ])
@@ -774,7 +1001,8 @@ class AvailabilityBucketRepository:
             query = """
                 SELECT id, instance, job, bucket_start, bucket_end,
                        uptime_seconds, downtime_seconds, unknown_seconds, coverage_seconds,
-                       sample_count, availability_pct, incident_count, avg_latency_ms, updated_at
+                       sample_count, availability_pct, incident_count, avg_latency_ms, updated_at,
+                       outage_json
                 FROM (
                     SELECT *,
                         ROW_NUMBER() OVER (
@@ -1012,6 +1240,16 @@ class AcknowledgmentRepository:
                     INSERT OR REPLACE INTO alert_acknowledgments (target_key, instance, acknowledged_by, acknowledged_at, created_at)
                     VALUES (?, ?, ?, ?, ?)
                 """, (inst_clean, inst_clean, username, t, t))
+                # Mirror onto the currently-firing incident row(s) for this
+                # instance too — alert_acknowledgments is live-only state
+                # (deleted the moment the instance recovers, see
+                # clear_resolved below), so without this an incident that
+                # gets acknowledged and then resolves would show no trace of
+                # who acknowledged it once it lands in Incident History.
+                conn.execute("""
+                    UPDATE incidents SET acknowledged_by = ?, acknowledged_at = ?
+                    WHERE instance = ? AND status = 'firing'
+                """, (username, t, inst_clean))
                 res.append({
                     "instance": inst_clean,
                     "acknowledged": True,
@@ -1024,6 +1262,10 @@ class AcknowledgmentRepository:
     def unacknowledge_instance(instance: str, db_path: Optional[str] = None) -> bool:
         with db_transaction(db_path) as conn:
             cur = conn.execute("DELETE FROM alert_acknowledgments WHERE target_key = ? OR instance = ?", (instance, instance))
+            conn.execute("""
+                UPDATE incidents SET acknowledged_by = NULL, acknowledged_at = NULL
+                WHERE instance = ? AND status = 'firing'
+            """, (instance,))
             return cur.rowcount > 0
 
     @staticmethod

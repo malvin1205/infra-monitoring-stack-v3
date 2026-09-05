@@ -774,7 +774,7 @@
               <label class="form-label" for="drawerMaintReasonInput">Reason (optional)</label>
               <input type="text" id="drawerMaintReasonInput" class="form-input" placeholder="Scheduled reboot, firmware update, ...">
             </div>
-            <button id="drawerMaintStartBtn" type="submit" class="btn btn-primary btn-sm" style="width:100%; justify-content:center;">Start Maintenance</button>
+            <button id="drawerMaintStartBtn" type="submit" class="btn btn-primary btn-sm btn-block">Start Maintenance</button>
           </form>
         </div>
       </div>
@@ -883,12 +883,52 @@
               <option value="43200">Last 30 Days</option>
             </select>
           </div>
+
+          <div class="job-dd" id="availSettingsDd">
+            <button class="icon-action job-settings-btn" id="availSettingsBtn" type="button" title="Availability / SLA settings" aria-label="Availability / SLA settings" aria-haspopup="dialog" aria-controls="availSettingsPopover" aria-expanded="false">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="3"/>
+                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+              </svg>
+            </button>
+            <div class="job-default-popover hidden" id="availSettingsPopover" role="dialog" aria-label="Availability / SLA settings">
+              <div class="jdp-title">Availability / SLA</div>
+              <label class="crp-row crp-row-checkbox" id="useNodeExporterRow">
+                <input type="checkbox" id="useNodeExporterCheckbox">
+                <span>Use Node Exporter for infrastructure-aware availability</span>
+              </label>
+              <div class="jdp-help">When on, a failed probe is cross-checked against Node Exporter to tell a service issue (host healthy) apart from an infrastructure issue (host also down). Never changes availability/SLA numbers — classification only. Targets without Node Exporter are unaffected.</div>
+            </div>
+          </div>
+
           <button id="closeAvailabilityBreakdown" class="modal-close" type="button" aria-label="Close modal">&times;</button>
         </div>
       </div>
 
       <div class="modal-body avail-modal-body">
-        <!-- Top 2 Primary Metric Cards -->
+        <!-- Modal Sub-Navigation Bar -->
+        <div class="avail-subnav-bar" role="tablist" aria-label="Availability Breakdown Views">
+          <button type="button" class="avail-subnav-btn is-active" id="btnSubnavRanking" data-avail-tab="ranking" role="tab" aria-selected="true">
+            <svg class="avail-subnav-icon" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect>
+              <line x1="8" y1="21" x2="16" y2="21"></line>
+              <line x1="12" y1="17" x2="12" y2="21"></line>
+            </svg>
+            <span>Overview & Ranking</span>
+          </button>
+          <button type="button" class="avail-subnav-btn" id="btnSubnavAudit" data-avail-tab="audit" role="tab" aria-selected="false">
+            <svg class="avail-subnav-icon" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
+              <polyline points="9 12 11 14 15 10"></polyline>
+            </svg>
+            <span>Data Quality & Telemetry Audit</span>
+            <span class="avail-subnav-badge hidden" id="auditSubnavBadge">LIMITED DATA</span>
+          </button>
+        </div>
+
+        <!-- ── TAB PANE 1: OVERVIEW & RANKING ── -->
+        <div class="avail-subnav-pane" id="paneAvailRanking">
+          <!-- Top 2 Primary Metric Cards -->
         <div class="avail-hero-grid">
           <!-- Card 1: Fleet Availability -->
           <div class="avail-hero-card avail-hero-fleet">
@@ -901,7 +941,11 @@
               </div>
               <div class="avail-hero-value" id="metricFleetAggregate">—</div>
               <div class="avail-hero-desc">Overall uptime across all monitored hosts</div>
-              <div class="avail-hero-data-warning" id="metricFleetDataWarning" hidden></div>
+              <button type="button" class="avail-hero-data-warning is-clickable" id="metricFleetDataWarning" hidden aria-label="View Telemetry and Coverage Audit">
+                <span class="ahw-icon">⚠</span>
+                <span class="ahw-text" id="metricFleetDataWarningText">Limited data</span>
+                <span class="ahw-action">View Telemetry Audit ➔</span>
+              </button>
 
               <div class="avail-split-bar-wrap">
                 <div class="avail-split-bar">
@@ -911,24 +955,6 @@
                 <div class="avail-split-legend">
                   <span class="legend-item"><span class="legend-dot dot-up"></span> Uptime <strong id="legendUptimePct">—</strong></span>
                   <span class="legend-item"><span class="legend-dot dot-down"></span> Downtime <strong id="legendDowntimePct">—</strong></span>
-                </div>
-              </div>
-            </div>
-
-            <div class="avail-hero-graphic" aria-hidden="true">
-              <svg class="avail-gauge-ring" viewBox="0 0 80 80">
-                <circle class="gauge-bg" cx="40" cy="40" r="34" />
-                <circle class="gauge-fill" id="fleetGaugeCircle" cx="40" cy="40" r="34" stroke-dasharray="213.6" stroke-dashoffset="0" />
-              </svg>
-              <div class="avail-gauge-icon-wrap">
-                <svg class="server-rack-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <rect x="2" y="2" width="20" height="8" rx="2" ry="2"></rect>
-                  <rect x="2" y="14" width="20" height="8" rx="2" ry="2"></rect>
-                  <line x1="6" y1="6" x2="6.01" y2="6"></line>
-                  <line x1="6" y1="18" x2="6.01" y2="18"></line>
-                </svg>
-                <div class="gauge-check-badge">
-                  <svg viewBox="0 0 12 12" width="8" height="8" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="2.5 6 4.5 8.5 9.5 3.5"></polyline></svg>
                 </div>
               </div>
             </div>
@@ -948,15 +974,6 @@
 
               <div class="avail-healthy-stat">
                 <span class="avail-healthy-count-text" id="metricHealthyHostsCount">— / — hosts</span>
-              </div>
-            </div>
-
-            <div class="avail-hero-graphic" aria-hidden="true">
-              <div class="avail-shield-container">
-                <svg class="avail-shield-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
-                  <polyline points="9 12 11 14 15 10"></polyline>
-                </svg>
               </div>
             </div>
           </div>
@@ -1081,6 +1098,115 @@
             </div>
           </div>
         </div>
+        </div>
+        <!-- ── END TAB PANE 1 ── -->
+
+        <!-- ── TAB PANE 2: DATA QUALITY & TELEMETRY AUDIT ─────────── -->
+        <div class="avail-subnav-pane hidden" id="paneAvailAudit">
+          <!-- SLA headline + downtime error budget -->
+          <div class="audit-sla-row">
+            <div class="audit-sla-card" id="auditSlaCard">
+              <div class="audit-sla-head">
+                <span class="audit-sla-label">SLA AVAILABILITY<span class="audit-sla-sub"> · excl. planned maintenance</span></span>
+                <span class="audit-sla-badge" id="auditSlaBadge">—</span>
+              </div>
+              <div class="audit-sla-value" id="auditSlaValue">—</div>
+              <div class="audit-sla-foot">
+                <span id="auditSlaTarget">target —</span>
+                <span class="audit-sla-maint" id="auditSlaMaint" hidden></span>
+              </div>
+            </div>
+
+            <div class="audit-sla-card" id="auditBudgetCard">
+              <div class="audit-sla-head">
+                <span class="audit-sla-label">DOWNTIME BUDGET<span class="audit-sla-sub" id="auditBudgetScope"> · this window</span></span>
+                <span class="audit-budget-state" id="auditBudgetState">—</span>
+              </div>
+              <div class="audit-budget-bar"><div class="audit-budget-fill" id="auditBudgetFill" style="width:0%;"></div></div>
+              <div class="audit-sla-foot">
+                <span id="auditBudgetUsed">— used of —</span>
+                <span id="auditBudgetProjection"></span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Coverage source one-liner -->
+          <div class="audit-status" id="auditStatus">
+            <svg class="audit-status-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="16" x2="12" y2="12"></line><line x1="12" y1="8" x2="12.01" y2="8"></line></svg>
+            <p class="audit-status-text" id="auditStatusText">—</p>
+            <span class="audit-status-src" id="auditStatusSrc"></span>
+          </div>
+
+          <!-- Coverage split -->
+          <div class="audit-grid" id="auditGrid">
+            <div class="audit-card">
+              <div class="audit-card-title">Observed</div>
+              <div class="audit-card-value text-observed" id="auditMetricObserved">—</div>
+              <div class="audit-card-sub" id="auditMetricObservedPct">— of window</div>
+              <div class="audit-card-meter"><div class="audit-card-fill fill-observed" id="auditMeterObserved" style="width:0%;"></div></div>
+            </div>
+
+            <div class="audit-card">
+              <div class="audit-card-title">Unmonitored</div>
+              <div class="audit-card-value text-missing" id="auditMetricMissing">—</div>
+              <div class="audit-card-sub" id="auditMetricMissingPct">— of window</div>
+              <div class="audit-card-meter"><div class="audit-card-fill fill-missing" id="auditMeterMissing" style="width:0%;"></div></div>
+            </div>
+
+            <div class="audit-card" id="auditMaintCard" hidden>
+              <div class="audit-card-title">Planned maintenance</div>
+              <div class="audit-card-value text-maint" id="auditMetricMaint">—</div>
+              <div class="audit-card-sub" id="auditMetricMaintPct">excluded from SLA</div>
+              <div class="audit-card-meter"><div class="audit-card-fill fill-maint" id="auditMeterMaint" style="width:0%;"></div></div>
+            </div>
+          </div>
+
+          <!-- Per-host telemetry -->
+          <div class="audit-table-card">
+            <div class="audit-table-header">
+              <div class="audit-table-title-wrap">
+                <span class="audit-table-title">PER-HOST</span>
+                <span class="audit-table-count" id="auditTableHostCount">0 hosts</span>
+              </div>
+              <div class="audit-filters-wrap">
+                <div class="audit-filter-chips" role="group" aria-label="Filter hosts">
+                  <button type="button" class="audit-chip is-active" data-filter="all" id="auditFilterAll">All</button>
+                  <button type="button" class="audit-chip" data-filter="breach" id="auditFilterBreach">SLA breach</button>
+                  <button type="button" class="audit-chip" data-filter="limited" id="auditFilterLimited">Coverage &lt;50%</button>
+                  <button type="button" class="audit-chip" data-filter="optimal" id="auditFilterOptimal">Coverage &ge;95%</button>
+                </div>
+                <input type="text" class="audit-search-input" id="auditSearchInput" placeholder="Filter host…" aria-label="Filter host in table">
+              </div>
+            </div>
+
+            <div class="audit-table-responsive">
+              <table class="audit-table">
+                <thead>
+                  <tr>
+                    <th>HOST</th>
+                    <th>COVERAGE</th>
+                    <th class="ta-r">SLA AVAIL / TARGET</th>
+                    <th class="ta-r">DOWNTIME (SLA)</th>
+                    <th class="ta-r">BUDGET LEFT</th>
+                  </tr>
+                </thead>
+                <tbody id="auditTableBody">
+                  <tr>
+                    <td colspan="5" class="audit-empty-row">Loading…</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="audit-footer-actions">
+            <button type="button" class="btn btn-secondary btn-sm" id="btnReturnToRanking">
+              <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="19" y1="12" x2="5" y2="12"></line><polyline points="12 19 5 12 12 5"></polyline></svg>
+              <span>Back to Overview</span>
+            </button>
+          </div>
+        </div>
+        <!-- ── END TAB PANE 2 ── -->
       </div>
 
       <!-- Modal Footer -->
@@ -1136,8 +1262,12 @@
             <button id="clearLogs" class="btn btn-secondary btn-sm" type="button">Clear</button>
           </div>
           <div class="data-table">
-            <div class="data-table-head log-grid" aria-hidden="true">
-              <span>Time</span><span>Status</span><span>Alert</span><span>Target</span><span>Severity</span><span>Duration</span><span>Message</span>
+            <div class="al-meta-bar">
+              <span class="al-meta-count" id="logStreamMeta">—</span>
+              <div class="al-legend">
+                <span class="al-legend-item"><span class="al-dot al-dot-firing" style="width:7px;height:7px;"></span>firing now</span>
+                <span class="al-legend-item"><span class="al-dot al-dot-resolved" style="width:7px;height:7px;"></span>resolved</span>
+              </div>
             </div>
             <div class="log-stream" id="logStream"></div>
           </div>
@@ -1171,18 +1301,43 @@
               <button class="chip" data-hist-filter="critical" type="button">Critical</button>
               <button class="chip" data-hist-filter="warning" type="button">Warning</button>
             </div>
+            <div class="logs-filter-group">
+              <button class="chip chip-active" data-hist-status="all" type="button">All</button>
+              <button class="chip" data-hist-status="ongoing" type="button">Ongoing</button>
+              <button class="chip" data-hist-status="resolved" type="button">Resolved</button>
+            </div>
+            <select id="historySortSelect" class="avail-range-select" aria-label="Sort incident history">
+              <option value="last_seen" selected>Sort: Last Seen</option>
+              <option value="total_down">Sort: Total Down</option>
+              <option value="occurrences">Sort: Occurrences</option>
+            </select>
             <button id="exportHistory" class="btn btn-secondary btn-sm" type="button">Export CSV</button>
             <button id="clearHistory" class="btn btn-secondary btn-sm" type="button">Clear</button>
           </div>
           <div class="history-meta-row">
-            <span id="historyMeta">0 incidents total</span>
-            <span id="historyBadge" class="host-count-badge">0</span>
+            <span id="historyMeta">0 incidents (filtered)</span>
+            <div class="history-meta-filters">
+              <select id="historyJobFilter" class="avail-range-select" aria-label="Filter by job">
+                <option value="all" selected>All Jobs</option>
+              </select>
+              <select id="historyRangeSelect" class="avail-range-select" aria-label="Select date range">
+                <option value="month" selected>This Month</option>
+                <option value="7d">Last 7 Days</option>
+                <option value="30d">Last 30 Days</option>
+                <option value="all">All Time</option>
+              </select>
+              <span id="historyBadge" class="host-count-badge">0</span>
+            </div>
           </div>
           <div class="data-table">
             <div class="data-table-head hist-grid" aria-hidden="true">
-              <span>Time</span><span>Status</span><span>Alert</span><span>Target</span><span>Severity</span><span>Duration</span><span>Message</span>
+              <span>Host / Alert</span><span>Status</span><span>Severity</span><span>Occurrences</span><span>First Seen</span><span style="text-align:right;">Total Down</span><span style="text-align:right;">Last Seen</span>
             </div>
             <div class="history-full-table" id="historyFullTable"></div>
+            <div class="history-pager" id="historyPager" hidden>
+              <button id="historyLoadMore" class="btn btn-secondary btn-sm" type="button">Show more</button>
+              <span id="historyPagerLabel" class="history-pager-label"></span>
+            </div>
           </div>
         </div>
 
@@ -1212,15 +1367,15 @@
 
       <div class="modal-body">
         <form id="addEndpointForm" style="margin-bottom: 20px;">
-          <div class="form-group" style="margin-bottom: 12px;">
-            <label for="endpointUrlInput" class="form-label" style="display: block; margin-bottom: 6px; font-size: 12px; font-weight: 500; color: var(--text-secondary);">New Prometheus Endpoint URL</label>
+          <div class="form-group">
+            <label for="endpointUrlInput" class="form-label">New Prometheus Endpoint URL</label>
             <div style="display: flex; gap: 8px;">
-              <input type="text" id="endpointUrlInput" class="search-input" style="flex: 1; border-radius: var(--r-sm);" placeholder="http://192.168.10.5:9090" required>
+              <input type="text" id="endpointUrlInput" class="form-input" style="flex: 1;" placeholder="http://192.168.10.5:9090" required>
               <button type="submit" class="add-target-btn" style="padding: 0 14px; flex-shrink: 0;">
                 <span>+ Add</span>
               </button>
             </div>
-            <div id="addEndpointError" class="form-error hidden" style="margin-top: 6px; font-size: 11px; color: var(--critical);"></div>
+            <div id="addEndpointError" class="form-error hidden" style="margin-top: 6px;"></div>
           </div>
         </form>
 
@@ -1236,31 +1391,29 @@
 
   <!-- Modern Confirmation Dialog Modal -->
   <div id="confirmModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="confirmModalTitle">
-    <div class="modal-card" style="max-width: 420px; border: 1px solid var(--critical-border, rgba(239, 68, 68, 0.3));">
-      <div class="modal-header" style="padding-bottom: 8px;">
-        <div style="display: flex; align-items: center; gap: 10px;">
-          <div style="width: 36px; height: 36px; border-radius: 50%; background: rgba(239, 68, 68, 0.15); display: flex; align-items: center; justify-content: center; color: #EF4444; flex-shrink: 0;">
+    <div class="modal-card modal-card-danger">
+      <div class="modal-header">
+        <div class="modal-title-group">
+          <div class="modal-icon-badge modal-icon-badge-danger">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
               <line x1="12" y1="9" x2="12" y2="13"/>
               <line x1="12" y1="17" x2="12.01" y2="17"/>
             </svg>
           </div>
-          <h3 class="modal-title" id="confirmModalTitle" style="font-size: 15px; font-weight: 600; color: var(--text-primary);">Delete Target</h3>
+          <h3 class="modal-title" id="confirmModalTitle">Delete Target</h3>
         </div>
         <button id="closeConfirmModalBtn" class="modal-close" type="button" aria-label="Close modal">&times;</button>
       </div>
 
-      <div class="modal-body" style="padding-top: 6px;">
+      <div class="modal-body">
         <p id="confirmModalMessage" style="font-size: 13px; color: var(--text-secondary); line-height: 1.5; margin-bottom: 20px;">
           Are you sure you want to remove this target from monitoring?
         </p>
 
-        <div style="display: flex; justify-content: flex-end; gap: 10px;">
-          <button id="confirmCancelBtn" class="btn btn-secondary" type="button" style="padding: 8px 16px;">Cancel</button>
-          <button id="confirmActionBtn" class="btn btn-danger" type="button" style="background: #EF4444; color: white; border: none; padding: 8px 16px; border-radius: var(--r-sm); font-weight: 500; cursor: pointer;">
-            Yes, Delete
-          </button>
+        <div class="modal-actions">
+          <button id="confirmCancelBtn" class="btn btn-secondary" type="button">Cancel</button>
+          <button id="confirmActionBtn" class="btn btn-danger" type="button">Yes, Delete</button>
         </div>
       </div>
     </div>
@@ -1268,7 +1421,7 @@
 
   <!-- Self-Monitoring Detail Modal (Phase 13 Revise) — reuses /health only -->
   <div id="selfHealthModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="selfHealthModalTitle">
-    <div class="modal-card" style="max-width: 380px;">
+    <div class="modal-card modal-card-narrow">
       <div class="modal-header">
         <h3 class="modal-title" id="selfHealthModalTitle">InfraWatch Self-Status</h3>
         <button id="closeSelfHealthModal" class="modal-close" type="button" aria-label="Close modal">&times;</button>
@@ -1284,100 +1437,92 @@
 
   <!-- First-Run Administrator Setup Modal -->
   <div id="setupModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="setupModalTitle">
-    <div class="modal-card" style="max-width: 440px;">
+    <div class="modal-card">
       <div class="modal-header">
-        <div style="display: flex; align-items: center; gap: 10px;">
-          <div style="width: 36px; height: 36px; border-radius: 50%; background: rgba(59, 130, 246, 0.15); display: flex; align-items: center; justify-content: center; color: var(--accent); flex-shrink: 0;">
+        <div class="modal-title-group">
+          <div class="modal-icon-badge">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
             </svg>
           </div>
           <div>
-            <h3 class="modal-title" id="setupModalTitle" style="font-size: 16px; font-weight: 600; color: var(--text-primary);">Initial System Setup</h3>
-            <div style="font-size: 12px; color: var(--text-secondary);">Create Administrator Account</div>
+            <h3 class="modal-title" id="setupModalTitle">Initial System Setup</h3>
+            <div class="modal-subtitle">Create Administrator Account</div>
           </div>
         </div>
       </div>
-      <div class="modal-body" style="padding-top: 10px;">
-        <p style="font-size: 13px; color: var(--text-secondary); line-height: 1.5; margin-bottom: 16px;">
+      <form id="setupForm" class="modal-form">
+        <p style="font-size: 13px; color: var(--text-secondary); line-height: 1.5;">
           Welcome to InfraWatch! Create the primary administrator account to secure monitoring operations.
         </p>
-        <form id="setupForm">
-          <div class="form-group" style="margin-bottom: 12px;">
-            <label for="setupDisplayNameInput" class="form-label" style="display: block; margin-bottom: 6px; font-size: 12px; font-weight: 500; color: var(--text-secondary);">Full / Display Name</label>
-            <input type="text" id="setupDisplayNameInput" class="search-input" style="width: 100%; border-radius: var(--r-sm);" placeholder="System Administrator" autocomplete="name">
-          </div>
-          <div class="form-group" style="margin-bottom: 12px;">
-            <label for="setupUsernameInput" class="form-label" style="display: block; margin-bottom: 6px; font-size: 12px; font-weight: 500; color: var(--text-secondary);">Admin Username *</label>
-            <input type="text" id="setupUsernameInput" class="search-input" style="width: 100%; border-radius: var(--r-sm);" placeholder="admin" required autocomplete="username">
-          </div>
-          <div class="form-group" style="margin-bottom: 12px;">
-            <label for="setupPasswordInput" class="form-label" style="display: block; margin-bottom: 6px; font-size: 12px; font-weight: 500; color: var(--text-secondary);">Password (min. 6 chars) *</label>
-            <input type="password" id="setupPasswordInput" class="search-input" style="width: 100%; border-radius: var(--r-sm);" placeholder="••••••••••••" required autocomplete="new-password">
-          </div>
-          <div class="form-group" style="margin-bottom: 16px;">
-            <label for="setupConfirmPasswordInput" class="form-label" style="display: block; margin-bottom: 6px; font-size: 12px; font-weight: 500; color: var(--text-secondary);">Confirm Password *</label>
-            <input type="password" id="setupConfirmPasswordInput" class="search-input" style="width: 100%; border-radius: var(--r-sm);" placeholder="••••••••••••" required autocomplete="new-password">
-          </div>
-          <div id="setupError" class="form-error hidden" style="margin-bottom: 14px; font-size: 12px; color: var(--critical);"></div>
-          <div style="display: flex; justify-content: flex-end;">
-            <button type="submit" id="setupSubmitBtn" class="btn btn-primary" style="padding: 9px 20px; font-weight: 600; width: 100%;">
-              Initialize & Log In
-            </button>
-          </div>
-        </form>
-      </div>
+        <div class="form-group">
+          <label for="setupDisplayNameInput" class="form-label">Full / Display Name</label>
+          <input type="text" id="setupDisplayNameInput" class="form-input" style="width: 100%;" placeholder="System Administrator" autocomplete="name">
+        </div>
+        <div class="form-group">
+          <label for="setupUsernameInput" class="form-label">Admin Username *</label>
+          <input type="text" id="setupUsernameInput" class="form-input" style="width: 100%;" placeholder="admin" required autocomplete="username">
+        </div>
+        <div class="form-group">
+          <label for="setupPasswordInput" class="form-label">Password (min. 6 chars) *</label>
+          <input type="password" id="setupPasswordInput" class="form-input" style="width: 100%;" placeholder="••••••••••••" required autocomplete="new-password">
+        </div>
+        <div class="form-group">
+          <label for="setupConfirmPasswordInput" class="form-label">Confirm Password *</label>
+          <input type="password" id="setupConfirmPasswordInput" class="form-input" style="width: 100%;" placeholder="••••••••••••" required autocomplete="new-password">
+        </div>
+        <div id="setupError" class="form-error hidden"></div>
+        <button type="submit" id="setupSubmitBtn" class="btn btn-primary btn-block">Initialize & Log In</button>
+      </form>
     </div>
   </div>
 
   <!-- User Login Modal -->
   <div id="loginModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="loginModalTitle">
-    <div class="modal-card" style="max-width: 380px;">
+    <div class="modal-card modal-card-narrow">
       <div class="modal-header">
-        <div style="display: flex; align-items: center; gap: 10px;">
-          <div style="width: 36px; height: 36px; border-radius: 50%; background: rgba(59, 130, 246, 0.15); display: flex; align-items: center; justify-content: center; color: var(--accent); flex-shrink: 0;">
+        <div class="modal-title-group">
+          <div class="modal-icon-badge">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/>
               <polyline points="10 17 15 12 10 7"/>
               <line x1="15" y1="12" x2="3" y2="12"/>
             </svg>
           </div>
-          <h3 class="modal-title" id="loginModalTitle" style="font-size: 16px; font-weight: 600; color: var(--text-primary);">Operator Login</h3>
+          <h3 class="modal-title" id="loginModalTitle">Operator Login</h3>
         </div>
         <button id="closeLoginModalBtn" class="modal-close" type="button" aria-label="Close modal">&times;</button>
       </div>
-      <div class="modal-body" style="padding-top: 10px;">
-        <form id="loginForm">
-          <div class="form-group" style="margin-bottom: 12px;">
-            <label for="loginUsernameInput" class="form-label" style="display: block; margin-bottom: 6px; font-size: 12px; font-weight: 500; color: var(--text-secondary);">Username</label>
-            <input type="text" id="loginUsernameInput" class="search-input" style="width: 100%; border-radius: var(--r-sm);" placeholder="Username" required autocomplete="username">
-          </div>
-          <div class="form-group" style="margin-bottom: 16px;">
-            <label for="loginPasswordInput" class="form-label" style="display: block; margin-bottom: 6px; font-size: 12px; font-weight: 500; color: var(--text-secondary);">Password</label>
-            <input type="password" id="loginPasswordInput" class="search-input" style="width: 100%; border-radius: var(--r-sm);" placeholder="••••••••••••" required autocomplete="current-password">
-          </div>
-          <div id="loginError" class="form-error hidden" style="margin-bottom: 14px; font-size: 12px; color: var(--critical);"></div>
-          <div style="display: flex; justify-content: flex-end; gap: 8px;">
-            <button id="cancelLoginBtn" class="btn btn-secondary" type="button" style="padding: 8px 16px;">Cancel</button>
-            <button type="submit" id="loginSubmitBtn" class="btn btn-primary" style="padding: 8px 20px; font-weight: 600;">Log In</button>
-          </div>
-        </form>
-      </div>
+      <form id="loginForm" class="modal-form">
+        <div class="form-group">
+          <label for="loginUsernameInput" class="form-label">Username</label>
+          <input type="text" id="loginUsernameInput" class="form-input" style="width: 100%;" placeholder="Username" required autocomplete="username">
+        </div>
+        <div class="form-group">
+          <label for="loginPasswordInput" class="form-label">Password</label>
+          <input type="password" id="loginPasswordInput" class="form-input" style="width: 100%;" placeholder="••••••••••••" required autocomplete="current-password">
+        </div>
+        <div id="loginError" class="form-error hidden"></div>
+        <div class="modal-actions">
+          <button id="cancelLoginBtn" class="btn btn-secondary" type="button">Cancel</button>
+          <button type="submit" id="loginSubmitBtn" class="btn btn-primary">Log In</button>
+        </div>
+      </form>
     </div>
   </div>
 
   <!-- User Management Modal (Admin Only) -->
   <div id="usersModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="usersModalTitle">
-    <div class="modal-card" style="max-width: 600px; width: 95%;">
+    <div class="modal-card modal-card-xl">
       <div class="modal-header">
-        <div style="display: flex; align-items: center; gap: 8px;">
+        <div class="modal-title-group">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
             <circle cx="9" cy="7" r="4"/>
             <path d="M23 21v-2a4 4 0 0 0-3-3.87"/>
             <path d="M16 3.13a4 4 0 0 1 0 7.75"/>
           </svg>
-          <span id="usersModalTitle" class="modal-title" style="font-weight: 700;">User Management</span>
+          <span id="usersModalTitle" class="modal-title">User Management</span>
         </div>
         <button id="closeUsersModalBtn" class="modal-close" type="button" aria-label="Close user management dialog">&times;</button>
       </div>
@@ -1385,7 +1530,7 @@
         <!-- Users List Section -->
         <div style="margin-bottom: 20px;">
           <div style="font-size: 13px; font-weight: 600; margin-bottom: 8px; color: var(--text-primary);">Existing Users</div>
-          <div id="usersListContainer" style="max-height: 180px; overflow-y: auto; border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--bg-surface);">
+          <div id="usersListContainer" style="max-height: 180px; overflow-y: auto; border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--surface);">
             <div style="padding: 12px; text-align: center; color: var(--text-muted); font-size: 12px;">Loading users...</div>
           </div>
         </div>
@@ -1398,32 +1543,32 @@
           <form id="createUserForm">
             <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px;">
               <div class="form-group">
-                <label for="newUsernameInput" class="form-label" style="display: block; margin-bottom: 4px; font-size: 12px; font-weight: 500; color: var(--text-secondary);">Username</label>
-                <input type="text" id="newUsernameInput" class="search-input" style="width: 100%; border-radius: var(--r-sm);" placeholder="e.g. operator1" required autocomplete="off">
+                <label for="newUsernameInput" class="form-label">Username</label>
+                <input type="text" id="newUsernameInput" class="form-input" style="width: 100%;" placeholder="e.g. operator1" required autocomplete="off">
               </div>
               <div class="form-group">
-                <label for="newDisplayNameInput" class="form-label" style="display: block; margin-bottom: 4px; font-size: 12px; font-weight: 500; color: var(--text-secondary);">Display Name</label>
-                <input type="text" id="newDisplayNameInput" class="search-input" style="width: 100%; border-radius: var(--r-sm);" placeholder="e.g. John Doe" autocomplete="off">
+                <label for="newDisplayNameInput" class="form-label">Display Name</label>
+                <input type="text" id="newDisplayNameInput" class="form-input" style="width: 100%;" placeholder="e.g. John Doe" autocomplete="off">
               </div>
             </div>
             <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px;">
               <div class="form-group">
-                <label for="newPasswordInput" class="form-label" style="display: block; margin-bottom: 4px; font-size: 12px; font-weight: 500; color: var(--text-secondary);">Password (min 6 chars)</label>
-                <input type="password" id="newPasswordInput" class="search-input" style="width: 100%; border-radius: var(--r-sm);" placeholder="••••••••••••" required minlength="6" autocomplete="new-password">
+                <label for="newPasswordInput" class="form-label">Password (min 6 chars)</label>
+                <input type="password" id="newPasswordInput" class="form-input" style="width: 100%;" placeholder="••••••••••••" required minlength="6" autocomplete="new-password">
               </div>
               <div class="form-group">
-                <label for="newRoleSelect" class="form-label" style="display: block; margin-bottom: 4px; font-size: 12px; font-weight: 500; color: var(--text-secondary);">Role</label>
-                <select id="newRoleSelect" class="search-input" style="width: 100%; border-radius: var(--r-sm); background: var(--bg-input); color: var(--text-primary); padding: 8px 12px;">
+                <label for="newRoleSelect" class="form-label">Role</label>
+                <select id="newRoleSelect" class="form-select">
                   <option value="viewer">Viewer (Read-Only NOC Wallboard)</option>
                   <option value="admin">Admin (Full Control)</option>
                 </select>
               </div>
             </div>
-            <div id="createUserError" class="form-error hidden" style="margin-bottom: 12px; font-size: 12px; color: var(--critical);"></div>
-            <div id="createUserSuccess" class="form-success hidden" style="margin-bottom: 12px; font-size: 12px; color: var(--success);"></div>
-            <div style="display: flex; justify-content: flex-end; gap: 8px;">
-              <button id="cancelUsersModalBtn" class="btn btn-secondary" type="button" style="padding: 8px 16px;">Close</button>
-              <button type="submit" id="createUserSubmitBtn" class="btn btn-primary" style="padding: 8px 20px; font-weight: 600;">Add User</button>
+            <div id="createUserError" class="form-error hidden" style="margin-bottom: 12px;"></div>
+            <div id="createUserSuccess" class="form-success hidden" style="margin-bottom: 12px;"></div>
+            <div class="modal-actions" style="margin-top: 0;">
+              <button id="cancelUsersModalBtn" class="btn btn-secondary" type="button">Close</button>
+              <button type="submit" id="createUserSubmitBtn" class="btn btn-primary">Add User</button>
             </div>
           </form>
         </div>

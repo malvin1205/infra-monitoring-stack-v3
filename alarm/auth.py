@@ -47,6 +47,8 @@ ROLE_PERMISSIONS: Dict[str, Set[str]] = {
         "dependencies.write",
         "telegram.read",
         "telegram.write",
+        "availability.read",
+        "availability.write",
         "users.manage",
         "alerts.ack",
         "audit.read",
@@ -57,6 +59,7 @@ ROLE_PERMISSIONS: Dict[str, Set[str]] = {
         "endpoints.read",
         "maintenance.read",
         "dependencies.read",
+        "availability.read",
     }
 }
 

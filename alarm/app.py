@@ -30,27 +30,29 @@ try:
     from fleet_availability import (
         summarize_entries, reconstruct_time_series_intervals, calculate_percentile,
         clip_hourly_bucket, merge_hybrid_target_availability, merge_hybrid_fleet_availability,
-        derive_bucket_inputs, estimate_instance_cadence
+        derive_bucket_inputs, estimate_instance_cadence, sla_budget, get_sla_target_pct,
+        get_availability_settings, save_availability_settings, classify_probe_failure
     )
 except ImportError:
     from alarm.fleet_availability import (
         summarize_entries, reconstruct_time_series_intervals, calculate_percentile,
         clip_hourly_bucket, merge_hybrid_target_availability, merge_hybrid_fleet_availability,
-        derive_bucket_inputs, estimate_instance_cadence
+        derive_bucket_inputs, estimate_instance_cadence, sla_budget, get_sla_target_pct,
+        get_availability_settings, save_availability_settings, classify_probe_failure
     )
 
 try:
     from storage import (
         init_db, IncidentRepository, EventLogRepository,
         MaintenanceRepository, DependencyRepository, EndpointRepository, DeletedTargetRepository,
-        AvailabilityBucketRepository, AggregationLeaseRepository,
+        AvailabilityBucketRepository, AggregationLeaseRepository, SlaTargetRepository, SlowThresholdRepository,
         UserRepository, AcknowledgmentRepository, AuditLogRepository
     )
 except ImportError:
     from alarm.storage import (
         init_db, IncidentRepository, EventLogRepository,
         MaintenanceRepository, DependencyRepository, EndpointRepository, DeletedTargetRepository,
-        AvailabilityBucketRepository, AggregationLeaseRepository,
+        AvailabilityBucketRepository, AggregationLeaseRepository, SlaTargetRepository, SlowThresholdRepository,
         UserRepository, AcknowledgmentRepository, AuditLogRepository
     )
 
@@ -345,6 +347,7 @@ def load_endpoints():
 
 DEFAULT_JOB_FILTER = os.environ.get("JOB_FILTER", "all")
 ALERTNAME_TARGET_DOWN = "TargetDown"
+ALERTNAME_SLOW_RESPONSE = "SlowResponse"
 
 # Minimal shape check for the Add Target form — not full RFC validation, just
 # enough to reject obvious garbage (e.g. a bare number) before it's written to
@@ -838,6 +841,31 @@ def _parse_epoch_ts(val):
         except Exception:
             return 0.0
 
+def maintenance_windows_by_instance(instances, job_map, windows=None):
+    """{instance: [(start_ts, end_ts), ...]} for maintenance windows overlapping
+    each given instance (directly, or via a job-scoped window). Used to carve
+    planned downtime out of the SLA denominator in /api/availability. Empty
+    dict when there are no windows (the common case — zero added overhead)."""
+    if windows is None:
+        windows = load_maintenance_windows()
+    if not windows or not instances:
+        return {}
+    job_map = job_map or {}
+    out = {}
+    for w in windows:
+        s = _parse_epoch_ts(w.get('start_epoch') if w.get('start_epoch') is not None else w.get('start', 0))
+        e = _parse_epoch_ts(w.get('end_epoch') if w.get('end_epoch') is not None else w.get('end', 0))
+        if e <= s:
+            continue
+        scope = w.get('scope') or w.get('scope_type')
+        target = w.get('target') or w.get('scope_target')
+        for inst in instances:
+            matched = (target == job_map.get(inst)) if scope == 'job' else (target == inst)
+            if matched:
+                out.setdefault(inst, []).append((s, e))
+    return out
+
+
 def get_active_maintenance(instance, job=None, windows=None):
     """First maintenance window currently covering this instance/job, or None."""
     if windows is None:
@@ -860,7 +888,8 @@ def get_active_maintenance(instance, job=None, windows=None):
     return None
 
 def record_alert_event(name, severity, instance, summary, job, event_time, is_now_firing,
-                        receiver='', generatorURL='', key=None, latency_ms=None):
+                        receiver='', generatorURL='', key=None, latency_ms=None,
+                        http_status_code=None, last_error=None):
     """Applies one alert firing/resolved transition to status.json/logs.json/
     history.json and SQLite database. Shared by the Alertmanager webhook and the Prometheus-poller
     fallback so both get identical transition-only dedupe and incident-history reconciliation.
@@ -899,7 +928,8 @@ def record_alert_event(name, severity, instance, summary, job, event_time, is_no
                 IncidentRepository.record_alert_event(
                     name=name, severity=severity, instance=instance, summary=summary,
                     job=job, event_time=event_time, is_now_firing=is_now_firing,
-                    receiver=receiver, generatorURL=generatorURL, key=key, latency_ms=latency_ms
+                    receiver=receiver, generatorURL=generatorURL, key=key, latency_ms=latency_ms,
+                    http_status_code=http_status_code, last_error=last_error
                 )
                 break
             except Exception as e:
@@ -938,6 +968,12 @@ def record_alert_event(name, severity, instance, summary, job, event_time, is_no
 
         history = load_json(HISTORY_FILE, [])
         if is_now_firing:
+            # occurrences/first_seen mirror IncidentRepository's SQLite
+            # semantics (see storage.py) — a re-fire of a key that already
+            # has a prior entry here increments instead of reading as a
+            # fresh "occurrences x1" (this JSON copy is a fallback only;
+            # SQLite is the source /history reads from when available).
+            prior = next((h for h in history if h.get('key') == key), None)
             history.insert(0, {
                 "key":          key,
                 "name":         name,
@@ -949,6 +985,10 @@ def record_alert_event(name, severity, instance, summary, job, event_time, is_no
                 "job":          job,
                 "receiver":     receiver,
                 "generatorURL": generatorURL,
+                "occurrences":  (prior.get('occurrences', 1) + 1) if prior else 1,
+                "first_seen":   (prior.get('first_seen') or prior.get('time')) if prior else event_time,
+                "http_status_code": http_status_code,
+                "last_error":   last_error,
             })
         else:
             for h in history:
@@ -973,19 +1013,25 @@ def record_alert_event(name, severity, instance, summary, job, event_time, is_no
         save_json(LOGS_FILE, logs[:MAX_LOGS])
         save_with_retention(HISTORY_FILE, HISTORY_ARCHIVE_FILE, history, MAX_HISTORY)
 
-        # Asynchronously dispatch Telegram notification on verified state transition
+        # Asynchronously dispatch Telegram notification on verified state transition.
+        # severity="warning" (SlowResponse) is intentionally excluded for now —
+        # response-time degradation fires far more often than a real outage,
+        # and whether it's actionable enough for Telegram is still an open
+        # decision pending a few days of real data. Dashboard/history still
+        # get it either way; only the push notification is held back.
         try:
-            dispatch_alert_async(
-                name=name,
-                severity=severity,
-                instance=instance,
-                summary=summary,
-                job=job,
-                event_time=event_time,
-                is_now_firing=is_now_firing,
-                duration_seconds=duration_seconds,
-                latency_ms=latency_ms
-            )
+            if severity != "warning":
+                dispatch_alert_async(
+                    name=name,
+                    severity=severity,
+                    instance=instance,
+                    summary=summary,
+                    job=job,
+                    event_time=event_time,
+                    is_now_firing=is_now_firing,
+                    duration_seconds=duration_seconds,
+                    latency_ms=latency_ms
+                )
         except Exception as e:
             logger.error(f"Error dispatching telegram alert: {e}")
 
@@ -1288,6 +1334,29 @@ def webhook():
     return jsonify({"ok": True})
 
 # ── Status / History / Logs ───────────────────────────────────────────────────
+def _annotate_logs_with_acknowledgment(log_rows):
+    """Live Alert Log rows are discrete past events, not ongoing state — an
+    acknowledgment isn't a property of one specific historical row, it's a
+    property of "is this instance's CURRENT outage acked right now". So this
+    joins each still-relevant 'firing' row against the live acknowledgment
+    table rather than storing ack info per log row. (Incident History uses
+    the durable incidents.acknowledged_by/at columns instead, since a
+    resolved incident needs the info to survive past the live table getting
+    cleared — see AcknowledgmentRepository.clear_resolved.)"""
+    try:
+        ack_map = AcknowledgmentRepository.get_active_acknowledgments()
+    except Exception:
+        return
+    if not ack_map:
+        return
+    for row in log_rows:
+        if row.get('event') != 'firing':
+            continue
+        ack = ack_map.get(row.get('instance'))
+        if ack:
+            row['acknowledged_by'] = ack['acknowledged_by']
+            row['acknowledged_at'] = ack['acknowledged_at']
+
 @app.route('/status')
 def status():
     state = build_canonical_monitoring_state()
@@ -1319,6 +1388,7 @@ def logs():
     try:
         data = EventLogRepository.get_logs(limit=limit)
         if data:
+            _annotate_logs_with_acknowledgment(data)
             return jsonify(data)
     except Exception:
         pass
@@ -1704,6 +1774,125 @@ def delete_maintenance_api(window_id):
     )
     return jsonify({"ok": True})
 
+# ── Per-target SLA targets API ──────────────────────────────────────────────
+# Optional per-instance SLA availability target (%). Absent -> the deployment
+# default (SLA_TARGET_PCT env / 99.9). Drives that target's compliance status
+# and error budget in /api/availability.
+@app.route('/api/sla-targets', methods=['GET'])
+@require_permission('targets.read')
+def list_sla_targets_api():
+    try:
+        targets = SlaTargetRepository.get_all()
+    except Exception:
+        targets = {}
+    return jsonify({"ok": True, "default_target_pct": get_sla_target_pct(), "targets": targets})
+
+@app.route('/api/sla-targets/<path:instance>', methods=['PUT'])
+@rate_limit(30, 60)
+@require_permission('targets.write')
+def set_sla_target_api(instance):
+    instance = (instance or '').strip()
+    if not instance:
+        return jsonify({"ok": False, "error": "Instance is required"}), 400
+    data = request.json or {}
+    try:
+        pct = float(data.get('target_pct'))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "target_pct must be a number 0-100"}), 400
+    if not (0.0 <= pct <= 100.0):
+        return jsonify({"ok": False, "error": "target_pct must be between 0 and 100"}), 400
+
+    saved = SlaTargetRepository.set_target(instance, pct, updated_by=g.current_user.get("username"))
+    clear_availability_cache(clear_db=False)
+    AuditLogRepository.record_action(
+        actor_username=g.current_user.get("username", "admin"),
+        actor_role=g.current_user.get("role", "admin"),
+        action="SET_SLA_TARGET",
+        resource=instance,
+        details=f"SLA target set to {saved}%"
+    )
+    return jsonify({"ok": True, "instance": instance, "target_pct": saved})
+
+@app.route('/api/sla-targets/<path:instance>', methods=['DELETE'])
+@rate_limit(30, 60)
+@require_permission('targets.write')
+def delete_sla_target_api(instance):
+    instance = (instance or '').strip()
+    try:
+        removed = SlaTargetRepository.delete_target(instance)
+    except Exception:
+        removed = False
+    if not removed:
+        return jsonify({"ok": False, "error": "No SLA target override for that instance"}), 404
+    clear_availability_cache(clear_db=False)
+    AuditLogRepository.record_action(
+        actor_username=g.current_user.get("username", "admin"),
+        actor_role=g.current_user.get("role", "admin"),
+        action="DELETE_SLA_TARGET",
+        resource=instance,
+        details="SLA target override removed (reverted to default)"
+    )
+    return jsonify({"ok": True, "instance": instance})
+
+# ── Per-target SlowResponse threshold API ───────────────────────────────────
+# Optional per-instance latency threshold (ms) for the SlowResponse warning
+# alert. Absent -> DEFAULT_SLOW_RESPONSE_THRESHOLD_MS applies. A naturally
+# slower target (e.g. an overseas endpoint) isn't "degraded" at the global
+# default — override it here instead of it flapping warning forever.
+@app.route('/api/slow-thresholds', methods=['GET'])
+@require_permission('targets.read')
+def list_slow_thresholds_api():
+    try:
+        thresholds = SlowThresholdRepository.get_all()
+    except Exception:
+        thresholds = {}
+    return jsonify({"ok": True, "default_threshold_ms": DEFAULT_SLOW_RESPONSE_THRESHOLD_MS, "thresholds": thresholds})
+
+@app.route('/api/slow-thresholds/<path:instance>', methods=['PUT'])
+@rate_limit(30, 60)
+@require_permission('targets.write')
+def set_slow_threshold_api(instance):
+    instance = (instance or '').strip()
+    if not instance:
+        return jsonify({"ok": False, "error": "Instance is required"}), 400
+    data = request.json or {}
+    try:
+        ms = float(data.get('threshold_ms'))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "threshold_ms must be a number"}), 400
+    if ms < 0:
+        return jsonify({"ok": False, "error": "threshold_ms must be >= 0"}), 400
+
+    saved = SlowThresholdRepository.set_threshold(instance, ms, updated_by=g.current_user.get("username"))
+    AuditLogRepository.record_action(
+        actor_username=g.current_user.get("username", "admin"),
+        actor_role=g.current_user.get("role", "admin"),
+        action="SET_SLOW_THRESHOLD",
+        resource=instance,
+        details=f"SlowResponse threshold set to {saved}ms"
+    )
+    return jsonify({"ok": True, "instance": instance, "threshold_ms": saved})
+
+@app.route('/api/slow-thresholds/<path:instance>', methods=['DELETE'])
+@rate_limit(30, 60)
+@require_permission('targets.write')
+def delete_slow_threshold_api(instance):
+    instance = (instance or '').strip()
+    try:
+        removed = SlowThresholdRepository.delete_threshold(instance)
+    except Exception:
+        removed = False
+    if not removed:
+        return jsonify({"ok": False, "error": "No SlowResponse threshold override for that instance"}), 404
+    AuditLogRepository.record_action(
+        actor_username=g.current_user.get("username", "admin"),
+        actor_role=g.current_user.get("role", "admin"),
+        action="DELETE_SLOW_THRESHOLD",
+        resource=instance,
+        details="SlowResponse threshold override removed (reverted to default)"
+    )
+    return jsonify({"ok": True, "instance": instance})
+
 # ── Alert Correlation (Phase 12) ─────────────────────────────────────────────
 # A "depends on" link between two instances, used only to decide what to
 # visually de-emphasize on the wallboard when both ends are down at once.
@@ -1855,6 +2044,37 @@ def test_telegram_api():
         return jsonify({"ok": True, "message": "Test notification sent successfully to Telegram"})
     return jsonify({"ok": False, "error": msg}), 400
 
+# ── Availability / SLA Settings API ──────────────────────────────────────────
+@app.route('/api/settings/availability', methods=['GET'])
+@rate_limit(20, 60)
+@require_permission('availability.read')
+def get_availability_settings_api():
+    settings = get_availability_settings()
+    return jsonify({
+        "ok": True,
+        "use_node_exporter_correlation": settings.get("use_node_exporter_correlation", False),
+    })
+
+@app.route('/api/settings/availability', methods=['POST'])
+@rate_limit(20, 60)
+@require_permission('availability.write')
+def save_availability_settings_api():
+    data = request.json or {}
+    updated = {}
+    if "use_node_exporter_correlation" in data:
+        updated["use_node_exporter_correlation"] = bool(data["use_node_exporter_correlation"])
+
+    if save_availability_settings(updated):
+        AuditLogRepository.record_action(
+            actor_username=g.current_user.get("username", "admin"),
+            actor_role=g.current_user.get("role", "admin"),
+            action="UPDATE_AVAILABILITY_SETTINGS",
+            resource="availability_settings",
+            details=f"Set use_node_exporter_correlation={updated.get('use_node_exporter_correlation')}"
+        )
+        return jsonify({"ok": True, "message": "Availability settings saved"})
+    return jsonify({"ok": False, "error": "Failed to save settings"}), 500
+
 def fetch_prom_query_map(query_expr, cache_ttl=5.0, timeout=None):
     raw, base = fetch_prometheus_json(f"/api/v1/query?query={quote(query_expr)}", use_cache=True, cache_ttl=cache_ttl, timeout=timeout)
     val_map = {}
@@ -1867,6 +2087,43 @@ def fetch_prom_query_map(query_expr, cache_ttl=5.0, timeout=None):
             if inst and val is not None:
                 val_map[inst] = val
     return val_map
+
+
+def fetch_prom_range_map(query_expr, start_ts, end_ts, step_sec, cache_ttl=5.0, timeout=None):
+    """Range query -> {instance: [(ts_float, 0|1), ...]} sorted by ts.
+
+    Used by the availability aggregator to feed raw probe samples straight
+    into reconstruct_time_series_intervals() (the exact engine) instead of
+    approximating from avg_over_time(). Values are coerced to 0/1 the same
+    way reconstruct_time_series_intervals does. Returns {} on any failure so
+    callers can fall back to the scalar path per-instance.
+    """
+    step = max(1, int(round(step_sec)))
+    path = (
+        f"/api/v1/query_range?query={quote(query_expr)}"
+        f"&start={int(start_ts)}&end={int(end_ts)}&step={step}"
+    )
+    raw, _ = fetch_prometheus_json(path, use_cache=True, cache_ttl=cache_ttl, timeout=timeout)
+    series = {}
+    if not raw or raw.get('status') != 'success':
+        return series
+    for r in raw.get('data', {}).get('result', []):
+        labels = r.get('metric', {})
+        inst = labels.get('instance') or labels.get('target') or labels.get('url')
+        if not inst:
+            continue
+        pts = []
+        for pair in r.get('values', []):
+            try:
+                ts = float(pair[0])
+                v = 1 if str(pair[1]) in ('1', '1.0', 'up', 'true', 'True') else 0
+                pts.append((ts, v))
+            except (ValueError, TypeError, IndexError):
+                continue
+        if pts:
+            pts.sort(key=lambda p: p[0])
+            series[inst] = pts
+    return series
 
 def fetch_down_since_prom_map(cache_ttl=10.0):
     last_up_map = {}
@@ -1942,6 +2199,41 @@ def classify_scrape_failure(health, last_error, http_status):
 
     return {"category": "Unknown", "detail": "No error detail available (probe_success=0)"}
 
+# ── Node Exporter infrastructure correlation ─────────────────────────────────
+# Only active when the "Use Node Exporter for infrastructure-aware
+# availability" setting is ON (see get_availability_settings). Matches a
+# blackbox/custom target to a Node Exporter `up` reading by HOST alone,
+# ignoring scheme/port on both sides -- the blackbox `instance` label (a URL
+# or bare address) and Node Exporter's (host:9100) essentially never share a
+# literal string. classify_probe_failure() (fleet_availability.py) then turns
+# that match into a service-vs-infrastructure label; this function only does
+# the host lookup.
+def _extract_host(addr):
+    if not addr:
+        return ""
+    a = str(addr).strip()
+    if "://" in a:
+        a = urlparse(a).netloc or a
+    a = a.split("@")[-1].split("/")[0]
+    # Strip a trailing :port. ponytail: naive for bracketed IPv6 literals,
+    # fine for the IPv4/hostname targets this app actually manages.
+    if a.count(":") == 1:
+        host, _, port = a.rpartition(":")
+        if port.isdigit():
+            a = host
+    return a.lower()
+
+def find_node_exporter_status(target_addr, node_exporter_up_map):
+    """Returns (found, healthy) for the Node Exporter instance matching
+    target_addr's host, or (False, False) if this target has none."""
+    target_host = _extract_host(target_addr)
+    if not target_host:
+        return False, False
+    for ne_instance, val in node_exporter_up_map.items():
+        if _extract_host(ne_instance) == target_host:
+            return True, str(val) in ('1', '1.0')
+    return False, False
+
 def fetch_all_probe_metrics(cache_ttl=3.0, timeout=None):
     f_succ = _SHARED_EXECUTOR.submit(fetch_prom_query_map, "probe_success", cache_ttl, timeout)
     f_dur = _SHARED_EXECUTOR.submit(fetch_prom_query_map, "probe_duration_seconds", cache_ttl, timeout)
@@ -1955,6 +2247,24 @@ def fetch_all_probe_metrics(cache_ttl=3.0, timeout=None):
         success_map = fetch_prom_query_map("up", cache_ttl=cache_ttl, timeout=timeout)
 
     return success_map, duration_map, status_code_map
+
+# ── Outage debounce ────────────────────────────────────────────────────────────
+# A target must be continuously down for at least this long before it counts as
+# an outage — i.e. before it drives system_status to CRITICAL, sounds the
+# frontend alarm, or fires a Telegram alert. Suppresses false alarms from
+# momentary blips (one failed scrape, a brief network hiccup) that recover on
+# their own. Webhook-delivered alerts are NOT gated here — Alertmanager has its
+# own `for:` delay.
+OUTAGE_GRACE_SECONDS = float(os.environ.get("OUTAGE_GRACE_SECONDS", "15"))
+
+def _outage_past_grace(down_since_ts, now=None):
+    """False while a target has been down for less than OUTAGE_GRACE_SECONDS.
+    down_since_ts is Prometheus's last-seen-up timestamp (item['downSince']).
+    Fail-open: a missing/zero start time (Prometheus has no last-up sample at
+    all) is treated as past grace so a real outage is never hidden."""
+    if not down_since_ts:
+        return True
+    return ((now or time.time()) - down_since_ts) >= OUTAGE_GRACE_SECONDS
 
 # ── Canonical Monitoring State Engine ───────────────────────────────────────
 def _derive_probe_readings(keys, probe_success_map, probe_duration_map, probe_status_code_map,
@@ -2054,10 +2364,25 @@ def build_canonical_monitoring_state(job_param=None):
     if not has_down and raw_targets and raw_targets.get('status') == 'success':
         has_down = any(t.get('health') != 'up' for t in raw_targets.get('data', {}).get('activeTargets', []))
 
+    use_node_exporter_correlation = get_availability_settings().get("use_node_exporter_correlation", False)
+
     if has_down:
         down_since_prom_map = fetch_down_since_prom_map(cache_ttl=10.0)
+        # Bulk single query (same shape as probe_success_map above), only
+        # ever fetched when the setting is ON and something is actually
+        # down -- mirrors down_since_prom_map's own "only when needed" gate.
+        node_exporter_up_map = fetch_prom_query_map('up{job="node_exporter"}', cache_ttl=10.0) if use_node_exporter_correlation else {}
     else:
         down_since_prom_map = {}
+        node_exporter_up_map = {}
+
+    def _infra_correlation_for(health, addr):
+        """None when the setting is OFF or the target is up -- classification
+        never runs, so OFF is byte-for-byte the pre-existing behavior."""
+        if not use_node_exporter_correlation or health == 'up':
+            return None
+        found, healthy = find_node_exporter_status(addr, node_exporter_up_map)
+        return classify_probe_failure(True, found, healthy)
 
     config_web_targets = load_website_targets()
     deleted_targets = set(load_deleted_targets())
@@ -2124,6 +2449,7 @@ def build_canonical_monitoring_state(job_param=None):
                     probe_status_code_map, down_since_prom_map, raw_target=t
                 )
                 classification = classify_scrape_failure(health, last_error, http_code)
+                infra_correlation = _infra_correlation_for(health, scrape_url or inst_name)
 
                 matched_alerts = alerts_by_instance.get(inst_name, []) + [
                     a for a in alerts_by_instance.get(scrape_url, [])
@@ -2142,6 +2468,7 @@ def build_canonical_monitoring_state(job_param=None):
                     "lastError":       last_error,
                     "failureCategory": classification["category"],
                     "failureDetail":   classification["detail"],
+                    "infraCorrelation": infra_correlation,
                     "labels":          labels,
                     "isWeb":           False,
                     "downSince":       down_since_val,
@@ -2156,6 +2483,7 @@ def build_canonical_monitoring_state(job_param=None):
                 probe_status_code_map, down_since_prom_map, raw_target=None
             )
             classification = classify_scrape_failure(health, last_error, http_code)
+            infra_correlation = _infra_correlation_for(health, target_url)
             matched_alerts = alerts_by_instance.get(target_url, [])
 
             result.append({
@@ -2170,6 +2498,7 @@ def build_canonical_monitoring_state(job_param=None):
                 "lastError":       "",
                 "failureCategory": classification["category"],
                 "failureDetail":   classification["detail"],
+                "infraCorrelation": infra_correlation,
                 "labels":          {"job": "custom", "instance": target_url},
                 "isWeb":           False,
                 "downSince":       down_since_val,
@@ -2235,6 +2564,7 @@ def build_canonical_monitoring_state(job_param=None):
         item['acknowledged_at'] = ack_rec['acknowledged_at'] if ack_rec else None
 
     # Derive authoritative target-level severity & effective_status
+    _now_wall = time.time()
     for item in result:
         is_down = item['health'] != 'up'
         is_maint = item['maintenance']
@@ -2243,8 +2573,14 @@ def build_canonical_monitoring_state(job_param=None):
         has_crit_alert = any(a.get('severity') == 'critical' for a in item.get('active_alerts', []))
         has_warn_alert = any(a.get('severity') == 'warning' for a in item.get('active_alerts', []))
 
+        # Debounce: a down target isn't a confirmed outage until it's been down
+        # for OUTAGE_GRACE_SECONDS. Within the window it still renders as down,
+        # but doesn't count toward alarms / CRITICAL.
+        confirmed_outage = is_down and _outage_past_grace(item.get('downSince'), _now_wall)
+        item['pending_outage'] = is_down and not confirmed_outage
+
         # Is target actionable / alarmable?
-        is_alarmable = (is_down or has_crit_alert or has_warn_alert) and not is_maint and not is_supp
+        is_alarmable = (confirmed_outage or has_crit_alert or has_warn_alert) and not is_maint and not is_supp
         item['is_alarmable'] = is_alarmable
 
         # Effective severity
@@ -2451,6 +2787,23 @@ def get_monitored_instances(job_filter=None):
 
 # ── Availability (historical uptime %) ────────────────────────────────────────
 # ── Availability (historical uptime %) ────────────────────────────────────────
+def _attach_sla_budgets(summary_dict, window_sec, default_target_pct, project_days, target_map=None):
+    """Compute the SLA error budget per target (mutating the per_server
+    values) and for the fleet, from the maintenance-excluded downtime/observed
+    figures. `target_map` gives per-instance SLA target overrides; the fleet
+    budget uses the deployment default. Returns the fleet-level budget dict."""
+    target_map = target_map or {}
+    for e in summary_dict.get("per_server", {}).get("values", []):
+        dt = e.get("sla_downtime_seconds", e.get("downtime_seconds", 0.0)) or 0.0
+        obs = e.get("sla_observed_seconds", e.get("observed_seconds", 0.0)) or 0.0
+        tp = target_map.get(e.get("id"), e.get("sla_target_pct") or default_target_pct)
+        e["sla_budget"] = sla_budget(dt, obs, tp, window_sec, project_days)
+    fa = summary_dict.get("fleet_aggregate", {}) or {}
+    f_dt = float(fa.get("total_downtime_minutes") or 0.0) * 60.0
+    f_obs = float(fa.get("total_observed_minutes") or 0.0) * 60.0
+    return sla_budget(f_dt, f_obs, default_target_pct, window_sec, project_days)
+
+
 @app.route('/api/availability')
 @rate_limit(120, 60)
 def api_availability():
@@ -2470,6 +2823,21 @@ def api_availability():
         minutes = days * 1440.0
     minutes = max(1.0, min(minutes, 90 * 1440.0))
     minutes_int = int(round(minutes))
+
+    # SLA error-budget target/period (optional overrides; default 99.9% / 30d)
+    try:
+        sla_target_pct = max(0.0, min(100.0, float(request.args.get('sla_target'))))
+    except (TypeError, ValueError):
+        sla_target_pct = get_sla_target_pct()
+    try:
+        sla_days = max(1, min(365, int(float(request.args.get('sla_days', 30)))))
+    except (TypeError, ValueError):
+        sla_days = 30
+    try:
+        sla_target_map = SlaTargetRepository.get_all()
+    except Exception:
+        sla_target_map = {}
+    sla_map_sig = hash(tuple(sorted(sla_target_map.items()))) if sla_target_map else 0
 
     end_ts = None
     end_param = request.args.get('end')
@@ -2498,7 +2866,7 @@ def api_availability():
         norm_end = f"live_{bucket_ts}"
         effective_ttl = avail_cache_ttl
 
-    avail_cache_key = f"avail:{active_url}:{norm_job}:{minutes_int}:{norm_end}"
+    avail_cache_key = f"avail:{active_url}:{norm_job}:{minutes_int}:{norm_end}:sla{sla_target_pct}/{sla_days}/{sla_map_sig}"
 
     # 1. Fast path: server in-memory availability cache hit
     t_cache_check_start = time.perf_counter()
@@ -2550,6 +2918,7 @@ def api_availability():
                     "offline": 0,
                 },
                 "overall": None,
+                "sla": sla_budget(0.0, 0.0, sla_target_pct, minutes * 60.0, sla_days),
                 "fleet_aggregate": empty_summary["fleet_aggregate"],
                 "fleet_average": empty_summary["fleet_average"],
                 "health_ratio": empty_summary["health_ratio"],
@@ -2568,6 +2937,20 @@ def api_availability():
             with _AVAILABILITY_CACHE_LOCK:
                 _AVAILABILITY_CACHE[avail_cache_key] = (now_under_lock, payload)
             return jsonify(payload)
+
+        # Maintenance windows overlapping this query window -> carved out of
+        # the SLA denominator downstream. Skip entirely (and skip the job-map
+        # lookup) when there are none.
+        _maint_windows = [
+            w for w in load_maintenance_windows()
+            if _parse_epoch_ts(w.get('end_epoch') if w.get('end_epoch') is not None else w.get('end', 0)) > req_start
+            and _parse_epoch_ts(w.get('start_epoch') if w.get('start_epoch') is not None else w.get('start', 0)) < req_end
+        ]
+        maint_by_inst = None
+        if _maint_windows:
+            _needs_job = any((w.get('scope') or w.get('scope_type')) == 'job' for w in _maint_windows)
+            _job_map = get_instance_job_map(job_filter) if _needs_job else {}
+            maint_by_inst = maintenance_windows_by_instance(monitored_instances, _job_map, _maint_windows) or None
 
         # 3. Retrieve SQLite bucket records in the window [req_start, req_end]
         t_sqlite_start = time.perf_counter()
@@ -2619,10 +3002,13 @@ def api_availability():
                 sqlite_buckets=db_bucket_records,
                 prom_results_map={},
                 expected_interval_sec=SCRAPE_INTERVAL_SECONDS,
+                maintenance_by_instance=maint_by_inst,
+                sla_threshold_by_instance=sla_target_map,
             )
             t_merge_end = time.perf_counter()
             merge_duration_ms = (t_merge_end - t_merge_start) * 1000.0
 
+            fleet_sla_budget = _attach_sla_budgets(summary_dict, minutes * 60.0, sla_target_pct, sla_days, target_map=sla_target_map)
             hybrid_meta = summary_dict.get("hybrid", {})
             counts = {"online": 0, "warning": 0, "offline": 0}
             for e in entries:
@@ -2671,12 +3057,16 @@ def api_availability():
                 "requested_window_seconds": hybrid_meta.get("requested_window_seconds", round(minutes * 60.0, 1)),
                 "coverage_seconds": hybrid_meta.get("coverage_seconds", 0.0),
                 "unknown_seconds": hybrid_meta.get("unknown_seconds", 0.0),
+                "missing_seconds": hybrid_meta.get("missing_seconds", hybrid_meta.get("unknown_seconds", 0.0)),
                 "sqlite_seconds": hybrid_meta.get("sqlite_seconds", 0.0),
                 "prometheus_seconds": hybrid_meta.get("prometheus_seconds", 0.0),
                 "overlap_removed_seconds": hybrid_meta.get("overlap_removed_seconds", 0.0),
+                "maintenance_excluded_seconds": hybrid_meta.get("maintenance_excluded_seconds", 0.0),
+                "sla": fleet_sla_budget,
                 "coverage_percent": hybrid_meta.get("coverage_percent", 0.0),
                 "availability_percent": summary_dict['fleet_aggregate']['value'],
                 "data_status": hybrid_meta.get("data_status", "COMPLETE"),
+                "telemetry_audit": hybrid_meta.get("telemetry_audit", summary_dict.get("telemetry_audit", {})),
                 "end": end_ts,
                 "counts": {
                     "total": len(monitored_instances),
@@ -2812,9 +3202,12 @@ def api_availability():
             sqlite_buckets=db_bucket_records,
             prom_results_map=prom_results_map,
             expected_interval_sec=cadence_map,
+            maintenance_by_instance=maint_by_inst,
+            sla_threshold_by_instance=sla_target_map,
         )
         t_merge_end = time.perf_counter()
         merge_duration_ms = (t_merge_end - t_merge_start) * 1000.0
+        fleet_sla_budget = _attach_sla_budgets(summary_dict, minutes * 60.0, sla_target_pct, sla_days, target_map=sla_target_map)
         hybrid_meta = summary_dict.get("hybrid", {})
 
         # Materialize completed hourly buckets in tests or background
@@ -2932,12 +3325,16 @@ def api_availability():
             "requested_window_seconds": hybrid_meta.get("requested_window_seconds", round(minutes * 60.0, 1)),
             "coverage_seconds": hybrid_meta.get("coverage_seconds", 0.0),
             "unknown_seconds": hybrid_meta.get("unknown_seconds", 0.0),
+            "missing_seconds": hybrid_meta.get("missing_seconds", hybrid_meta.get("unknown_seconds", 0.0)),
             "sqlite_seconds": hybrid_meta.get("sqlite_seconds", 0.0),
             "prometheus_seconds": hybrid_meta.get("prometheus_seconds", 0.0),
             "overlap_removed_seconds": hybrid_meta.get("overlap_removed_seconds", 0.0),
+            "maintenance_excluded_seconds": hybrid_meta.get("maintenance_excluded_seconds", 0.0),
+            "sla": fleet_sla_budget,
             "coverage_percent": hybrid_meta.get("coverage_percent", 0.0),
             "availability_percent": summary_dict['fleet_aggregate']['value'],
             "data_status": hybrid_meta.get("data_status", "PARTIAL"),
+            "telemetry_audit": hybrid_meta.get("telemetry_audit", summary_dict.get("telemetry_audit", {})),
             "end": end_ts,
             "counts": {
                 "total": len(monitored_instances),
@@ -3300,7 +3697,13 @@ def health():
 ALERT_POLL_INTERVAL_SECONDS = float(os.environ.get("ALERT_POLL_INTERVAL", "15"))
 WEBHOOK_ACTIVE_WINDOW_SECONDS = 120
 
+# SlowResponse (warning-severity, up-but-degraded) config. See
+# compute_slow_response_transitions() for the debounce rule this backs.
+DEFAULT_SLOW_RESPONSE_THRESHOLD_MS = float(os.environ.get("SLOW_RESPONSE_THRESHOLD_MS", "500"))
+SLOW_RESPONSE_DEBOUNCE_N = int(os.environ.get("SLOW_RESPONSE_DEBOUNCE_N", "3"))
+
 _poller_state = {}  # instance -> 'up' | 'down', seeded from status.json at startup
+_slow_poller_state = {}  # instance -> {'consec_slow', 'consec_fast', 'firing'} for SlowResponse debounce
 _maintenance_active_prev = set()  # instance-scoped maintenance windows active as of the last poll tick
 _LAST_POLLER_TICK = [0.0]  # heartbeat for /health — set every tick, whether or not it did work
 
@@ -3327,6 +3730,55 @@ def compute_state_transitions(success_map, prev_state):
             transitions.append((inst, is_up))
     return transitions, new_state
 
+def compute_slow_response_transitions(readings, prev_state, thresholds, debounce_n=SLOW_RESPONSE_DEBOUNCE_N):
+    """Pure function (same shape as compute_state_transitions): given
+    instance->(is_up, response_time_ms) readings and the last debounce state
+    per instance, return (transitions, updated_state).
+
+    Response time is naturally noisy — firing/resolving on a single sample
+    would flap exactly like the occurrence-counting bug Incident History
+    task #1 fixed, just for a new alert type. Requires `debounce_n`
+    CONSECUTIVE over-threshold samples to fire, and `debounce_n` consecutive
+    under-threshold samples to resolve — one bad or one good sample alone
+    changes nothing. A target going DOWN supersedes "slow": streaks reset
+    and a firing SlowResponse resolves immediately (being down isn't a
+    degraded-but-up condition, it's TargetDown's job).
+
+    thresholds: {instance: threshold_ms}, missing -> caller's global default.
+    """
+    transitions = []
+    new_state = {}
+    for inst, (is_up, rt_ms) in readings.items():
+        st = dict(prev_state.get(inst) or {'consec_slow': 0, 'consec_fast': 0, 'firing': False})
+
+        if not is_up:
+            st['consec_slow'] = 0
+            st['consec_fast'] = 0
+            if st['firing']:
+                st['firing'] = False
+                transitions.append((inst, False))
+            new_state[inst] = st
+            continue
+
+        threshold = thresholds.get(inst, DEFAULT_SLOW_RESPONSE_THRESHOLD_MS)
+        is_slow_now = rt_ms is not None and rt_ms > threshold
+        if is_slow_now:
+            st['consec_slow'] += 1
+            st['consec_fast'] = 0
+        else:
+            st['consec_fast'] += 1
+            st['consec_slow'] = 0
+
+        if not st['firing'] and st['consec_slow'] >= debounce_n:
+            st['firing'] = True
+            transitions.append((inst, True))
+        elif st['firing'] and st['consec_fast'] >= debounce_n:
+            st['firing'] = False
+            transitions.append((inst, False))
+
+        new_state[inst] = st
+    return transitions, new_state
+
 def _seed_poller_state():
     # Currently-firing alerts (survived from before a backend restart) seed
     # as 'down' so we don't re-fire a duplicate "went offline" for an outage
@@ -3339,20 +3791,22 @@ def _seed_poller_state():
             _poller_state[inst] = 'down'
 
 def _reconcile_orphaned_alerts(monitored_instances):
-    """Auto-resolves TargetDown alerts whose instance no longer exists in the
-    monitored set at all — e.g. removed from Prometheus's scrape config
-    entirely, not merely down. Without this, such an alert can never be
-    observed recovering (compute_state_transitions only looks at instances
-    still present in success_map/instances) and stays firing forever,
-    permanently pinning status.json to CRITICAL. See AUDIT.md.
-    Only touches poller-owned TargetDown alerts, and only runs when `instances`
-    is non-empty (i.e. Prometheus itself is reachable) — see call site."""
+    """Auto-resolves poller-owned alerts (TargetDown, SlowResponse) whose
+    instance no longer exists in the monitored set at all — e.g. removed
+    from Prometheus's scrape config entirely, not merely down. Without this,
+    such an alert can never be observed recovering (compute_state_transitions
+    / compute_slow_response_transitions only look at instances still present
+    in success_map/instances) and stays firing forever, permanently pinning
+    status.json to CRITICAL/WARNING. See AUDIT.md.
+    Only touches poller-owned alerts, and only runs when `instances` is
+    non-empty (i.e. Prometheus itself is reachable) — see call site."""
     status_data = load_json(STATUS_FILE, {"alerts": []})
     orphaned = [
         a for a in status_data.get('alerts', [])
-        if a.get('name') == ALERTNAME_TARGET_DOWN and a.get('instance') not in monitored_instances
+        if a.get('name') in (ALERTNAME_TARGET_DOWN, ALERTNAME_SLOW_RESPONSE) and a.get('instance') not in monitored_instances
     ]
     for a in orphaned:
+        _slow_poller_state.pop(a.get('instance'), None)
         record_alert_event(
             name=a.get('name'),
             severity=a.get('severity', 'critical'),
@@ -3384,8 +3838,19 @@ def _poll_targets_once():
     # Instance-scoped maintenance: freeze this instance's tracked state for
     # the window so no transition is recorded, then force one fresh check the
     # moment the window ends — "auto resume monitoring". If it's still down,
-    # that's now a real transition and a fresh incident is raised; if it
-    # recovered, prev==new and nothing fires.
+    # that's now a real transition (compute_state_transitions sees the forced
+    # 'up' vs the real 'down') and a fresh incident is raised; record_alert_
+    # event()'s own dedup no-ops it harmlessly if that incident was already
+    # firing from before the window.
+    #
+    # If it instead recovered WHILE under maintenance, compute_state_
+    # transitions sees forced-'up' == actual 'up' and never emits an event at
+    # all — so a TargetDown incident that started before the window and
+    # recovered silently during it would stay "firing" in SQLite forever
+    # (the poller never evaluates a maintained instance, so no resolve is
+    # ever recorded any other way). Confirm the real state right here instead
+    # and explicitly resolve — record_alert_event() no-ops safely if nothing
+    # was actually firing.
     # ponytail: job-scoped maintenance is enforced only in record_alert_event()
     # (still no false incident/alarm) — this resume nudge is instance-only;
     # extend to jobs if job-wide maintenance flapping becomes a problem.
@@ -3393,14 +3858,44 @@ def _poll_targets_once():
     active_now = {inst for inst in instances if get_active_maintenance(inst, windows=windows)}
     for inst in _maintenance_active_prev - active_now:
         _poller_state[inst] = 'up'
+        _slow_poller_state.pop(inst, None)  # fresh debounce streak once monitoring resumes
+        val = success_map.get(inst)
+        if val is not None and str(val) in ('1', '1.0'):
+            record_alert_event(
+                name=ALERTNAME_TARGET_DOWN,
+                severity="critical",
+                instance=inst,
+                summary=f"{inst} recovered (confirmed after maintenance window ended)",
+                job="blackbox",
+                event_time=time.time(),
+                is_now_firing=False,
+                receiver="prometheus-poller",
+                key=f"{ALERTNAME_TARGET_DOWN}|{inst}",
+            )
     _maintenance_active_prev.clear()
     _maintenance_active_prev.update(active_now)
 
     scoped = {inst: v for inst, v in success_map.items() if inst in instances and inst not in active_now}
     transitions, new_state = compute_state_transitions(scoped, _poller_state)
-    _poller_state.update(new_state)
 
     now = time.time()
+
+    # Debounce down-transitions: don't fire an outage until the target has been
+    # down for OUTAGE_GRACE_SECONDS (same gate as build_canonical_monitoring_state).
+    # A held instance is left UNLATCHED in _poller_state so the next tick
+    # re-checks it — a blip that recovers inside the window never fires.
+    if any(not is_up for _, is_up in transitions):
+        down_since_map = fetch_down_since_prom_map()
+        held = []
+        for inst, is_up in transitions:
+            if not is_up and not _outage_past_grace(down_since_map.get(inst), now):
+                new_state[inst] = _poller_state.get(inst, 'up')
+            else:
+                held.append((inst, is_up))
+        transitions = held
+
+    _poller_state.update(new_state)
+
     for inst, is_up in transitions:
         lat = duration_map.get(inst)
         try:
@@ -3408,6 +3903,8 @@ def _poll_targets_once():
         except (TypeError, ValueError):
             latency_ms = None
 
+        http_status_code = status_code_map.get(inst)
+        last_error = None
         if is_up:
             summary = f"{inst} recovered"
         else:
@@ -3415,8 +3912,9 @@ def _poll_targets_once():
             # lastError (that lives on /api/v1/targets, which this loop
             # doesn't fetch), so this degrades to HTTP-code-based
             # classification or "Unknown", same as any other probe-only target.
-            classification = classify_scrape_failure('down', '', status_code_map.get(inst))
+            classification = classify_scrape_failure('down', '', http_status_code)
             summary = f"{inst} is unreachable ({classification['category']})"
+            last_error = classification['detail']
 
         record_alert_event(
             name=ALERTNAME_TARGET_DOWN,
@@ -3429,6 +3927,52 @@ def _poll_targets_once():
             receiver="prometheus-poller",
             key=f"{ALERTNAME_TARGET_DOWN}|{inst}",
             latency_ms=latency_ms,
+            http_status_code=http_status_code,
+            last_error=last_error,
+        )
+
+    # SlowResponse (warning-severity): evaluated every tick for every
+    # currently-scoped instance, independent of whether TargetDown had a
+    # transition — the debounce needs a consecutive-sample count, not just
+    # the ticks where something already changed. See
+    # compute_slow_response_transitions() for the debounce/threshold rules.
+    readings = {}
+    for inst, val in scoped.items():
+        lat = duration_map.get(inst)
+        try:
+            rt_ms = round(float(lat) * 1000, 1) if lat is not None else None
+        except (TypeError, ValueError):
+            rt_ms = None
+        readings[inst] = (str(val) in ('1', '1.0'), rt_ms)
+
+    try:
+        slow_thresholds = SlowThresholdRepository.get_all()
+    except Exception:
+        slow_thresholds = {}
+
+    slow_transitions, new_slow_state = compute_slow_response_transitions(
+        readings, _slow_poller_state, slow_thresholds
+    )
+    _slow_poller_state.update(new_slow_state)
+
+    for inst, is_now_firing in slow_transitions:
+        threshold = slow_thresholds.get(inst, DEFAULT_SLOW_RESPONSE_THRESHOLD_MS)
+        rt_ms = readings[inst][1]
+        summary = (
+            f"{inst} response time degraded ({rt_ms}ms > {threshold}ms threshold)" if is_now_firing
+            else f"{inst} response time recovered"
+        )
+        record_alert_event(
+            name=ALERTNAME_SLOW_RESPONSE,
+            severity="warning",
+            instance=inst,
+            summary=summary,
+            job="blackbox",
+            event_time=now,
+            is_now_firing=is_now_firing,
+            receiver="prometheus-poller",
+            key=f"{ALERTNAME_SLOW_RESPONSE}|{inst}",
+            latency_ms=rt_ms,
         )
 
 def _poller_loop():
@@ -3454,6 +3998,38 @@ _AVAIL_AGGREGATOR_WORKER_ID = f"{os.getpid()}_{uuid.uuid4().hex[:8]}"
 AVAIL_AGGREGATE_INTERVAL_SECONDS = 60.0
 _avail_aggregator_started = False
 
+def _availability_aggregation_windows(now, latest_end):
+    """Time windows the aggregator should (re)aggregate this cycle.
+
+    Backfill (empty/stale store): 6h windows from an hour-aligned start
+    `floor(now/3600) - 7d` up to `now`. 21600 and 86400*7 are whole
+    multiples of 3600, so every interior boundary stays hour-aligned; only
+    the final window ends at the unaligned `now` to cover the in-progress
+    hour. An unaligned start would push every boundary mid-hour (06:16:14,
+    12:16:14, ...) and, since the per-window loop floors/ceils each window
+    to whole hours, two consecutive windows would then both touch the same
+    hourly bucket — each seeing only its own slice of that hour and
+    overwriting the other, leaving the rest of that hour unaggregated.
+
+    Steady state: just the last completed hour, plus the in-progress hour
+    once it is >= 30s old.
+    """
+    if latest_end is None or latest_end < (now - 86400 * 7):
+        windows = []
+        cur_t = math.floor(now / 3600.0) * 3600.0 - 86400 * 7
+        while cur_t < now:
+            next_t = min(cur_t + 21600, now)
+            windows.append((cur_t, next_t))
+            cur_t = next_t
+        return windows
+
+    hour_end = math.floor(now / 3600.0) * 3600.0
+    windows = [(hour_end - 3600.0, hour_end)]
+    if now - hour_end >= 30.0:
+        windows.append((hour_end, now))
+    return windows
+
+
 def _aggregate_availability_cycle():
     """Incremental availability aggregation run executed only by the elected leader worker."""
     is_leader = AggregationLeaseRepository.acquire_or_renew(
@@ -3471,21 +4047,7 @@ def _aggregate_availability_cycle():
         return
 
     latest_end = AvailabilityBucketRepository.get_latest_bucket_end('all')
-    windows_to_aggregate = []
-
-    if latest_end is None or latest_end < (now - 86400 * 7):
-        backfill_start = now - 86400 * 7
-        cur_t = backfill_start
-        while cur_t < now:
-            next_t = min(cur_t + 21600, now)
-            windows_to_aggregate.append((cur_t, next_t))
-            cur_t = next_t
-    else:
-        hour_end = math.floor(now / 3600.0) * 3600.0
-        hour_start = hour_end - 3600.0
-        windows_to_aggregate.append((hour_start, hour_end))
-        if now - hour_end >= 30.0:
-            windows_to_aggregate.append((hour_end, now))
+    windows_to_aggregate = _availability_aggregation_windows(now, latest_end)
 
     for w_start, w_end in windows_to_aggregate:
         w_minutes = max(1, int(round((w_end - w_start) / 60.0)))
@@ -3517,6 +4079,25 @@ def _aggregate_availability_cycle():
                 results[k] = f.result()
             except Exception:
                 results[k] = {}
+
+        # Raw 0/1 sample stream for the exact reconstruction engine. One range
+        # query for the whole fleet per window; per instance per hour it is
+        # sliced and fed to reconstruct_time_series_intervals(). Step is
+        # coarse enough to bound the payload (all instances at once) but fine
+        # enough for hour-level accounting — sub-`range_step` blips can be
+        # missed here; the live /api/availability path still re-queries fresh
+        # and /api/target-history uses a finer step. On any failure the maps
+        # come back empty and every instance falls back to the scalar
+        # avg_over_time approximation below.
+        range_step = 15.0 if w_minutes <= 180 else 30.0
+        try:
+            probe_range_map = fetch_prom_range_map("probe_success", w_start, w_end, range_step, cache_ttl=10.0, timeout=20.0)
+        except Exception:
+            probe_range_map = {}
+        try:
+            up_range_map = fetch_prom_range_map("up", w_start, w_end, range_step, cache_ttl=10.0, timeout=20.0)
+        except Exception:
+            up_range_map = {}
 
         # Same classify-and-merge step as api_availability's materialize
         # path, via derive_bucket_inputs() — see its docstring.
@@ -3561,6 +4142,62 @@ def _aggregate_availability_cycle():
             raw_dur = duration_map.get(inst)
             raw_inc = incidents_map.get(inst)
 
+            latency = 0.0
+            if raw_dur is not None:
+                try:
+                    latency = round(float(raw_dur), 1)
+                except (ValueError, TypeError):
+                    latency = 0.0
+
+            # Exact path: raw 0/1 samples for this instance (probe_success
+            # first, fall back to the `up` series for node/exporter targets).
+            samples = probe_range_map.get(inst) or up_range_map.get(inst)
+            if samples:
+                cad = (
+                    estimate_instance_cadence(inst, count_map, first_ts_map, last_ts_map)
+                    or (fleet_median_cadence if fleet_median_cadence > 0 else range_step)
+                )
+                cur_h = h_start
+                while cur_h < h_end:
+                    nxt_h = cur_h + 3600.0
+                    if cur_h >= now:
+                        break  # never materialize a bucket for an hour that has not started
+                    eff_end = min(nxt_h, now)
+                    rec = reconstruct_time_series_intervals(
+                        samples, window_start_ts=cur_h, window_end_ts=eff_end,
+                        expected_interval_sec=cad,
+                    )
+                    hour_pts = [v for ts, v in samples if cur_h <= ts < eff_end]
+                    bucket_records.append({
+                        "instance": inst,
+                        "job": instance_job_map.get(inst, "blackbox"),
+                        "bucket_start": cur_h,
+                        "bucket_end": nxt_h,
+                        "uptime_seconds": round(rec["uptime_seconds"], 2),
+                        "downtime_seconds": round(rec["downtime_seconds"], 2),
+                        "unknown_seconds": round(rec["unknown_seconds"], 2),
+                        "coverage_seconds": round(rec["coverage_seconds"], 2),
+                        "sample_count": len(hour_pts),
+                        "availability_pct": rec["availability_pct"],
+                        "incident_count": int(rec["incident_count"]),
+                        "avg_latency_ms": latency,
+                        "updated_at": now,
+                        # per-hour outages + still-in-outage-at-hour-start/end
+                        # flags: merge_hybrid_target_availability drops the
+                        # duplicate incident where one outage straddles the
+                        # boundary between two contiguous buckets.
+                        "outage_json": {
+                            "d": [round(float(x), 1) for x in rec.get("outage_durations_sec", [])],
+                            "ongoing_start": bool(hour_pts and hour_pts[0] == 0),
+                            "ongoing_end": bool(rec.get("is_ongoing_outage")),
+                        },
+                    })
+                    cur_h = nxt_h
+                continue
+
+            # Fallback path: no raw samples (Prometheus range query failed, or
+            # short retention) — approximate from the avg_over_time / count /
+            # first-last-timestamp scalars, same as before this pass.
             avail_pct = None
             if raw_avail is not None:
                 try:
@@ -3580,7 +4217,9 @@ def _aggregate_availability_cycle():
                         span = l_ts - f_ts
                         if f_ts > 0 and l_ts > 0 and span > 0:
                             intv = span / (sample_count - 1)
-                            cov_sec = min(span + intv, w_duration_sec)
+                            lead_in = min(intv, max(0.0, f_ts - w_start)) if (f_ts - w_start) <= intv * 1.5 else 0.0
+                            lead_out = min(intv, max(0.0, w_end - l_ts)) if (w_end - l_ts) <= intv * 1.5 else 0.0
+                            cov_sec = min(span + lead_in + lead_out, w_duration_sec)
                         else:
                             eff_cad = fleet_median_cadence if fleet_median_cadence > 0 else step_sec
                             cov_sec = min(sample_count * eff_cad, w_duration_sec)
@@ -3608,13 +4247,6 @@ def _aggregate_availability_cycle():
                     inc_count = 0
             if inc_count == 0 and down_sec > 0:
                 inc_count = 1
-
-            latency = 0.0
-            if raw_dur is not None:
-                try:
-                    latency = round(float(raw_dur), 1)
-                except (ValueError, TypeError):
-                    latency = 0.0
 
             cur_h = h_start
             while cur_h < h_end:
