@@ -196,8 +196,21 @@ class RecordAlertEventTests(unittest.TestCase):
         alarm_app.HISTORY_FILE = os.path.join(self.tmpdir, "history.json")
         alarm_app.HISTORY_ARCHIVE_FILE = os.path.join(self.tmpdir, "history_archive.json")
         alarm_app.LOGS_FILE = os.path.join(self.tmpdir, "logs.json")
+        # Isolate SQLite too — record_alert_event() also writes the incidents
+        # table, and tests here (e.g. test_repeat_firing_notification_is_deduped)
+        # intentionally leave an incident firing. Without this it leaked into
+        # the shared session DB and broke count assertions elsewhere (audit F2).
+        from storage import init_db
+        self.db_path = os.path.join(self.tmpdir, "test.db")
+        init_db(self.db_path)
+        self._orig_db_env = os.environ.get("INFRAWATCH_DB_PATH")
+        os.environ["INFRAWATCH_DB_PATH"] = self.db_path
 
     def tearDown(self):
+        if self._orig_db_env is not None:
+            os.environ["INFRAWATCH_DB_PATH"] = self._orig_db_env
+        else:
+            os.environ.pop("INFRAWATCH_DB_PATH", None)
         (alarm_app.STATUS_FILE, alarm_app.HISTORY_FILE,
          alarm_app.HISTORY_ARCHIVE_FILE, alarm_app.LOGS_FILE) = self._orig
         shutil.rmtree(self.tmpdir, ignore_errors=True)

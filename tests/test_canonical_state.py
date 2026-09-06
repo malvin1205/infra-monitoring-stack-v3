@@ -246,8 +246,19 @@ class CanonicalMonitoringStateTests(unittest.TestCase):
             self.assertEqual(data['summary']['suppressed'], 1)
 
     def test_restart_while_active_incident_exists_preserves_canonical_state(self):
-        """When backend restarts with status.json containing active alert, canonical state retains it."""
+        """A real restart preserves the active incident in SQLite (the single
+        source of truth for active-alert state, audit F1); canonical state must
+        still surface it. status.json is only a denormalized cache now."""
         now = time.time()
+        from storage import IncidentRepository
+        IncidentRepository.record_alert_event(
+            name="TargetDown", severity="critical", instance="server-prod-01",
+            summary="Target server-prod-01 is unreachable", job="blackbox",
+            event_time=now - 300, is_now_firing=True, key="TargetDown|server-prod-01",
+        )
+        # Write the status.json cache too — the assertions below must pass
+        # regardless of whether it is present, proving canonical state no
+        # longer depends on it.
         save_json(alarm_app.STATUS_FILE, {
             "status": "CRITICAL",
             "alerts": [
@@ -441,6 +452,60 @@ class CanonicalMonitoringStateTests(unittest.TestCase):
         active_acks = storage.AcknowledgmentRepository.get_active_acknowledgments()
         self.assertIn("host-a", active_acks, "job-a's own ack must survive its own scoped poll")
         self.assertIn("host-b", active_acks, "host-b is still down in job-b -- a job-a-scoped poll must not clear it")
+
+    def test_unscraped_custom_target_is_no_data_not_alarm(self):
+        """A websites.yml target that no Prometheus job scrapes has health
+        'unknown' (no probe sample). It must render as no_data, must NOT be
+        alarmable, and must NOT drive CRITICAL / the siren — the phantom
+        'Down' + Critical on every startup was this being treated as an
+        outage with a fail-open (downSince=0) grace check."""
+        empty_prom = {"status": "success", "data": {"activeTargets": []}}
+        with patch.object(alarm_app, 'fetch_prometheus_json', return_value=(empty_prom, 'http://prom:9090')), \
+             patch.object(alarm_app, 'fetch_all_probe_metrics', return_value=({}, {}, {})), \
+             patch.object(alarm_app, 'fetch_down_since_prom_map', return_value={}), \
+             patch.object(alarm_app, 'load_website_targets', return_value=["10.0.0.88:9100"]):
+            data = json.loads(self.client.get('/instances').data)
+
+        self.assertEqual(data['system_status'], 'NORMAL')
+        self.assertEqual(data['summary']['alarmable_down'], 0)
+        self.assertFalse(data['summary']['has_alarm'])
+        self.assertEqual(data['summary']['no_data'], 1)
+        self.assertEqual(data['summary']['down'], 0)
+        t = next(x for x in data['targets'] if x['instance'] == "10.0.0.88:9100")
+        self.assertEqual(t['health'], 'unknown')
+        self.assertEqual(t['effective_status'], 'no_data')
+        self.assertFalse(t['is_alarmable'])
+        self.assertFalse(t['pending_outage'])
+
+    def test_resolve_alert_api_clears_sqlite_phantom(self):
+        """POST /api/alerts/resolve force-resolves an incident that is firing
+        in SQLite but absent from the status.json cache — the phantom-CRITICAL
+        case (audit F1). record_alert_event's cache-first dedupe alone would
+        no-op it, so the endpoint resolves straight against SQLite."""
+        from storage import IncidentRepository
+        now = time.time()
+        IncidentRepository.record_alert_event(
+            name="TargetDown", severity="critical", instance="ghost-host:9100",
+            summary="unreachable", job="blackbox", event_time=now - 3600,
+            is_now_firing=True, key="TargetDown|ghost-host:9100",
+        )
+        self.assertEqual(len(IncidentRepository.get_active_incidents(db_path=self.db_path)), 1)
+
+        res = self.client.post('/api/alerts/resolve', json={"key": "TargetDown|ghost-host:9100"})
+        self.assertEqual(res.status_code, 200)
+        body = json.loads(res.data)
+        self.assertTrue(body["ok"])
+        self.assertTrue(body["changed"])
+        self.assertEqual(len(IncidentRepository.get_active_incidents(db_path=self.db_path)), 0)
+
+        # Idempotent: a second resolve is a harmless no-op.
+        res2 = self.client.post('/api/alerts/resolve', json={"name": "TargetDown", "instance": "ghost-host:9100"})
+        self.assertEqual(res2.status_code, 200)
+        self.assertFalse(json.loads(res2.data)["changed"])
+
+    def test_resolve_alert_api_requires_identifier(self):
+        res = self.client.post('/api/alerts/resolve', json={})
+        self.assertEqual(res.status_code, 400)
 
 
 if __name__ == '__main__':

@@ -266,9 +266,18 @@ def get_current_authenticated_user() -> Optional[Dict[str, Any]]:
                 from alarm.storage import UserRepository
             user = UserRepository.get_by_id(user_id, include_password_hash=False)
             if user and user.get("is_active"):
+                # Signed-cookie sessions have no server-side store. A password
+                # change bumps users.session_epoch; a cookie minted before that
+                # (possibly on another device) no longer matches and is
+                # rejected here. Sessions minted before this field existed
+                # carry no "epoch" and are left alone until they expire.
+                sess_epoch = session.get("epoch")
+                if sess_epoch is not None and sess_epoch != user.get("session_epoch", 0):
+                    return None
                 role = user.get("role", "viewer")
                 perms = ROLE_PERMISSIONS.get(role, ROLE_PERMISSIONS["viewer"])
                 user_dict = dict(user)
+                user_dict.pop("session_epoch", None)
                 user_dict["is_m2m"] = False
                 user_dict["permissions"] = sorted(list(perms))
                 return user_dict

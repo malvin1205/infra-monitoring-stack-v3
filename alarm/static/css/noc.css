@@ -3,8 +3,9 @@
    Inspired by: Linear, Vercel, Better Stack, Datadog
    ============================================================================ */
 
-/* ── Google Fonts Import ──────────────────────────────── */
-@import url('https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,300;0,14..32,400;0,14..32,500;0,14..32,600;0,14..32,700;1,14..32,400&family=JetBrains+Mono:wght@400;500;600&display=swap');
+/* Fonts (Inter + JetBrains Mono) are loaded via <link rel="stylesheet"> in
+   alarm.html <head> with a preconnect — a render-blocking @import here would
+   only re-request the same sheet on a slower serialized path. */
 
 /* ── Design Tokens — Dark Mode ────────────────────────── */
 :root {
@@ -35,8 +36,8 @@
   --success-border: rgba(34, 197, 94, 0.20);
 
   --warning: #ffd500;
-  --warning-bg: rgba(245, 158, 11, 0.10);
-  --warning-border: rgba(245, 158, 11, 0.20);
+  --warning-bg: rgba(255, 213, 0, 0.10);
+  --warning-border: rgba(255, 213, 0, 0.22);
 
   --critical: #EF4444;
   --critical-bg: rgba(239, 68, 68, 0.08);
@@ -48,6 +49,30 @@
   /* Typography */
   --font: 'Inter', -apple-system, system-ui, sans-serif;
   --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+
+  /* Type scale — canonical sizes. The stylesheet still carries ~220 raw
+     font-size:Npx literals (audit F/N5); migrate them to these on touch,
+     snapping to the nearest step. Don't add new px font-sizes. */
+  --fs-2xs: 10px;
+  --fs-xs:  11px;
+  --fs-sm:  12px;
+  --fs-md:  13px;
+  --fs-base: 14px;
+  --fs-lg:  16px;
+  --fs-xl:  20px;
+  --fs-2xl: 26px;
+
+  /* Spacing scale (4px base). Same migration guidance as the type scale —
+     replace raw px padding/margin/gap with these on touch. */
+  --space-0-5: 2px;
+  --space-1: 4px;
+  --space-1-5: 6px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
 
   /* Radii */
   --r-sm: 8px;
@@ -78,7 +103,20 @@
   --bg-hover: var(--surface-hover);
   --border-focus: var(--accent);
   --r-full: 9999px;
+  --r-pill: 9999px;
 }
+
+/* ── Responsive breakpoints (canonical scale) ─────────────
+   Use these values only. Historical rules still reference a
+   few near-neighbours (720↔768, 620↔640) — treat those as
+   the same tier when editing; don't introduce new ones.
+     xs   480   phone
+     sm   640   large phone / small tablet
+     md   768   tablet
+     lg   1024  small laptop
+     xl   1400  desktop
+     tv   1920  wallboard
+   ──────────────────────────────────────────────────────── */
 
 /* ── Design Tokens — Light Mode ───────────────────────── */
 [data-theme="light"] {
@@ -99,21 +137,52 @@
 
   --text-primary: #0F172A;
   --text-secondary: #475569;
-  --text-muted: #94A3B8;
+  /* was #94A3B8 — ~2.8:1 on the light page background, fails WCAG AA. */
+  --text-muted: #64748B;
   --text-inverse: #F8FAFC;
 
-  --success-bg: rgba(34, 197, 94, 0.08);
-  --success-border: rgba(34, 197, 94, 0.18);
-  --warning-bg: rgba(245, 158, 11, 0.08);
-  --warning-border: rgba(245, 158, 11, 0.18);
-  --critical-bg: rgba(239, 68, 68, 0.06);
-  --critical-border: rgba(239, 68, 68, 0.14);
-  --accent-bg: rgba(56, 189, 248, 0.07);
+  /* Semantic FOREGROUNDS must be re-mapped for light mode: the dark-mode
+     values (#ffd500 especially) sit at ~1.4:1 on a near-white background. */
+  --success: #15803D;
+  --warning: #B45309;
+  --critical: #B91C1C;
+  --accent: #0284C7;
+
+  --success-bg: rgba(21, 128, 61, 0.08);
+  --success-border: rgba(21, 128, 61, 0.20);
+  --warning-bg: rgba(180, 83, 9, 0.09);
+  --warning-border: rgba(180, 83, 9, 0.22);
+  --critical-bg: rgba(185, 28, 28, 0.07);
+  --critical-border: rgba(185, 28, 28, 0.18);
+  --accent-bg: rgba(2, 132, 199, 0.08);
 
   --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.08), 0 1px 2px rgba(0, 0, 0, 0.05);
   --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.10), 0 2px 6px rgba(0, 0, 0, 0.07);
   --shadow-lg: 0 12px 40px rgba(0, 0, 0, 0.15), 0 4px 16px rgba(0, 0, 0, 0.10);
   --shadow-drawer: -8px 0 40px rgba(0, 0, 0, 0.12);
+}
+
+/* Visually hidden but exposed to assistive tech (headings, labels). */
+.sr-only {
+  position: absolute !important;
+  width: 1px; height: 1px;
+  padding: 0; margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ── Keyboard focus safety net ────────────────────────────
+   Many component rules set `outline: none` and rely on their own
+   `:focus-visible` restyle. This zero-specificity `:where()` rule guarantees a
+   visible ring for anything focusable that slipped through without one — a
+   component's own :focus-visible still wins on specificity. Only shows for
+   keyboard focus, never mouse. ──────────────────────────── */
+:where(a, button, input, select, textarea, summary, [tabindex]:not([tabindex="-1"]), [role="button"], [role="tab"], [role="option"]):focus-visible {
+  outline: 2px solid var(--border-focus, var(--accent));
+  outline-offset: 2px;
 }
 
 /* ── Light Theme — Colored Box Overrides ──────────────────
@@ -136,7 +205,7 @@
   border-color: #86efac;
   box-shadow: 0 0 14px -6px rgba(34, 197, 94, 0.22);
 }
-[data-theme="light"] .summary-card:nth-child(2) .sc-value { color: #15803d !important; }
+[data-theme="light"] .summary-card:nth-child(2) .sc-value { color: var(--success) !important; }
 [data-theme="light"] .summary-card:nth-child(2) .sc-label { color: rgba(20, 83, 45, 0.8) !important; }
 
 [data-theme="light"] .summary-card:nth-child(3) {
@@ -144,7 +213,7 @@
   border-color: #fcd34d;
   box-shadow: 0 0 14px -6px rgba(245, 158, 11, 0.22);
 }
-[data-theme="light"] .summary-card:nth-child(3) .sc-value { color: #b45309 !important; }
+[data-theme="light"] .summary-card:nth-child(3) .sc-value { color: var(--warning) !important; }
 [data-theme="light"] .summary-card:nth-child(3) .sc-label { color: rgba(146, 64, 14, 0.8) !important; }
 
 [data-theme="light"] .summary-card:nth-child(4) {
@@ -152,7 +221,7 @@
   border-color: #fca5a5;
   box-shadow: 0 0 14px -6px rgba(239, 68, 68, 0.22);
 }
-[data-theme="light"] .summary-card:nth-child(4) .sc-value { color: #b91c1c !important; }
+[data-theme="light"] .summary-card:nth-child(4) .sc-value { color: var(--critical) !important; }
 [data-theme="light"] .summary-card:nth-child(4) .sc-label { color: rgba(127, 29, 29, 0.8) !important; }
 
 [data-theme="light"] .summary-card:nth-child(5) {
@@ -305,7 +374,7 @@ input {
   padding: 0 12px;
   background: var(--success-bg);
   border: 1px solid var(--success-border);
-  border-radius: 100px;
+  border-radius: var(--r-pill);
   box-sizing: border-box;
 }
 
@@ -548,7 +617,7 @@ html, body {
   height: 32px;
   padding: 0 14px;
   box-sizing: border-box;
-  border-radius: 100px;
+  border-radius: var(--r-pill);
   font-size: 12px;
   font-weight: 600;
   letter-spacing: 0.03em;
@@ -1096,7 +1165,7 @@ html, body {
   letter-spacing: 0.03em;
   line-height: 1;
   padding: 2px 5px;
-  border-radius: 999px;
+  border-radius: var(--r-pill);
   color: var(--accent);
   background: rgba(56, 189, 248, 0.14);
   flex-shrink: 0;
@@ -1218,7 +1287,7 @@ html, body {
   color: var(--text-muted);
   background: var(--bg);
   border: 1px solid var(--border-strong);
-  border-radius: 100px;
+  border-radius: var(--r-pill);
   padding: 3px 9px;
   font-variant-numeric: tabular-nums;
 }
@@ -1390,6 +1459,15 @@ html, body {
   background: linear-gradient(180deg, #d32f2f 0%, #8e1513 100%);
   border-color: rgba(255, 255, 255, 0.15);
   color: #ffffff;
+}
+
+/* No data -> Prometheus has no probe sample for this target (e.g. an
+   un-scraped websites.yml entry). Neutral grey — NOT an outage, no alarm. */
+.host-card.hc-nodata {
+  background: linear-gradient(180deg, #3f4652 0%, #2b303a 100%);
+  border-color: rgba(255, 255, 255, 0.12);
+  border-style: dashed;
+  color: rgba(255, 255, 255, 0.85);
 }
 
 /* Correlated child of a down parent */
@@ -2359,7 +2437,7 @@ html, body {
 
 .ara-bar-track {
   height: 3px;
-  border-radius: 9999px;
+  border-radius: var(--r-pill);
   background: rgba(255, 255, 255, 0.08);
   overflow: hidden;
   display: flex;
@@ -2368,7 +2446,7 @@ html, body {
 
 .ara-bar-fill {
   height: 100%;
-  border-radius: 9999px;
+  border-radius: var(--r-pill);
   transition: width 0.3s ease;
 }
 
@@ -3763,7 +3841,7 @@ html, body {
   padding: 8px 14px;
   background: var(--accent-bg);
   border: 1px solid rgba(56, 189, 248, 0.25);
-  border-radius: 100px;
+  border-radius: var(--r-pill);
   font-size: 11.5px;
   font-weight: 600;
   color: var(--accent);
@@ -3812,7 +3890,7 @@ html, body {
   height: 32px;
   padding: 0 14px;
   box-sizing: border-box;
-  border-radius: 100px;
+  border-radius: var(--r-pill);
   font-size: 12px;
   font-weight: 700;
   cursor: pointer;
@@ -3890,7 +3968,7 @@ html, body {
   min-width: 16px;
   height: 16px;
   padding: 0 4px;
-  border-radius: 999px;
+  border-radius: var(--r-pill);
   background: var(--critical);
   color: #fff;
   font-size: 10px;
@@ -4163,7 +4241,7 @@ html, body {
 .log-stream::-webkit-scrollbar-thumb,
 .history-full-table::-webkit-scrollbar-thumb {
   background: var(--border-strong);
-  border-radius: 999px;
+  border-radius: var(--r-pill);
 }
 
 .log-stream::-webkit-scrollbar-thumb:hover,
@@ -4507,6 +4585,21 @@ html, body {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+.history-resolve-btn {
+  margin-top: 4px;
+  padding: 2px 8px;
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 1.4;
+  color: var(--critical);
+  background: var(--critical-bg);
+  border: 1px solid var(--critical-border);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.history-resolve-btn:hover { filter: brightness(1.08); }
+.history-resolve-btn:focus-visible { outline: 2px solid var(--critical); outline-offset: 1px; }
 
 .history-sev {
   font-size: 10.5px;
@@ -4931,7 +5024,7 @@ button:disabled.rbac-restricted {
   font-weight: 800;
   letter-spacing: 0.05em;
   padding: 2px 7px;
-  border-radius: 999px;
+  border-radius: var(--r-pill);
   white-space: nowrap;
   background: rgba(255, 255, 255, 0.08);
   color: var(--text-secondary);
@@ -4965,14 +5058,14 @@ button:disabled.rbac-restricted {
 
 .audit-budget-bar {
   height: 4px;
-  border-radius: 999px;
+  border-radius: var(--r-pill);
   background: rgba(255, 255, 255, 0.08);
   overflow: hidden;
   margin: 5px 0;
 }
 .audit-budget-fill {
   height: 100%;
-  border-radius: 999px;
+  border-radius: var(--r-pill);
   background: #22c55e;
   transition: width 0.3s ease;
 }
@@ -5257,13 +5350,13 @@ button:disabled.rbac-restricted {
   max-width: 140px;
   height: 4px;
   background: rgba(255, 255, 255, 0.08);
-  border-radius: 9999px;
+  border-radius: var(--r-pill);
   overflow: hidden;
 }
 
 .audit-cov-bar-fill {
   height: 100%;
-  border-radius: 9999px;
+  border-radius: var(--r-pill);
   background: var(--text-muted);
 }
 
@@ -5287,49 +5380,38 @@ button:disabled.rbac-restricted {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
-   AVAILABILITY BREAKDOWN — REVAMP (scoped to .avb)
-   A self-contained visual language for this modal only: validated token
-   palette + IBM Plex, one scroll container, one "bold moment" (the fleet
-   ring). Nothing here leaks to the rest of the app — every selector is
-   prefixed .avb and the shared token names are re-pointed locally.
+   AVAILABILITY BREAKDOWN (scoped to .avb)
+   Layout only: one scroll container, sticky header/footer, the fleet ring.
+   Colour + type come from the app-wide tokens (see the .avb rule below, which
+   re-points its local token names at the globals) so this modal matches every
+   other dialog and follows light/dark mode. Every selector is prefixed .avb —
+   nothing leaks out.
    ═══════════════════════════════════════════════════════════════════════════ */
 .avb {
-  /* validated palette */
-  --bg-page: #05070a;
-  --bg-panel: #0b0f14;
-  --bg-surface: #11161d;
-  --bg-raised: #171d26;
-  --border: #232b35;
-  --border-soft: #1a2029;
-  --text-hi: #e8edf2;
-  --text-mid: #96a3b0;
-  --text-low: #5c6773;
-  --accent: #45d6c4;
-  --warn: #e3a53d;
-  --crit: #e15b6e;
-  --ok: #3fc98a;
-  --avb-font-ui: 'IBM Plex Sans', 'Inter', -apple-system, system-ui, sans-serif;
-  --avb-font-mono: 'IBM Plex Mono', ui-monospace, 'JetBrains Mono', 'SFMono-Regular', monospace;
+  /* This modal's local token names now just re-point to the app-wide tokens
+     so its colour composition and type match every other dialog. (It used to
+     ship a bespoke IBM Plex + teal theme that also ignored light mode.) The
+     .avb rules below reference these local names, so nothing else needs to
+     change and nothing leaks out of the modal. */
+  --bg-page: var(--bg);
+  --bg-panel: var(--surface);
+  --bg-surface: var(--surface-raised);
+  --bg-raised: var(--surface-hover);
+  --border: var(--border-strong);
+  --border-soft: var(--border-subtle);
+  --text-hi: var(--text-primary);
+  --text-mid: var(--text-secondary);
+  --text-low: var(--text-muted);
+  --warn: var(--warning);
+  --crit: var(--critical);
+  --ok: var(--success);
+  --avb-font-ui: var(--font);
+  --avb-font-mono: var(--font-mono);
+  /* --accent inherits the global accent */
 
-  /* bridge the app-wide token names so any rule we don't restyle still
-     picks up this palette while inside the modal */
-  --text-primary: var(--text-hi);
-  --text-secondary: var(--text-mid);
-  --text-muted: var(--text-low);
-  --surface: var(--bg-surface);
-  --surface-raised: var(--bg-raised);
-  --surface-hover: #1c2530;
-  --bg-card: var(--bg-panel);
-  --border-subtle: var(--border-soft);
-  --border-strong: var(--border);
-  --success: var(--ok);
-  --critical: var(--crit);
-  --warning: var(--warn);
-  --font-mono: var(--avb-font-mono);
-
-  font-family: var(--avb-font-ui);
-  background: var(--bg-panel);
-  border: 1px solid var(--border);
+  font-family: var(--font);
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
   max-width: 760px !important;
   max-height: calc(100vh - 40px);
   display: flex;
@@ -5358,14 +5440,14 @@ button:disabled.rbac-restricted {
 .avb .avail-modal-subtitle { font-size: 11.5px; color: var(--text-mid); }
 .avb .modal-title-sub { color: var(--text-low); }
 .avb .avail-updating-badge {
-  background: rgba(69, 214, 196, 0.1);
-  border: 1px solid rgba(69, 214, 196, 0.28);
+  background: rgba(56, 189, 248, 0.1);
+  border: 1px solid rgba(56, 189, 248, 0.28);
   color: var(--accent);
   border-radius: 4px;
   font-weight: 500;
 }
 .avb .avail-updating-spinner {
-  border-color: rgba(69, 214, 196, 0.3);
+  border-color: rgba(56, 189, 248, 0.3);
   border-top-color: var(--accent);
 }
 .avb .avail-range-select {
@@ -5377,10 +5459,10 @@ button:disabled.rbac-restricted {
   font-size: 11px;
   font-weight: 500;
 }
-.avb .avail-range-select:hover { border-color: #33404e; background-color: var(--bg-raised); }
+.avb .avail-range-select:hover { border-color: var(--border); background-color: var(--bg-raised); }
 .avb .avail-range-select:focus-visible {
   border-color: var(--accent);
-  box-shadow: 0 0 0 2px rgba(69, 214, 196, 0.28);
+  box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.28);
   outline: none;
 }
 .avb .icon-action {
@@ -5402,7 +5484,7 @@ button:disabled.rbac-restricted {
   padding: 9px 18px;
 }
 .avb .avail-footer-link { color: var(--accent); }
-.avb .avail-footer-link:hover { color: #6fe4d5; }
+.avb .avail-footer-link:hover { color: var(--accent); }
 
 /* ── The one and only scroll container ─────────────────────────────────── */
 .avb .avb-scroll {
@@ -5455,8 +5537,8 @@ button:disabled.rbac-restricted {
 .avb .avail-subnav-btn:hover { background: var(--bg-surface); color: var(--text-hi); }
 .avb .avail-subnav-btn.is-active {
   color: var(--accent);
-  background: rgba(69, 214, 196, 0.08);
-  border-color: rgba(69, 214, 196, 0.3);
+  background: rgba(56, 189, 248, 0.08);
+  border-color: rgba(56, 189, 248, 0.3);
 }
 .avb .avail-subnav-badge {
   font-family: var(--avb-font-mono);
@@ -5469,7 +5551,16 @@ button:disabled.rbac-restricted {
   color: var(--warn);
   border-radius: 4px;
 }
-.avb .avail-subnav-pane { animation: avbPaneIn 0.18s ease; }
+/* One vertical rhythm for the whole pane: sections flow at a single gap,
+   no per-section margins stacking on top of each other. */
+.avb .avail-subnav-pane {
+  animation: avbPaneIn 0.18s ease;
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+}
+.avb .avail-subnav-pane > * { margin-top: 0; margin-bottom: 0; }
+.avb .avail-subnav-pane > .audit-divider { display: none; }
 @keyframes avbPaneIn { from { opacity: 0; } to { opacity: 1; } }
 
 /* ── Section titles: thin vertical accent, sentence case ───────────────── */
@@ -5492,7 +5583,7 @@ button:disabled.rbac-restricted {
 }
 
 /* ── Hero grid ────────────────────────────────────────────────────────── */
-.avb .avail-hero-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 18px; }
+.avb .avail-hero-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 0; }
 .avb .avail-hero-card {
   position: relative;
   background: var(--bg-surface);
@@ -5531,12 +5622,12 @@ button:disabled.rbac-restricted {
   inset: 0 0 auto 0;
   height: 2px;
   border-radius: 8px 8px 0 0;
-  background: linear-gradient(90deg, var(--accent) 0%, rgba(69, 214, 196, 0.35) 45%, transparent 100%);
+  background: linear-gradient(90deg, var(--accent) 0%, rgba(56, 189, 248, 0.35) 45%, transparent 100%);
 }
 .avb .avb-fleet-body { display: flex; align-items: center; gap: 14px; }
 .avb .avb-fleet-figures { min-width: 0; }
 .avb .avb-ring { flex: 0 0 auto; display: block; }
-.avb .avb-ring-track { stroke: #202834; }
+.avb .avb-ring-track { stroke: var(--border); }
 .avb .avb-ring-value {
   stroke: var(--accent);
   transition: stroke-dashoffset 0.5s cubic-bezier(0.4, 0, 0.2, 1);
@@ -5558,11 +5649,11 @@ button:disabled.rbac-restricted {
   height: 6px;
   border-radius: 3px;
   overflow: hidden;
-  background: #1d2430;
+  background: var(--border);
   margin: 12px 0 7px;
 }
 .avb .avb-splitbar-up { background: var(--ok); transition: width 0.4s ease; }
-.avb .avb-splitbar-down { background: #3a4551; transition: width 0.4s ease; }
+.avb .avb-splitbar-down { background: var(--text-low); transition: width 0.4s ease; }
 .avb .avail-split-legend {
   display: flex;
   gap: 14px;
@@ -5574,10 +5665,10 @@ button:disabled.rbac-restricted {
 .avb .avail-split-legend strong { color: var(--text-hi); font-weight: 500; }
 .avb .legend-dot { width: 6px; height: 6px; border-radius: 2px; }
 .avb .dot-up { background: var(--ok); }
-.avb .dot-down { background: #3a4551; }
+.avb .dot-down { background: var(--text-low); }
 
 /* ── Availability Trend (empty-state shell) ───────────────────────────── */
-.avb .avb-trend-section { margin: 0 0 20px; }
+.avb .avb-trend-section { margin: 0; }
 .avb .avb-trend-section .avb-sec-title { margin-bottom: 9px; }
 .avb .avb-trend-card {
   background: var(--bg-surface);
@@ -5622,9 +5713,28 @@ button:disabled.rbac-restricted {
   text-align: center;
   padding: 0 12px;
 }
-.avb .avb-trend-empty svg { color: #2f3a46; }
+.avb .avb-trend-empty svg { color: var(--text-low); }
 .avb .avb-trend-empty p { margin: 4px 0 0; font-size: 11.5px; color: var(--text-mid); }
 .avb .avb-trend-empty span { font-size: 10px; color: var(--text-low); max-width: 320px; }
+.avb .avb-trend-svg-wrap {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+.avb .avb-trend-svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+.avb .avb-trend-area { fill: var(--accent); opacity: 0.12; stroke: none; }
+.avb .avb-trend-line {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 1.5px;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
 .avb .avb-trend-xaxis {
   display: flex;
   justify-content: space-between;
@@ -5673,7 +5783,7 @@ button:disabled.rbac-restricted {
   background: rgba(255, 255, 255, 0.05); color: var(--text-hi);
 }
 .avb .avail-sort-item.is-active {
-  background: rgba(69, 214, 196, 0.14);
+  background: rgba(56, 189, 248, 0.14);
   color: var(--accent);
   font-weight: 500;
 }
@@ -5741,7 +5851,7 @@ button:disabled.rbac-restricted {
 .avb .pct-warning  { color: var(--warn); }
 .avb .pct-good     { color: var(--ok); }
 .avb .pct-muted    { color: var(--text-low); }
-.avb .ara-bar-track { background: #1d2430; height: 3px; }
+.avb .ara-bar-track { background: var(--border); height: 3px; }
 .avb .bar-fill-critical { background: var(--crit); }
 .avb .bar-fill-orange   { background: #e08653; }
 .avb .bar-fill-warning  { background: var(--warn); }
@@ -5822,7 +5932,7 @@ button:disabled.rbac-restricted {
 .avb .audit-sla-badge.is-mid, .avb .audit-budget-state.is-mid { background: rgba(227, 165, 61, 0.14);  color: var(--warn); }
 .avb .audit-sla-badge.is-bad, .avb .audit-budget-state.is-bad { background: rgba(225, 91, 110, 0.14);  color: var(--crit); }
 
-.avb .audit-budget-bar { background: #1d2430; height: 4px; }
+.avb .audit-budget-bar { background: var(--border); height: 4px; }
 .avb .audit-budget-fill { background: var(--ok); }
 .avb .audit-budget-fill.is-mid { background: var(--warn); }
 .avb .audit-budget-fill.is-bad { background: var(--crit); }
@@ -5841,6 +5951,12 @@ button:disabled.rbac-restricted {
 
 /* coverage split */
 .avb .audit-section-title { color: var(--text-hi); }
+/* Softer, shorter accent on the "Coverage" heading; consistent gap to the grid. */
+.avb .audit-section .avb-sec-title {
+  padding-left: 8px;
+  margin-bottom: 13px;
+  border-left-color: color-mix(in srgb, var(--accent) 55%, transparent);
+}
 .avb .audit-divider { background: var(--border); }
 .avb .audit-grid { gap: 18px; }
 .avb .audit-card { border-left: 1px solid var(--border); padding-left: 14px; }
@@ -5852,9 +5968,16 @@ button:disabled.rbac-restricted {
   letter-spacing: 0;
   text-transform: none;
   color: var(--text-low);
+  margin-bottom: 5px;
 }
-.avb .audit-card-value { font-family: var(--avb-font-mono); font-size: 17px; font-weight: 500; color: var(--text-hi); }
-.avb .audit-card-sub { font-family: var(--avb-font-mono); font-size: 10px; color: var(--text-low); }
+.avb .audit-card-value {
+  font-family: var(--avb-font-mono);
+  font-size: 16px;
+  font-weight: 600;
+  line-height: 1.2;
+  color: var(--text-hi);
+}
+.avb .audit-card-sub { font-family: var(--avb-font-mono); font-size: 10px; color: var(--text-low); margin-top: 4px; }
 .avb .text-observed { color: var(--text-hi); }
 .avb .text-missing  { color: var(--warn); }
 .avb .text-maint    { color: var(--text-hi); }
@@ -5896,7 +6019,7 @@ button:disabled.rbac-restricted {
   border-radius: 4px;
 }
 .avb .audit-chip:hover { color: var(--text-hi); }
-.avb .audit-chip.is-active { background: rgba(69, 214, 196, 0.14); color: var(--accent); }
+.avb .audit-chip.is-active { background: rgba(56, 189, 248, 0.14); color: var(--accent); }
 .avb .audit-chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .avb .audit-search-input {
   background: var(--bg-page);
@@ -5907,7 +6030,7 @@ button:disabled.rbac-restricted {
   font-size: 10.5px;
 }
 .avb .audit-search-input::placeholder { color: var(--text-low); }
-.avb .audit-search-input:focus { border-color: var(--accent); outline: none; box-shadow: 0 0 0 2px rgba(69, 214, 196, 0.22); }
+.avb .audit-search-input:focus { border-color: var(--accent); outline: none; box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.22); }
 
 .avb .audit-table { font-size: 11px; }
 .avb .audit-table th {
@@ -5928,7 +6051,7 @@ button:disabled.rbac-restricted {
 .avb .audit-host-job { font-family: var(--avb-font-ui); font-size: 9px; color: var(--text-low); }
 .avb .audit-cov-pct { font-family: var(--avb-font-mono); color: var(--text-hi); }
 .avb .audit-cov-pct.is-lim { color: var(--warn); }
-.avb .audit-cov-bar-wrap { background: #1d2430; }
+.avb .audit-cov-bar-wrap { background: var(--border); }
 .avb .audit-cov-bar-fill { background: var(--text-low); }
 .avb .audit-cov-bar-fill.bar-limited { background: var(--warn); }
 .avb .audit-table .mono { font-family: var(--avb-font-mono); }

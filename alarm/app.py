@@ -1,16 +1,19 @@
-from flask import Flask, request, jsonify, render_template, session, g
+from flask import Flask, request, jsonify, render_template, session, g, has_request_context
 import json
 import time
 import os
 import math
 import re
 import gzip
+import hashlib
 import threading
 import sys
+import shutil
 import uuid
 import ipaddress
 import logging
 import socket
+import contextlib
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from functools import wraps
@@ -106,17 +109,33 @@ _AVAIL_FRESHNESS_TOLERANCE_SEC = 150.0  # 60.0 * 2.5
 
 app = Flask(__name__)
 app.secret_key = get_session_secret()
+# Behind a reverse proxy, trust X-Forwarded-For/-Proto ONLY when explicitly
+# told to (value = number of trusted proxy hops, usually "1"). Without this the
+# per-IP login rate-limit and _client_identity() bucket every request under the
+# proxy's address; with it they see the real client. Off by default so a direct
+# client can't spoof the headers.
+_trust_proxy_hops = int(os.environ.get("INFRAWATCH_TRUST_PROXY", "0"))
+if _trust_proxy_hops > 0:
+    from werkzeug.middleware.proxy_fix import ProxyFix
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=_trust_proxy_hops, x_proto=_trust_proxy_hops)
 app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 app.config['SESSION_COOKIE_NAME'] = 'infrawatch_session'
-if os.environ.get("SESSION_COOKIE_SECURE", "0") == "1":
-    app.config['SESSION_COOKIE_SECURE'] = True
+# Secure cookie is the default now; a plain-HTTP LAN install can opt out with
+# SESSION_COOKIE_SECURE=0. (Previously this was opt-IN, so every default
+# deployment shipped a non-Secure session cookie.)
+app.config['SESSION_COOKIE_SECURE'] = os.environ.get("SESSION_COOKIE_SECURE", "1") != "0"
 # Flask defaults PERMANENT_SESSION_LIFETIME to 31 days; a NOC login on a
 # shared workstation shouldn't stay valid that long unattended.
 app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(hours=int(os.environ.get("INFRAWATCH_SESSION_HOURS", "24")))
 # Static assets (JS/CSS/mp3) are safe to let browsers cache briefly — only the
-# dynamic/live JSON endpoints need the no-cache headers below.
-app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 300
+# dynamic/live JSON endpoints need the no-cache headers below. The ?v=<mtime>
+# query string (see inject_asset_version) busts this immediately on any change,
+# so the window can be a full week rather than 5 minutes.
+app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 604800
+# Reject oversized request bodies outright (memory-exhaustion floor). The
+# webhook and every JSON API here deal in small payloads; 2 MiB is generous.
+app.config['MAX_CONTENT_LENGTH'] = int(os.environ.get("INFRAWATCH_MAX_BODY_BYTES", str(2 * 1024 * 1024)))
 
 @app.context_processor
 def inject_asset_version():
@@ -131,40 +150,93 @@ def inject_asset_version():
     return {"asset_version": asset_version}
 
 GZIP_MIN_BYTES = 500
+# Content types worth gzipping — text/JSON/JS/CSS/SVG. Binary assets (mp3,
+# png) are already compressed; re-gzipping them wastes CPU for ~0 saving.
+_GZIP_MIMETYPES = {
+    'text/html', 'text/css', 'text/plain', 'text/xml',
+    'application/javascript', 'text/javascript',
+    'application/json', 'image/svg+xml',
+}
+# Same policy expressed as a header so it can't drift out of sync with CSP
+# tightening: everything from same origin, plus the Google Fonts stylesheet
+# (<link> in alarm.html) and the font files it pulls. 'unsafe-inline' is
+# still required for the inline theme bootstrap and the ~100 inline style=
+# attributes in the template — see frontend audit F30 for removing those.
+_CSP = (
+    "default-src 'self'; "
+    "base-uri 'self'; "
+    "object-src 'none'; "
+    "frame-ancestors 'self'; "
+    "form-action 'self'; "
+    "img-src 'self' data:; "
+    "font-src 'self' https://fonts.gstatic.com; "
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+    "script-src 'self' 'unsafe-inline'; "
+    "connect-src 'self'"
+)
+
+
+def _maybe_gzip(response, is_static=False):
+    accept_encoding = request.headers.get('Accept-Encoding', '')
+    if 'gzip' not in accept_encoding or 'Content-Encoding' in response.headers:
+        return
+    if (response.mimetype or '').split(';')[0].strip() not in _GZIP_MIMETYPES:
+        return
+    # For a static FILE response (direct_passthrough + a file wrapper body),
+    # only touch a plain 200 with no Range request — never a 206/304 or a
+    # range fetch. Dynamic responses (JSON, rendered HTML) are always safe to
+    # compress regardless of status, same as the previous behaviour.
+    if is_static:
+        if response.status_code != 200 or request.headers.get('Range'):
+            return
+        if response.direct_passthrough:
+            response.direct_passthrough = False
+    body = response.get_data()
+    if len(body) < GZIP_MIN_BYTES:
+        return
+    compressed = gzip.compress(body, compresslevel=5)
+    response.set_data(compressed)
+    response.headers['Content-Encoding'] = 'gzip'
+    response.headers['Content-Length'] = str(len(compressed))
+    # Byte ranges no longer map to the (now gzipped) body — drop the offer so a
+    # cache/client can't request a range against a mismatched length.
+    response.headers.pop('Accept-Ranges', None)
+    vary = response.headers.get('Vary')
+    if not vary:
+        response.headers['Vary'] = 'Accept-Encoding'
+    elif 'accept-encoding' not in vary.lower():
+        response.headers['Vary'] = f"{vary}, Accept-Encoding"
+
 
 @app.after_request
 def add_header(response):
-    if request.path.startswith('/static/'):
-        return response
+    is_static = request.path.startswith('/static/')
 
-    response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
-    response.headers['Pragma'] = 'no-cache'
-    response.headers['Expires'] = '-1'
+    # Security headers apply everywhere (static included — cheap, and a
+    # stray HTML error page under /static/ still benefits).
     response.headers['X-Content-Type-Options'] = 'nosniff'
     response.headers['X-Frame-Options'] = 'SAMEORIGIN'
     response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+    response.headers['Content-Security-Policy'] = _CSP
 
-    # Compress larger JSON payloads — matters once a fleet reaches hundreds/
-    # thousands of targets — without touching response content.
-    accept_encoding = request.headers.get('Accept-Encoding', '')
-    if (
-        'gzip' in accept_encoding
-        and not response.direct_passthrough
-        and 'Content-Encoding' not in response.headers
-    ):
-        body = response.get_data()
-        if len(body) >= GZIP_MIN_BYTES:
-            compressed = gzip.compress(body, compresslevel=6)
-            response.set_data(compressed)
-            response.headers['Content-Encoding'] = 'gzip'
-            response.headers['Content-Length'] = str(len(compressed))
-            response.headers['Vary'] = 'Accept-Encoding'
+    if is_static:
+        # ?v=<mtime> already busts this on every change, so cache hard.
+        response.headers['Cache-Control'] = 'public, max-age=604800, immutable'
+    else:
+        response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+        response.headers['Pragma'] = 'no-cache'
+        response.headers['Expires'] = '-1'
+
+    # Compress text/JSON/JS/CSS/SVG for both dynamic responses and static
+    # assets — gunicorn serves static itself here (no compressing proxy),
+    # so without this the ~420 KB of JS+CSS ships uncompressed every load.
+    _maybe_gzip(response, is_static=is_static)
 
     return response
 
 @app.errorhandler(404)
 def handle_404(e):
-    if request.path.startswith('/api/') or request.path in ('/instances', '/status', '/logs', '/history', '/webhook', '/health', '/health/live', '/health/ready'):
+    if request.path.startswith('/api/') or request.path in ('/instances', '/status', '/logs', '/history', '/webhook', '/api/webhook', '/health', '/health/live', '/health/ready'):
         return jsonify({"ok": False, "error": "Resource not found"}), 404
     return render_template('alarm.html'), 404
 
@@ -202,6 +274,20 @@ def parse_alert_timestamp(value, fallback):
 def alert_key(a, labels):
     return a.get('fingerprint') or f"{labels.get('alertname', 'Unknown')}|{labels.get('instance', '-')}"
 
+
+def active_incident_list():
+    """The current set of firing alerts. SQLite `incidents` is the single
+    source of truth (audit F1); status.json is a denormalized cache used only
+    as a fallback when the SQLite read itself fails (corrupt/locked DB), which
+    preserves the pre-F1 resilience of the read paths."""
+    try:
+        return IncidentRepository.get_active_incidents()
+    except Exception:
+        logger.exception("active_incident_list: SQLite read failed; using status.json cache")
+        status_data = load_json(STATUS_FILE, None)
+        return status_data.get('alerts', []) if isinstance(status_data, dict) else []
+
+
 MAX_ARCHIVE_HISTORY = 5000
 
 def save_with_retention(main_path, archive_path, data, limit):
@@ -217,6 +303,15 @@ def save_with_retention(main_path, archive_path, data, limit):
 # in webhook() — without it, concurrent deliveries (Alertmanager routinely
 # fans out several groups at once under threaded=True) each read the same
 # stale list and clobber each other's inserts on save.
+#
+# This is an in-PROCESS lock. The deployment is single-process (gunicorn
+# --workers 1 --threads 8, see Dockerfile) so that is sufficient. Scaling to
+# --workers > 1 would let two processes race these JSON files — but they are
+# only a denormalized cache now: SQLite (incidents / event_logs) is the single
+# source of truth for active-alert state and for /history & /logs (audit F1),
+# and its writes ARE cross-process safe (BEGIN IMMEDIATE + per-key dedupe, see
+# test_persistence_concurrency). A multi-worker deploy would still need a
+# cross-process lock here (and poller leader election) before it is correct.
 _WEBHOOK_LOCK = threading.Lock()
 
 def load_json(path, default=None):
@@ -263,7 +358,10 @@ def save_json(path, data):
 # deployment needs, so guessing at container-networking conventions no
 # longer earns its keep. This single default covers the common case (a
 # compose service literally named "prometheus") without guessing further.
-_DEFAULT_PROM_URL = os.environ.get("PROMETHEUS_URL", "http://prometheus:9090")
+# Blank/unset PROMETHEUS_URL => no default endpoint: the deployment runs with
+# an empty endpoint list until the operator adds one in the UI. Only a
+# non-blank value seeds and acts as the failover fallback.
+_DEFAULT_PROM_URL = os.environ.get("PROMETHEUS_URL", "http://prometheus:9090").strip()
 
 def _is_blocked_ip(ip):
     return (ip.is_link_local or
@@ -275,7 +373,13 @@ def _is_blocked_ip(ip):
 
 def is_safe_endpoint_url(url: str):
     try:
-        parsed = urlparse(url.strip())
+        url = url.strip()
+        # Reject characters that have no place in a URL and would let a stored
+        # endpoint break out of an HTML attribute / element when the endpoint
+        # manager renders it (defence in depth alongside client-side escaping).
+        if any(c in url for c in '"\'<>`\\ \t\n\r') or any(ord(c) < 0x20 for c in url):
+            return False, "Endpoint URL contains illegal characters"
+        parsed = urlparse(url)
         if parsed.scheme not in ('http', 'https'):
             return False, "Invalid scheme; only http and https are allowed"
         if not parsed.netloc or '@' in parsed.netloc:
@@ -339,7 +443,8 @@ def load_endpoints():
     try:
         data = EndpointRepository.load_endpoints_state(_DEFAULT_PROM_URL)
     except Exception:
-        data = {"active": _DEFAULT_PROM_URL, "endpoints": [_DEFAULT_PROM_URL]}
+        data = ({"active": _DEFAULT_PROM_URL, "endpoints": [_DEFAULT_PROM_URL]}
+                if _DEFAULT_PROM_URL else {"active": None, "endpoints": []})
 
     _ENDPOINTS_CACHE["data"] = data
     _ENDPOINTS_CACHE["ts"] = now
@@ -348,6 +453,11 @@ def load_endpoints():
 DEFAULT_JOB_FILTER = os.environ.get("JOB_FILTER", "all")
 ALERTNAME_TARGET_DOWN = "TargetDown"
 ALERTNAME_SLOW_RESPONSE = "SlowResponse"
+
+# Global default latency (ms) above which an up target is "slow"/degraded.
+# Per-instance overrides live in SlowThresholdRepository. Used by BOTH the
+# SlowResponse alert (poller) and the live grid's severity/summary (audit F4).
+DEFAULT_SLOW_RESPONSE_THRESHOLD_MS = float(os.environ.get("SLOW_RESPONSE_THRESHOLD_MS", "500"))
 
 # Minimal shape check for the Add Target form — not full RFC validation, just
 # enough to reject obvious garbage (e.g. a bare number) before it's written to
@@ -383,77 +493,173 @@ def matches_job_filter(job, scrape_pool, filter_val):
     val_lower = filter_val.lower()
     return job_lower == val_lower or pool_lower == val_lower or val_lower in job_lower or val_lower in pool_lower
 
-TARGETS_PATHS = [
-    os.environ.get("TARGETS_FILE"),
-    "/app/targets/websites.yml",
-    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "prometheus", "targets", "websites.yml")),
-    os.path.abspath(os.path.join(os.path.dirname(__file__), "targets", "websites.yml"))
-]
-
 def get_targets_file():
+    # websites.yml is InfraWatch's own curation list — the subset of
+    # Prometheus-discovered instances an operator has pinned for the wallboard
+    # (see load_website_targets consumers). It is NOT a Prometheus scrape
+    # config: nothing here provisions Prometheus from it. The old
+    # ../prometheus/targets/ and /app/targets/ lookup paths were remnants of
+    # the pre-v3 era when this project bundled its own Prometheus — dropped.
     env_target = os.environ.get("TARGETS_FILE")
-    if env_target and os.path.isfile(env_target):
+    if env_target:
         return env_target
-    
+
     local_target = os.path.abspath(os.path.join(os.path.dirname(__file__), "targets", "websites.yml"))
     if os.path.isfile(local_target):
         return local_target
 
-    for p in TARGETS_PATHS:
-        if p and os.path.isfile(p):
-            return p
-
     os.makedirs(os.path.dirname(local_target), exist_ok=True)
+    example_target = local_target + ".example"
+    if os.path.isfile(example_target):
+        try:
+            shutil.copyfile(example_target, local_target)
+        except Exception:
+            pass
     return local_target
 
-# websites.yml is a Prometheus file_sd YAML doc: a list of {targets, labels}
-# groups. This app only owns the group labeled job: "blackbox_http" — other
-# groups (e.g. a hand-written blackbox_ping group) are read straight through
-# to save() untouched, so structure, custom labels, and multi-group targets
-# survive an Add/Delete Target round-trip instead of getting flattened.
+
+def normalize_target(url):
+    """Canonical form for dedup/compare only (not for storage): lowercase host,
+    drop scheme and a default :80/:443, strip trailing slash. Two entries that
+    normalize equal are the same target — 'foo', 'FOO:80', 'http://foo/' all
+    collapse to 'foo'."""
+    s = (url or "").strip()
+    s = re.sub(r'^https?://', '', s, flags=re.I).rstrip('/')
+    m = re.match(r'^([^/]+?)(?::(\d+))?(/.*)?$', s)
+    if not m:
+        return s.lower()
+    host, port, path = m.group(1).lower(), m.group(2), m.group(3) or ''
+    if port in ('80', '443'):
+        port = None
+    return host + (f':{port}' if port else '') + path
+
+# websites.yml keeps the Prometheus file_sd shape (a list of {targets, labels}
+# groups) purely so it round-trips cleanly and could be pointed at a Prometheus
+# by an operator who wires it up themselves. InfraWatch itself only owns the
+# group labeled job: "blackbox_http"; any other group (e.g. a hand-written
+# blackbox_ping group) is read straight through to save() untouched, so
+# structure and multi-group files survive an Add/Delete round-trip. That
+# passthrough guarantee is why save_website_targets() must NEVER fall back to
+# an empty doc when the existing file fails to parse (K3) — doing so would
+# silently delete every sibling group.
 WEBSITES_JOB_LABEL = "blackbox_http"
+
+# mtime-keyed parse cache: get_instance_job_map(), get_monitored_instances()
+# and get_instance_cadence_map() each call this within one /instances request,
+# re-reading and re-parsing the same YAML file every time. Keyed on (path,
+# mtime) so save_website_targets() — which rewrites the file — invalidates it
+# automatically with no explicit bump needed.
+_WEBSITE_TARGETS_CACHE = {"key": None, "data": None}
+_WEBSITE_TARGETS_CACHE_LOCK = threading.Lock()
+
+
+@contextlib.contextmanager
+def _targets_write_lock():
+    """Cross-process advisory lock around the websites.yml read-modify-write.
+    In-process threads are already serialized by _WEBHOOK_LOCK at the call
+    sites; this additionally guards a deployment scaled past one gunicorn
+    worker/process, where that threading.Lock no longer helps and two
+    concurrent Add/Delete cycles would lose an update. Best-effort: if the
+    platform lock primitive is unavailable it proceeds unlocked (prior
+    behavior). ponytail: coarse whole-file lock, fine at /api/targets' 20/60
+    rate limit; revisit only if target churn ever gets hot.
+    """
+    lock_path = get_targets_file() + ".lock"
+    f = None
+    try:
+        try:
+            os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
+            f = open(lock_path, "a+")
+            f.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        except OSError:
+            pass
+        yield
+    finally:
+        if f is not None:
+            try:
+                f.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            f.close()
+
 
 def load_website_targets():
     target_file = get_targets_file()
     if not os.path.exists(target_file):
         return []
     try:
+        mtime = os.path.getmtime(target_file)
+    except OSError:
+        mtime = 0.0
+    cache_key = (target_file, mtime)
+    with _WEBSITE_TARGETS_CACHE_LOCK:
+        if _WEBSITE_TARGETS_CACHE["key"] == cache_key and _WEBSITE_TARGETS_CACHE["data"] is not None:
+            return list(_WEBSITE_TARGETS_CACHE["data"])
+    try:
         with open(target_file, 'r', encoding='utf-8') as f:
             doc = yaml.safe_load(f)
     except Exception as e:
-        print(f"Error loading targets: {e}", flush=True)
+        logger.error(f"Error loading targets: {e}")
         return []
 
     if not isinstance(doc, list):
+        if doc is not None:
+            logger.warning("targets file %s is not a file_sd list — ignoring", target_file)
         return []
 
     urls = []
+    seen_norm = set()
     for group in doc:
         if not isinstance(group, dict):
+            logger.warning("targets file %s has a non-mapping group entry — skipped", target_file)
             continue
         labels = group.get('labels') or {}
         if labels.get('job') != WEBSITES_JOB_LABEL:
             continue
         for u in (group.get('targets') or []):
             u = str(u).strip()
-            if u and u not in urls:
+            n = normalize_target(u)
+            if u and n not in seen_norm:
+                seen_norm.add(n)
                 urls.append(u)
+    with _WEBSITE_TARGETS_CACHE_LOCK:
+        _WEBSITE_TARGETS_CACHE["key"] = cache_key
+        _WEBSITE_TARGETS_CACHE["data"] = list(urls)
     return urls
 
 def save_website_targets(urls):
+    """Rewrite the blackbox_http group in websites.yml to `urls`, preserving
+    every other group. Returns True on success; raises on a corrupt existing
+    file or a failed write so the caller can report the failure instead of
+    silently claiming success (K3/S6)."""
     target_file = get_targets_file()
+    tmp_file = target_file + ".tmp"
     try:
-        os.makedirs(os.path.dirname(target_file), exist_ok=True)
+        os.makedirs(os.path.dirname(target_file) or ".", exist_ok=True)
 
         doc = []
-        if os.path.exists(target_file):
-            try:
-                with open(target_file, 'r', encoding='utf-8') as f:
-                    loaded = yaml.safe_load(f)
-                if isinstance(loaded, list):
-                    doc = loaded
-            except Exception:
-                doc = []
+        if os.path.exists(target_file) and os.path.getsize(target_file) > 0:
+            with open(target_file, 'r', encoding='utf-8') as f:
+                loaded = yaml.safe_load(f)
+            if isinstance(loaded, list):
+                doc = loaded
+            elif loaded is not None:
+                # Parsed to a non-list (or would have raised above): refuse to
+                # overwrite — an operator's hand-written multi-group file must
+                # not be clobbered by a bad parse.
+                raise RuntimeError(f"{target_file} is not a file_sd list; refusing to overwrite")
 
         for group in doc:
             if isinstance(group, dict) and (group.get('labels') or {}).get('job') == WEBSITES_JOB_LABEL:
@@ -462,12 +668,24 @@ def save_website_targets(urls):
         else:
             doc.append({"targets": list(urls), "labels": {"job": WEBSITES_JOB_LABEL}})
 
-        tmp_file = target_file + ".tmp"
+        if os.path.exists(target_file):
+            try:
+                shutil.copyfile(target_file, target_file + ".bak")
+            except OSError as e:
+                logger.warning("could not write %s.bak: %s", target_file, e)
+
         with open(tmp_file, 'w', encoding='utf-8') as f:
             yaml.safe_dump(doc, f, default_flow_style=False, sort_keys=False)
         os.replace(tmp_file, target_file)
+        return True
     except Exception as e:
-        print(f"Error saving targets {target_file}: {e}", flush=True)
+        logger.error(f"Error saving targets {target_file}: {e}")
+        try:
+            if os.path.exists(tmp_file):
+                os.unlink(tmp_file)
+        except OSError:
+            pass
+        raise
 
 LAST_WORKING_PROMETHEUS_URL = None
 PROMETHEUS_CACHE = {}
@@ -709,7 +927,7 @@ def fetch_prometheus_json(path, use_cache=True, cache_ttl=None, timeout=None):
         # prometheus:9090 compose default) — the one an operator actually
         # configured for this deployment, ahead of the other saved endpoints.
         fallback_candidates = []
-        if _DEFAULT_PROM_URL not in primary_candidates:
+        if _DEFAULT_PROM_URL and _DEFAULT_PROM_URL not in primary_candidates:
             fallback_candidates.append(_DEFAULT_PROM_URL)
         for ep in endpoints_data.get("endpoints", []):
             if ep not in primary_candidates and ep not in fallback_candidates:
@@ -763,8 +981,47 @@ def _client_identity():
     if header.startswith("Bearer "):
         header = header[len("Bearer "):]
     if header:
-        return f"key:{header}"
+        # Bucket by a short digest, not the raw secret — the limiter dict is
+        # process-global and gets logged/inspected during debugging.
+        return "key:" + hashlib.sha256(header.encode("utf-8", "ignore")).hexdigest()[:16]
     return f"ip:{request.remote_addr or 'unknown'}"
+
+
+# ── Per-username login throttle ──────────────────────────────────────────────
+# The IP-based rate_limit() on /api/auth/login is the outer floor; this adds a
+# per-account lockout so a single target account can't be sprayed 20/min/IP
+# from a rotating IP pool. Disabled under TESTING so the suite's negative-path
+# login tests don't trip it.
+_LOGIN_FAILS = {}
+_LOGIN_FAILS_LOCK = threading.Lock()
+_LOGIN_MAX_FAILS = 10
+_LOGIN_LOCK_SECONDS = 300.0
+
+def _login_locked(username):
+    if app.config.get("TESTING"):
+        return False
+    now = time.time()
+    with _LOGIN_FAILS_LOCK:
+        rec = _LOGIN_FAILS.get(username)
+        if not rec:
+            return False
+        fails, first_ts = rec
+        if now - first_ts > _LOGIN_LOCK_SECONDS:
+            _LOGIN_FAILS.pop(username, None)
+            return False
+        return fails >= _LOGIN_MAX_FAILS
+
+def _login_note_failure(username):
+    now = time.time()
+    with _LOGIN_FAILS_LOCK:
+        fails, first_ts = _LOGIN_FAILS.get(username, (0, now))
+        if now - first_ts > _LOGIN_LOCK_SECONDS:
+            fails, first_ts = 0, now
+        _LOGIN_FAILS[username] = (fails + 1, first_ts)
+
+def _login_clear(username):
+    with _LOGIN_FAILS_LOCK:
+        _LOGIN_FAILS.pop(username, None)
 
 def rate_limit(max_calls, per_seconds):
     """At most max_calls per per_seconds, per (route, client identity).
@@ -800,12 +1057,29 @@ def rate_limit(max_calls, per_seconds):
         return wrapped
     return decorator
 
+# ── Authorization model (deliberate, see audit F52) ──────────────────────────
+#   * Operational reads — /instances, /status, /history, /logs,
+#     /api/availability, /api/targets, /api/prometheus-targets,
+#     /api/maintenance (GET), /api/dependencies (GET), /api/jobs, /health* —
+#     are intentionally UNauthenticated: this is a NOC LAN wallboard shown on
+#     shared screens with no login, and everything above is already visible on
+#     that wallboard.
+#   * Config / secret / audit reads — /api/telegram, /api/settings/availability,
+#     /api/sla-targets, /api/slow-thresholds, /api/audit/logs, /api/auth/users —
+#     ARE gated (@require_permission): they expose bot tokens, tuning knobs, or
+#     the audit trail, none of which belong on the open wallboard.
+#   * All mutations (POST/PUT/PATCH/DELETE) require an admin session or the M2M
+#     API key.
+# /api/jobs (F37) is a curl-friendly diagnostic that returns the same job list
+# already derivable from /api/prometheus-targets; kept public for parity with
+# that endpoint rather than half-gated.
 @app.route('/')
 def index():
-    # No API key is rendered here. The dashboard is a read-only LAN wallboard;
-    # the mutation credential (@require_api_key routes) is entered by an
-    # operator client-side (see apiFetch()/authHeaders() in alarm.js) and
-    # kept only in that browser's localStorage, never shipped to every viewer.
+    # No credential is rendered here. The dashboard is a read-only LAN
+    # wallboard; UI mutations authenticate with an admin *session cookie*
+    # established via /api/auth/login — alarm.js apiFetch() sends only that
+    # cookie, there is no client-side API key or authHeaders(). The M2M
+    # INFRAWATCH_API_KEY / X-API-Key path is for scripts & automation only.
     return render_template('alarm.html')
 
 # Set whenever /webhook receives a real Alertmanager delivery — the poller
@@ -818,16 +1092,44 @@ _LAST_WEBHOOK_AT = [0.0]
 # record_alert_event() — the single place both the webhook and the poller
 # funnel through — so a maintenance window suppresses alerts/alarms without a
 # second alert pipeline.
+# load_maintenance_windows() / load_dependencies() are called several times
+# per /instances and /status request via build_canonical_monitoring_state()
+# (and its helpers), each time a fresh SQLite connection + SELECT. Memoize
+# them for the lifetime of a single request only, via flask.g: a mutation in
+# one request is always visible to the next, and code paths with no request
+# context (the background poller, direct calls in tests) transparently get an
+# uncached live read.
+def _request_memo(key, producer):
+    if not has_request_context():
+        return producer()
+    cache = getattr(g, "_infrawatch_memo", None)
+    if cache is None:
+        cache = {}
+        g._infrawatch_memo = cache
+    if key not in cache:
+        cache[key] = producer()
+    return cache[key]
+
+def _invalidate_maint_cache():
+    if has_request_context():
+        getattr(g, "_infrawatch_memo", {}).pop("maint_windows", None)
+
+def _invalidate_dep_cache():
+    if has_request_context():
+        getattr(g, "_infrawatch_memo", {}).pop("dependencies", None)
+
 def load_maintenance_windows():
     """SQLite (MaintenanceRepository) is the sole source of truth.
     maintenance.json used to be written alongside every create/delete and
     merged in here by id — a second, non-transactional copy that could
     silently drift from the DB (the exact failure mode this now avoids by
     construction: there's only one write path)."""
-    try:
-        return MaintenanceRepository.list_windows()
-    except Exception:
-        return []
+    def _load():
+        try:
+            return MaintenanceRepository.list_windows()
+        except Exception:
+            return []
+    return _request_memo("maint_windows", _load)
 
 def _parse_epoch_ts(val):
     if val is None:
@@ -869,11 +1171,15 @@ def maintenance_windows_by_instance(instances, job_map, windows=None):
     return out
 
 
-def get_active_maintenance(instance, job=None, windows=None):
-    """First maintenance window currently covering this instance/job, or None."""
+def get_active_maintenance(instance, job=None, windows=None, now=None):
+    """First maintenance window currently covering this instance/job, or None.
+    `now` defaults to wall-clock; pass an explicit event time so the app-layer
+    suppression check in record_alert_event() agrees with the SQLite-layer one
+    (audit F6)."""
     if windows is None:
         windows = load_maintenance_windows()
-    now = time.time()
+    if now is None:
+        now = time.time()
     for w in windows:
         start_raw = w.get('start_epoch') if w.get('start_epoch') is not None else w.get('start', 0)
         end_raw = w.get('end_epoch') if w.get('end_epoch') is not None else w.get('end', 0)
@@ -902,7 +1208,7 @@ def record_alert_event(name, severity, instance, summary, job, event_time, is_no
     key = key or f"{name}|{instance}"
 
     with _WEBHOOK_LOCK:
-        if is_now_firing and get_active_maintenance(instance, job):
+        if is_now_firing and get_active_maintenance(instance, job, now=event_time):
             return False  # suppressed: instance/job is under an active maintenance window.
 
         status_data = load_json(STATUS_FILE, {"status": "NORMAL", "alerts": [], "updated": event_time})
@@ -1070,8 +1376,8 @@ def auth_setup_api():
         return jsonify({"ok": False, "error": "Username must be at least 3 characters"}), 400
     if not re.match(r'^[a-zA-Z0-9_\-\.]+$', username):
         return jsonify({"ok": False, "error": "Username contains invalid characters"}), 400
-    if not password or len(password) < 6:
-        return jsonify({"ok": False, "error": "Password must be at least 6 characters"}), 400
+    if not password or len(password) < 12:
+        return jsonify({"ok": False, "error": "Password must be at least 12 characters"}), 400
     if confirm and password != confirm:
         return jsonify({"ok": False, "error": "Passwords do not match"}), 400
 
@@ -1080,20 +1386,33 @@ def auth_setup_api():
     if not user:
         return jsonify({"ok": False, "error": "System already initialized with an administrator"}), 409
 
-    # Automatically create session and log in the first admin
+    # Automatically create session and log in the first admin. Clear first so
+    # nothing from a pre-auth session is carried across the privilege change.
+    session.clear()
     session["user_id"] = user["id"]
+    session["epoch"] = user.get("session_epoch", 0)
     session.permanent = True
-    UserRepository.update_last_login(user["id"])
-
-    AuditLogRepository.record_action(
-        actor_username=username,
-        actor_role="admin",
-        action="SYSTEM_SETUP",
-        resource="user:admin",
-        details="Initial administrator account created"
-    )
+    try:
+        UserRepository.update_last_login(user["id"])
+        AuditLogRepository.record_action(
+            actor_username=username,
+            actor_role="admin",
+            action="SYSTEM_SETUP",
+            resource="user:admin",
+            details="Initial administrator account created"
+        )
+    except Exception:
+        # The account exists and the session is set — a failure writing the
+        # last-login timestamp or audit row must not turn a real login into a
+        # 500 that tells the client it failed.
+        logger.warning("post-setup bookkeeping failed for user %s", user["id"], exc_info=True)
     user_info = get_current_authenticated_user()
     return jsonify({"ok": True, "user": user_info})
+
+# Precomputed once so the "no such user" path spends the same CPU on a hash
+# comparison as the "user exists" path — closes the response-time oracle that
+# otherwise lets an attacker enumerate valid usernames.
+_DUMMY_PW_HASH = hash_password(uuid.uuid4().hex)
 
 @app.route('/api/auth/login', methods=['POST'])
 @rate_limit(20, 60)
@@ -1106,24 +1425,45 @@ def auth_login_api():
         return jsonify({"ok": False, "error": "Username and password are required"}), 400
 
     user_with_hash = UserRepository.get_by_username(username, include_password_hash=True)
-    if not user_with_hash or not user_with_hash.get("is_active"):
+    active = bool(user_with_hash and user_with_hash.get("is_active"))
+    stored_hash = user_with_hash.get("password_hash", "") if user_with_hash else ""
+    # Always run one verify — against the real hash if the account is usable,
+    # the dummy otherwise — so response timing can't enumerate usernames.
+    verified = verify_password(password, stored_hash if active else _DUMMY_PW_HASH)
+    password_ok = active and verified
+
+    if not password_ok:
+        _login_note_failure(username)
+        # The per-username lockout gates FAILED attempts only. A caller who
+        # presents the correct password is admitted below regardless of lock
+        # state — so a third party spraying bad passwords at a known username
+        # can slow a brute-force run but can no longer lock the real user out
+        # (previously this was a permanent account-denial DoS).
+        if _login_locked(username):
+            return jsonify({"ok": False, "error": "Too many failed attempts. Try again in a few minutes."}), 429
         return jsonify({"ok": False, "error": "Invalid username or password"}), 401
 
-    if not verify_password(password, user_with_hash.get("password_hash", "")):
-        return jsonify({"ok": False, "error": "Invalid username or password"}), 401
-
+    _login_clear(username)
+    # Rotate the session on the privilege change; drop any pre-auth contents.
+    session.clear()
     session["user_id"] = user_with_hash["id"]
+    session["epoch"] = user_with_hash.get("session_epoch", 0)
     session.permanent = True
-    UserRepository.update_last_login(user_with_hash["id"])
 
     user_info = get_current_authenticated_user()
-    AuditLogRepository.record_action(
-        actor_username=user_info["username"],
-        actor_role=user_info["role"],
-        action="USER_LOGIN",
-        resource=f"user:{user_info['username']}",
-        details="User logged in via web session"
-    )
+    try:
+        UserRepository.update_last_login(user_with_hash["id"])
+        AuditLogRepository.record_action(
+            actor_username=user_info["username"],
+            actor_role=user_info["role"],
+            action="USER_LOGIN",
+            resource=f"user:{user_info['username']}",
+            details="User logged in via web session"
+        )
+    except Exception:
+        # Session is already established; a bookkeeping failure must not 500 a
+        # successful login.
+        logger.warning("post-login bookkeeping failed for user %s", user_with_hash["id"], exc_info=True)
     return jsonify({"ok": True, "user": user_info})
 
 @app.route('/api/auth/logout', methods=['POST'])
@@ -1163,8 +1503,8 @@ def create_user_api():
         return jsonify({"ok": False, "error": "Username must be at least 3 characters"}), 400
     if not re.match(r'^[a-zA-Z0-9_\-\.]+$', username):
         return jsonify({"ok": False, "error": "Username contains invalid characters"}), 400
-    if not password or len(password) < 6:
-        return jsonify({"ok": False, "error": "Password must be at least 6 characters"}), 400
+    if not password or len(password) < 12:
+        return jsonify({"ok": False, "error": "Password must be at least 12 characters"}), 400
     if role not in ("admin", "viewer"):
         return jsonify({"ok": False, "error": "Role must be admin or viewer"}), 400
 
@@ -1199,8 +1539,8 @@ def update_user_api(user_id):
         role = str(role).strip().lower()
         if role not in ("admin", "viewer"):
             return jsonify({"ok": False, "error": "Role must be admin or viewer"}), 400
-    if password is not None and len(password) < 6:
-        return jsonify({"ok": False, "error": "Password must be at least 6 characters"}), 400
+    if password is not None and len(password) < 12:
+        return jsonify({"ok": False, "error": "Password must be at least 12 characters"}), 400
 
     # Don't let the last active admin lock everyone (including themselves) out
     losing_admin = target["role"] == "admin" and target["is_active"] and (
@@ -1284,6 +1624,79 @@ def unacknowledge_alert_api():
     )
     return jsonify({"ok": True})
 
+@app.route('/api/alerts/resolve', methods=['POST'])
+@rate_limit(30, 60)
+@require_permission("alerts.ack")
+def resolve_alert_api():
+    """Force-resolve a firing incident by key (or name + instance).
+
+    Operator backstop for a phantom incident that no automatic path will ever
+    clear (audit F1) — e.g. one recorded for an instance the external
+    Prometheus no longer scrapes, so the poller's transition detector never
+    sees it recover. `_reconcile_orphaned_alerts` handles poller-owned
+    (TargetDown/SlowResponse) phantoms automatically once Prometheus is
+    reachable; this covers everything else, and gives ops a manual lever.
+    """
+    data = request.json or {}
+    key = str(data.get("key") or "").strip()
+    name = str(data.get("name") or "").strip()
+    instance = str(data.get("instance") or data.get("target") or "").strip()
+
+    if not key:
+        if name and instance:
+            key = f"{name}|{instance}"
+        else:
+            return jsonify({"ok": False, "error": "key, or name + instance, is required"}), 400
+    if (not name or not instance) and "|" in key:
+        k_name, k_inst = key.split("|", 1)
+        name = name or k_name
+        instance = instance or k_inst
+
+    # Resolve straight against SQLite (the source of truth). record_alert_event()
+    # gates on the status.json cache first, so it would NO-OP a phantom that is
+    # firing in SQLite but absent from that cache — which is exactly this
+    # endpoint's target. IncidentRepository gates on the DB row itself.
+    now = time.time()
+    try:
+        changed = IncidentRepository.record_alert_event(
+            name=name or "Unknown", severity="critical", instance=instance or "-",
+            summary=f"{instance or key} manually resolved by operator", job="",
+            event_time=now, is_now_firing=False, key=key,
+        )
+    except Exception:
+        logger.exception("resolve_alert_api: SQLite resolve failed for %s", key)
+        return jsonify({"ok": False, "error": "Could not resolve incident"}), 500
+
+    # Drop it from the status.json cache too, and recompute the cached global
+    # status, so a fallback read of that cache can't resurrect it.
+    try:
+        with _WEBHOOK_LOCK:
+            sd = load_json(STATUS_FILE, None)
+            if isinstance(sd, dict) and sd.get("alerts"):
+                kept = [a for a in sd["alerts"]
+                        if (a.get("key") or f"{a.get('name')}|{a.get('instance')}") != key]
+                if len(kept) != len(sd["alerts"]):
+                    sd["alerts"] = kept
+                    if any(a.get('severity', 'critical') == 'critical' for a in kept):
+                        sd["status"] = "CRITICAL"
+                    elif kept:
+                        sd["status"] = "WARNING"
+                    else:
+                        sd["status"] = "NORMAL"
+                    sd["updated"] = now
+                    save_json(STATUS_FILE, sd)
+    except Exception:
+        logger.exception("resolve_alert_api: status.json cache cleanup failed for %s", key)
+
+    AuditLogRepository.record_action(
+        actor_username=g.current_user.get("username", "operator"),
+        actor_role=g.current_user.get("role", "admin"),
+        action="RESOLVE_ALERT",
+        resource=key,
+        details="Manually force-resolved incident" + ("" if changed else " (was not firing — no-op)"),
+    )
+    return jsonify({"ok": True, "key": key, "changed": bool(changed)})
+
 # ── Audit Trail API ───────────────────────────────────────────────────────────
 @app.route('/api/audit/logs', methods=['GET'])
 @require_permission("audit.read")
@@ -1297,6 +1710,7 @@ def get_audit_logs_api():
 
 # ── Webhook ───────────────────────────────────────────────────────────────────
 @app.route('/webhook', methods=['POST'])
+@app.route('/api/webhook', methods=['POST'])
 @require_webhook_secret
 def webhook():
     data     = request.json or {}
@@ -1378,6 +1792,8 @@ def _annotate_logs_with_acknowledgment(log_rows):
             row['acknowledged_at'] = ack['acknowledged_at']
 
 @app.route('/status')
+@app.route('/api/status')
+@rate_limit(120, 60)  # unauthenticated + fans out to Prometheus via build_canonical_monitoring_state (audit F16); no legit client polls this
 def status():
     state = build_canonical_monitoring_state()
     return jsonify({
@@ -1388,17 +1804,25 @@ def status():
         "updated": state.get("updated", time.time())
     })
 
+# NOTE: /history and /logs return a bare JSON array (no {"ok": ...} envelope)
+# for backward compatibility with the History/Logs page consumers in alarm.js.
+# Unifying them onto the standard envelope is tracked as audit finding F33 and
+# needs a coordinated frontend change; not done here to avoid a silent break.
 @app.route('/history')
+@app.route('/api/history')
 def history():
     try:
-        data = IncidentRepository.get_history(limit=MAX_HISTORY)
-        if data:
-            return jsonify(data)
+        # Return the SQLite result even when it is a legitimately empty list —
+        # an empty history is not a read failure (audit F20).
+        return jsonify(IncidentRepository.get_history(limit=MAX_HISTORY))
     except Exception:
-        pass
-    return jsonify(load_json(HISTORY_FILE, []))
+        logger.exception("history(): SQLite read failed, falling back to history.json")
+    # Fallback also folds in history_archive.json so overflow rows past
+    # MAX_HISTORY remain reachable in this degraded path (audit F11).
+    return jsonify((load_json(HISTORY_FILE, []) + load_json(HISTORY_ARCHIVE_FILE, []))[:MAX_HISTORY])
 
 @app.route('/logs')
+@app.route('/api/logs')
 def logs():
     try:
         limit = int(request.args.get('limit', 50))
@@ -1406,12 +1830,12 @@ def logs():
         limit = 50
     limit = max(1, min(limit, MAX_LOGS))
     try:
+        # A legitimately empty log list is not a read failure (audit F20).
         data = EventLogRepository.get_logs(limit=limit)
-        if data:
-            _annotate_logs_with_acknowledgment(data)
-            return jsonify(data)
+        _annotate_logs_with_acknowledgment(data)
+        return jsonify(data)
     except Exception:
-        pass
+        logger.exception("logs(): SQLite read failed, falling back to logs.json")
     data = load_json(LOGS_FILE, [])
     return jsonify(data[:limit])
 
@@ -1503,7 +1927,7 @@ def add_endpoint_api():
             if set_active:
                 EndpointRepository.select_endpoint(url)
         except Exception as e:
-            print(f"Error adding endpoint {url}: {e}", flush=True)
+            logger.error(f"Error adding endpoint {url}: {e}")
             return jsonify({"ok": False, "error": "Failed to save endpoint"}), 500
 
         if set_active:
@@ -1575,8 +1999,10 @@ def delete_endpoint_api():
         if url not in data["endpoints"]:
             return jsonify({"ok": False, "error": "Prometheus Endpoint not found"}), 404
 
-        if len(data["endpoints"]) <= 1:
-            return jsonify({"ok": False, "error": "Cannot delete the last remaining endpoint"}), 400
+        # Deleting the last endpoint is allowed — the deployment is then in a
+        # deliberate "no Prometheus configured" state (every query returns no
+        # data) until the operator adds one. It will NOT be re-seeded on the
+        # next boot unless PROMETHEUS_URL is set (see load_endpoints_state).
 
         was_active = (data["active"] == url)
         try:
@@ -1654,9 +2080,37 @@ def get_prometheus_available_targets():
     prom_list.sort(key=lambda x: x['instance'], reverse=False)
     return jsonify({"ok": True, "targets": prom_list})
 
+def _prometheus_discovered_instances():
+    """Best-effort set of instance names Prometheus currently scrapes. Empty
+    set means 'could not tell' (Prometheus unreachable) — callers must not
+    treat empty as 'nothing discovered'."""
+    # Short timeout: on the wallboard this call is almost always cache-warm
+    # (the dashboard polls /api/v1/targets continuously); when it isn't, a
+    # missing warning is no worse than the pre-existing behavior, so don't
+    # make the operator wait on a slow/dead Prometheus.
+    raw, _ = fetch_prometheus_json('/api/v1/targets', use_cache=True, cache_ttl=10.0, timeout=0.8)
+    if not raw or raw.get('status') != 'success':
+        return set()
+    out = set()
+    for t in raw.get('data', {}).get('activeTargets', []):
+        inst = (t.get('labels') or {}).get('instance')
+        if inst:
+            out.add(inst)
+        if t.get('scrapeUrl'):
+            out.add(t['scrapeUrl'])
+    return out
+
+
 @app.route('/api/targets', methods=['GET'])
 def get_targets_api():
-    return jsonify({"ok": True, "targets": load_website_targets()})
+    # `deleted` is returned so the UI can show — and offer to restore —
+    # tombstoned targets instead of them just vanishing forever (S3). A
+    # re-POST of any deleted url clears its tombstone.
+    return jsonify({
+        "ok": True,
+        "targets": load_website_targets(),
+        "deleted": load_deleted_targets(),
+    })
 
 @app.route('/api/targets', methods=['POST'])
 @rate_limit(20, 60)
@@ -1669,17 +2123,26 @@ def add_target_api():
     if not is_valid_target(url):
         return jsonify({"ok": False, "error": "Invalid target — please use a valid hostname, IP, or URL"}), 400
 
-    with _WEBHOOK_LOCK:
-        # Remove from deleted_targets if previously deleted
-        deleted = load_deleted_targets()
-        if url in deleted:
-            deleted.remove(url)
-            save_deleted_targets(deleted)
+    norm = normalize_target(url)
+    added = False
+    try:
+        with _WEBHOOK_LOCK, _targets_write_lock():
+            # Restore from tombstone if it was previously deleted.
+            deleted = load_deleted_targets()
+            drop = [d for d in deleted if normalize_target(d) == norm]
+            if drop:
+                for d in drop:
+                    deleted.remove(d)
+                save_deleted_targets(deleted)
 
-        current = load_website_targets()
-        if url not in current:
-            current.append(url)
-            save_website_targets(current)
+            current = load_website_targets()
+            if not any(normalize_target(c) == norm for c in current):
+                current.append(url)
+                save_website_targets(current)
+                added = True
+    except Exception as e:
+        logger.error("add_target_api failed for %s: %s", url, e)
+        return jsonify({"ok": False, "error": "Could not persist target — see server log"}), 500
 
     AuditLogRepository.record_action(
         actor_username=g.current_user.get("username", "admin"),
@@ -1688,7 +2151,28 @@ def add_target_api():
         resource=url,
         details="Added website/IP target"
     )
-    return jsonify({"ok": True, "targets": current})
+    resp = {"ok": True, "targets": current}
+    # Tell the caller what actually changed — pinning an already-monitored,
+    # non-deleted target is a no-op, and the old code returned a bare success
+    # that read as "something happened" (audit F13).
+    if drop and added:
+        resp["message"] = "Target restored and pinned to the wallboard."
+    elif drop:
+        resp["message"] = "Target restored — it was previously removed."
+    elif added:
+        resp["message"] = "Target pinned to the wallboard."
+    else:
+        resp["message"] = "No change — this target is already monitored."
+    # websites.yml is a curation list, not a scrape config: this target only
+    # shows live data once the operator's (external) Prometheus actually
+    # scrapes it. On a genuine add, warn if we can see it isn't in the current
+    # target set (skipped on an idempotent re-add — nothing changed).
+    if added:
+        discovered = _prometheus_discovered_instances()
+        if discovered and url not in discovered and norm not in {normalize_target(d) for d in discovered}:
+            resp["warning"] = ("Prometheus is not currently scraping this target — it will show as "
+                               "Unknown on the wallboard until your Prometheus scrape config picks it up.")
+    return jsonify(resp)
 
 @app.route('/api/targets', methods=['DELETE'])
 @rate_limit(20, 60)
@@ -1698,17 +2182,23 @@ def delete_target_api():
     url = data.get('url', '').strip()
     if not url:
         return jsonify({"ok": False, "error": "IP / Target host is required"}), 400
-    
-    with _WEBHOOK_LOCK:
-        current = load_website_targets()
-        if url in current:
-            current.remove(url)
-            save_website_targets(current)
 
-        deleted = load_deleted_targets()
-        if url not in deleted:
-            deleted.append(url)
-            save_deleted_targets(deleted)
+    norm = normalize_target(url)
+    try:
+        with _WEBHOOK_LOCK, _targets_write_lock():
+            current = load_website_targets()
+            keep = [c for c in current if normalize_target(c) != norm]
+            if len(keep) != len(current):
+                save_website_targets(keep)
+            current = keep
+
+            deleted = load_deleted_targets()
+            if not any(normalize_target(d) == norm for d in deleted):
+                deleted.append(url)
+                save_deleted_targets(deleted)
+    except Exception as e:
+        logger.error("delete_target_api failed for %s: %s", url, e)
+        return jsonify({"ok": False, "error": "Could not persist target removal — see server log"}), 500
 
     AuditLogRepository.record_action(
         actor_username=g.current_user.get("username", "admin"),
@@ -1717,7 +2207,10 @@ def delete_target_api():
         resource=url,
         details="Deleted website/IP target"
     )
-    return jsonify({"ok": True})
+    # `restorable` reminds the caller the tombstone is reversible (re-POST) —
+    # a delete here only hides the target from InfraWatch, it cannot stop an
+    # external Prometheus from scraping it.
+    return jsonify({"ok": True, "restorable": True})
 
 # ── Maintenance windows API ─────────────────────────────────────────────────
 @app.route('/api/maintenance', methods=['GET'])
@@ -1747,22 +2240,20 @@ def create_maintenance_api():
         return jsonify({"ok": False, "error": "start and end must be epoch timestamps"}), 400
     if end <= start:
         return jsonify({"ok": False, "error": "end timestamp must be after start timestamp"}), 400
+    # Cap the span so a fat-fingered "epoch 0 → year 9999" window can't sit in
+    # the table forever suppressing every alert for a target.
+    if end - start > 366 * 86400:
+        return jsonify({"ok": False, "error": "Maintenance window cannot exceed 366 days"}), 400
 
     with _WEBHOOK_LOCK:
         try:
             window = MaintenanceRepository.create_window(
                 scope=scope, target=target, reason=reason, start=float(start), end=float(end)
             )
+            _invalidate_maint_cache()
         except Exception:
-            window = {
-                "id": f"mw_{int(time.time() * 1000)}",
-                "scope": scope,
-                "target": target,
-                "reason": reason,
-                "start": start,
-                "end": end,
-                "created_at": int(time.time()),
-            }
+            logger.exception("create_maintenance_api: DB write failed")
+            return jsonify({"ok": False, "error": "Failed to save maintenance window"}), 500
 
     AuditLogRepository.record_action(
         actor_username=g.current_user.get("username", "admin"),
@@ -1780,6 +2271,7 @@ def delete_maintenance_api(window_id):
     with _WEBHOOK_LOCK:
         try:
             deleted = MaintenanceRepository.delete_window(window_id)
+            _invalidate_maint_cache()
         except Exception:
             deleted = False
         if not deleted:
@@ -1922,11 +2414,13 @@ def load_dependencies():
     """SQLite (DependencyRepository) is the sole source of truth — see
     load_maintenance_windows() earlier in this file for why dependencies.json's
     old dual-write (SQLite + a separate JSON copy) was removed rather than
-    kept as a merge-by-id fallback."""
-    try:
-        return DependencyRepository.list_dependencies()
-    except Exception:
-        return []
+    kept as a merge-by-id fallback. Memoized per-request via flask.g."""
+    def _load():
+        try:
+            return DependencyRepository.list_dependencies()
+        except Exception:
+            return []
+    return _request_memo("dependencies", _load)
 
 def apply_correlation_suppression(targets, parent_map):
     """Pure function: tags each target in-place with dependsOn/suppressedBy.
@@ -1959,8 +2453,10 @@ def create_dependency_api():
     with _WEBHOOK_LOCK:
         try:
             dep = DependencyRepository.create_dependency(parent=parent, child=child)
+            _invalidate_dep_cache()
         except Exception:
-            dep = {"id": f"dep_{int(time.time() * 1000)}", "child": child, "parent": parent, "created_at": int(time.time())}
+            logger.exception("create_dependency_api: DB write failed")
+            return jsonify({"ok": False, "error": "Failed to save dependency"}), 500
 
     AuditLogRepository.record_action(
         actor_username=g.current_user.get("username", "admin"),
@@ -1978,6 +2474,7 @@ def delete_dependency_api(dep_id):
     with _WEBHOOK_LOCK:
         try:
             deleted = DependencyRepository.delete_dependency(dep_id)
+            _invalidate_dep_cache()
         except Exception:
             deleted = False
         if not deleted:
@@ -2277,6 +2774,19 @@ def fetch_all_probe_metrics(cache_ttl=3.0, timeout=None):
 # own `for:` delay.
 OUTAGE_GRACE_SECONDS = float(os.environ.get("OUTAGE_GRACE_SECONDS", "15"))
 
+def _sane_epoch(ts):
+    """Coerce a down-since value to a plausible Unix-seconds timestamp, else 0.
+    The wallboard ages an outage as `now - downSince`; a junk small/negative
+    value there rendered as "496859h" (i.e. counting from 1970). ~2001..~2286
+    is the accepted window; anything else becomes 0 (the UI then times the
+    outage from when it first saw it)."""
+    try:
+        v = int(float(ts))
+    except (TypeError, ValueError):
+        return 0
+    return v if 1_000_000_000 <= v <= 10_000_000_000 else 0
+
+
 def _outage_past_grace(down_since_ts, now=None):
     """False while a target has been down for less than OUTAGE_GRACE_SECONDS.
     down_since_ts is Prometheus's last-seen-up timestamp (item['downSince']).
@@ -2326,8 +2836,7 @@ def _derive_probe_readings(keys, probe_success_map, probe_duration_map, probe_st
         health = 'unknown'
 
     if health != 'up':
-        last_up = _first(down_since_prom_map)
-        down_since_val = int(last_up) if last_up else 0
+        down_since_val = _sane_epoch(_first(down_since_prom_map))
     else:
         down_since_val = 0
 
@@ -2386,6 +2895,17 @@ def build_canonical_monitoring_state(job_param=None):
 
     use_node_exporter_correlation = get_availability_settings().get("use_node_exporter_correlation", False)
 
+    # Per-instance "slow" latency threshold — the live grid must honour the
+    # same SlowThresholdRepository overrides the SlowResponse alert does, not
+    # a hardcoded 500ms (audit F4).
+    try:
+        _slow_thresholds = SlowThresholdRepository.get_all()
+    except Exception:
+        _slow_thresholds = {}
+
+    def _slow_threshold_for(inst):
+        return _slow_thresholds.get(inst, DEFAULT_SLOW_RESPONSE_THRESHOLD_MS)
+
     if has_down:
         down_since_prom_map = fetch_down_since_prom_map(cache_ttl=10.0)
         # Bulk single query (same shape as probe_success_map above), only
@@ -2431,15 +2951,12 @@ def build_canonical_monitoring_state(job_param=None):
             if j and j != 'prometheus':
                 available_jobs.add(j)
 
-    # Load active alerts from status.json (populated by webhook & synthetic poller) or SQLite
-    status_data = load_json(STATUS_FILE, None)
-    if status_data is not None and isinstance(status_data, dict) and "alerts" in status_data:
-        active_alerts_list = status_data.get('alerts', [])
-    else:
-        try:
-            active_alerts_list = IncidentRepository.get_active_incidents()
-        except Exception:
-            active_alerts_list = []
+    # Active-alert state: SQLite incidents is the SINGLE source of truth
+    # (audit F1). status.json is only a denormalized write-through cache;
+    # reading it preferentially let the two diverge silently — a SQLite-only
+    # firing incident became an unclearable phantom CRITICAL, a status.json
+    # -only one desynced /history from /status.
+    active_alerts_list = active_incident_list()
 
     alerts_by_instance = {}
     for a in active_alerts_list:
@@ -2533,7 +3050,7 @@ def build_canonical_monitoring_state(job_param=None):
             if matches_job_filter(alert_job, alert_job, job_param):
                 is_any_down = any(a.get('name') == ALERTNAME_TARGET_DOWN for a in inst_alerts)
                 health = 'down' if is_any_down else 'up'
-                down_since_val = inst_alerts[0].get('time', 0) if is_any_down else 0
+                down_since_val = _sane_epoch(inst_alerts[0].get('time')) if is_any_down else 0
                 result.append({
                     "instance":        inst,
                     "job":             alert_job,
@@ -2586,10 +3103,19 @@ def build_canonical_monitoring_state(job_param=None):
     # Derive authoritative target-level severity & effective_status
     _now_wall = time.time()
     for item in result:
-        is_down = item['health'] != 'up'
+        # 'unknown' means Prometheus has no probe_success sample for this
+        # target at all (e.g. a websites.yml entry no scrape job covers) —
+        # that is "no data", NOT an outage. Treating it as down made every
+        # un-scraped custom target a phantom confirmed outage on startup:
+        # is_down was `!= 'up'`, downSince defaulted to 0, and
+        # _outage_past_grace(0) fail-opens → CRITICAL + siren every boot.
+        is_down = item['health'] == 'down'
+        is_nodata = item['health'] not in ('up', 'down')
         is_maint = item['maintenance']
         is_supp = bool(item.get('suppressedBy'))
-        is_slow = (item['health'] == 'up' and item['responseTimeMs'] > 500)
+        slow_threshold_ms = _slow_threshold_for(item['instance'])
+        item['slowThresholdMs'] = slow_threshold_ms
+        is_slow = (item['health'] == 'up' and item['responseTimeMs'] > slow_threshold_ms)
         has_crit_alert = any(a.get('severity') == 'critical' for a in item.get('active_alerts', []))
         has_warn_alert = any(a.get('severity') == 'warning' for a in item.get('active_alerts', []))
 
@@ -2599,7 +3125,8 @@ def build_canonical_monitoring_state(job_param=None):
         confirmed_outage = is_down and _outage_past_grace(item.get('downSince'), _now_wall)
         item['pending_outage'] = is_down and not confirmed_outage
 
-        # Is target actionable / alarmable?
+        # Is target actionable / alarmable? 'no data' on its own never is — it
+        # only becomes alarmable if it also carries a real firing alert.
         is_alarmable = (confirmed_outage or has_crit_alert or has_warn_alert) and not is_maint and not is_supp
         item['is_alarmable'] = is_alarmable
 
@@ -2612,6 +3139,8 @@ def build_canonical_monitoring_state(job_param=None):
             item['severity'] = "critical"
         elif is_slow or has_warn_alert:
             item['severity'] = "warning"
+        elif is_nodata:
+            item['severity'] = "unknown"
         else:
             item['severity'] = "ok"
 
@@ -2624,6 +3153,8 @@ def build_canonical_monitoring_state(job_param=None):
             item['effective_status'] = "down"
         elif is_slow or has_warn_alert:
             item['effective_status'] = "degraded"
+        elif is_nodata:
+            item['effective_status'] = "no_data"
         else:
             item['effective_status'] = "up"
 
@@ -2631,7 +3162,10 @@ def build_canonical_monitoring_state(job_param=None):
     # `result` is filtered by job_param, so it only has full down-state visibility
     # on the unfiltered ("all") sweep -- running this on a job-scoped view would
     # see every other job's down instances as "absent" and wipe their acks.
-    if not job_param or job_param.lower() in ('all', '*'):
+    # Only take a write lock when there is actually an acknowledgment to
+    # possibly clear — otherwise this GET path opened a BEGIN IMMEDIATE
+    # transaction on SQLite every 5s per polling client for nothing.
+    if (not job_param or job_param.lower() in ('all', '*')) and active_acks:
         try:
             active_down_set = {t['instance'] for t in result if t['health'] != 'up'}
             AcknowledgmentRepository.clear_resolved(active_down_set)
@@ -2641,8 +3175,9 @@ def build_canonical_monitoring_state(job_param=None):
     # Compute authoritative global system metrics & status
     total = len(result)
     up_count = sum(1 for t in result if t['health'] == 'up')
-    down_count = sum(1 for t in result if t['health'] != 'up')
-    slow_count = sum(1 for t in result if t['health'] == 'up' and t['responseTimeMs'] > 500)
+    down_count = sum(1 for t in result if t['health'] == 'down')
+    nodata_count = sum(1 for t in result if t['health'] not in ('up', 'down'))
+    slow_count = sum(1 for t in result if t['health'] == 'up' and t['responseTimeMs'] > _slow_threshold_for(t['instance']))
     maint_count = sum(1 for t in result if t['maintenance'])
     supp_count = sum(1 for t in result if t.get('suppressedBy'))
     alarmable_down = sum(1 for t in result if t['is_alarmable'] and t['health'] != 'up')
@@ -2672,6 +3207,7 @@ def build_canonical_monitoring_state(job_param=None):
         "total": total,
         "up": up_count,
         "down": down_count,
+        "no_data": nodata_count,
         "slow": slow_count,
         "maintenance": maint_count,
         "suppressed": supp_count,
@@ -2710,6 +3246,7 @@ def build_canonical_monitoring_state(job_param=None):
 
 # ── Instances & Real-time Metrics API ─────────────────────────────────────────
 @app.route('/instances')
+@app.route('/api/instances')
 @rate_limit(120, 60)
 def instances():
     job_param = request.args.get('job', DEFAULT_JOB_FILTER)
@@ -2744,9 +3281,9 @@ def get_instance_job_map(job_filter=None):
         if matches_job_filter("custom", "custom", job_filter) and target_url not in deleted_targets:
             job_map.setdefault(target_url, "custom")
 
-    # Also include instances with active alerts
-    status_data = load_json(STATUS_FILE, {"alerts": []})
-    for a in status_data.get('alerts', []):
+    # Also include instances with active alerts — from SQLite, the single
+    # source of truth for active-alert state (audit F1).
+    for a in active_incident_list():
         inst = a.get('instance')
         if inst and inst not in deleted_targets and matches_job_filter(a.get('job', 'alertmanager'), 'alertmanager', job_filter):
             job_map.setdefault(inst, a.get('job') or 'alertmanager')
@@ -2821,7 +3358,82 @@ def _attach_sla_budgets(summary_dict, window_sec, default_target_pct, project_da
     fa = summary_dict.get("fleet_aggregate", {}) or {}
     f_dt = float(fa.get("total_downtime_minutes") or 0.0) * 60.0
     f_obs = float(fa.get("total_observed_minutes") or 0.0) * 60.0
-    return sla_budget(f_dt, f_obs, default_target_pct, window_sec, project_days)
+    # f_dt/f_obs are fleet TOTALS (summed over every scored host), so the
+    # window they're measured against must be the fleet total too — one
+    # host's window * scored host count. Passing the single-host window here
+    # made the fleet error budget report ~Nx the real usage (N hosts ->
+    # "BREACHED" on a healthy fleet).
+    n_scored = int(summary_dict.get("scored_count") or 0) or 1
+    return sla_budget(f_dt, f_obs, default_target_pct, window_sec * n_scored, project_days)
+
+
+def _build_fleet_trend(db_bucket_records, trend_end_ts, hours=24):
+    """Per-hour fleet availability over the last `hours`, for the modal's
+    Availability Trend line chart. Fleet availability for one hour =
+    sum(uptime_seconds) / sum(coverage_seconds) across every instance's bucket
+    for that hour. Hours with zero fleet coverage are omitted (the chart shows
+    a gap). Returns [] when no materialized buckets fall in the window — the
+    frontend keeps its "not enough hourly buckets yet" placeholder in that case.
+    """
+    if not db_bucket_records:
+        return []
+    cutoff = float(trend_end_ts) - hours * 3600.0
+    by_hour = {}
+    for b in db_bucket_records:
+        try:
+            bs = float(b.get("bucket_start", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if bs < cutoff or bs >= float(trend_end_ts):
+            continue
+        agg = by_hour.setdefault(bs, [0.0, 0.0])
+        agg[0] += float(b.get("uptime_seconds", 0) or 0)
+        agg[1] += float(b.get("coverage_seconds", 0) or 0)
+    series = []
+    for bs in sorted(by_hour):
+        up, cov = by_hour[bs]
+        if cov <= 0:
+            continue
+        series.append({
+            "ts": int(bs),
+            "availability_pct": round(max(0.0, min(100.0, (up / cov) * 100.0)), 2),
+        })
+    return series
+
+
+@app.route('/api/availability/data-range')
+@rate_limit(120, 60)
+def api_availability_data_range():
+    """Resolve the "Since data began" range: earliest telemetry we hold for
+    this job filter -> now, expressed as a minutes span the rest of the
+    range pipeline (/api/availability, /api/target-history, charts) already
+    understands. `minutes` is null when there is nothing recorded yet."""
+    job_filter = request.args.get('job', DEFAULT_JOB_FILTER)
+    job_key = job_filter if (job_filter and job_filter != 'all') else 'all'
+    since_ts = None
+    try:
+        since_ts = AvailabilityBucketRepository.get_earliest_bucket_start(job_key)
+    except Exception:
+        logger.warning("data-range: earliest bucket lookup failed", exc_info=True)
+    # No materialized archive yet (fresh install, aggregator hasn't run): anchor
+    # to when the Prometheus endpoint was registered — the earliest point
+    # continuous monitoring could have started. NOT the oldest incident: one
+    # stale alert row from a week ago would stretch the window to 7d while
+    # Prometheus's in-memory buffer only answers for ~24h, making the whole
+    # fleet read as 86% "unmonitored".
+    if since_ts is None:
+        try:
+            ep = EndpointRepository.get_active_endpoint()
+            if ep and ep.get("created_at"):
+                since_ts = float(ep["created_at"])
+        except Exception:
+            since_ts = None
+    now = time.time()
+    if since_ts is None or since_ts >= now:
+        return jsonify({"ok": True, "since_ts": None, "minutes": None})
+    minutes = max(1, int(round((now - since_ts) / 60.0)))
+    minutes = min(minutes, 366 * 1440)  # same ceiling as api_availability
+    return jsonify({"ok": True, "since_ts": round(since_ts, 1), "minutes": minutes})
 
 
 @app.route('/api/availability')
@@ -2841,7 +3453,7 @@ def api_availability():
         except (TypeError, ValueError):
             days = 1.0
         minutes = days * 1440.0
-    minutes = max(1.0, min(minutes, 90 * 1440.0))
+    minutes = max(1.0, min(minutes, 366 * 1440.0))
     minutes_int = int(round(minutes))
 
     # SLA error-budget target/period (optional overrides; default 99.9% / 30d)
@@ -2952,6 +3564,8 @@ def api_availability():
                 "entries": [],
                 "targets": {},
                 "analytics": empty_summary.get("analytics", {}),
+                "trend": [],
+                "trend_end_ts": int(req_end),
                 "source": "nodata"
             }
             with _AVAILABILITY_CACHE_LOCK:
@@ -3082,6 +3696,7 @@ def api_availability():
                 "prometheus_seconds": hybrid_meta.get("prometheus_seconds", 0.0),
                 "overlap_removed_seconds": hybrid_meta.get("overlap_removed_seconds", 0.0),
                 "maintenance_excluded_seconds": hybrid_meta.get("maintenance_excluded_seconds", 0.0),
+                "maintenance_scheduled_seconds": hybrid_meta.get("maintenance_scheduled_seconds", 0.0),
                 "sla": fleet_sla_budget,
                 "coverage_percent": hybrid_meta.get("coverage_percent", 0.0),
                 "availability_percent": summary_dict['fleet_aggregate']['value'],
@@ -3110,9 +3725,15 @@ def api_availability():
                 "entries": summary_dict['per_server']['values'],
                 "targets": {e['id']: e['availability_pct'] for e in summary_dict['per_server']['values']},
                 "analytics": summary_dict.get('analytics', {}),
+                "trend": _build_fleet_trend(db_bucket_records, req_end),
+                "trend_end_ts": int(req_end),
                 "source": "materialized",
                 "_trace": trace_data,
             }
+            # F57: the per-request timing block is a debugging aid, not UI data —
+            # keep it out of the cached/served payload unless explicitly asked.
+            if not request.args.get("debug"):
+                payload.pop("_trace", None)
             with _AVAILABILITY_CACHE_LOCK:
                 _AVAILABILITY_CACHE[avail_cache_key] = (now_under_lock, payload)
 
@@ -3230,11 +3851,15 @@ def api_availability():
         fleet_sla_budget = _attach_sla_budgets(summary_dict, minutes * 60.0, sla_target_pct, sla_days, target_map=sla_target_map)
         hybrid_meta = summary_dict.get("hybrid", {})
 
-        # Materialize completed hourly buckets in tests or background
+        # Materialize completed hourly buckets — TEST-ONLY (audit F3). In
+        # production the background aggregator (_aggregate_availability_cycle)
+        # is the sole materializer; running this per hybrid request and
+        # discarding the result (it is only persisted under TESTING) was pure
+        # wasted CPU on the frontend's 15s poll.
         materialized_buckets = []
         h_start = math.floor(req_start / 3600.0) * 3600.0
         h_end = math.ceil(req_end / 3600.0) * 3600.0
-        if h_end > h_start:
+        if h_end > h_start and app.config.get('TESTING'):
             num_hours = max(1, int(round((h_end - h_start) / 3600.0)))
             for inst in monitored_instances:
                 rc = count_map.get(inst)
@@ -3285,11 +3910,10 @@ def api_availability():
                     cur_h = nxt_h
 
         if materialized_buckets:
-            if app.config.get('TESTING'):
-                try:
-                    AvailabilityBucketRepository.save_buckets(materialized_buckets)
-                except Exception:
-                    pass
+            try:
+                AvailabilityBucketRepository.save_buckets(materialized_buckets)
+            except Exception:
+                pass
 
         # Live status count resolution
         counts = {"online": 0, "warning": 0, "offline": 0}
@@ -3350,6 +3974,7 @@ def api_availability():
             "prometheus_seconds": hybrid_meta.get("prometheus_seconds", 0.0),
             "overlap_removed_seconds": hybrid_meta.get("overlap_removed_seconds", 0.0),
             "maintenance_excluded_seconds": hybrid_meta.get("maintenance_excluded_seconds", 0.0),
+            "maintenance_scheduled_seconds": hybrid_meta.get("maintenance_scheduled_seconds", 0.0),
             "sla": fleet_sla_budget,
             "coverage_percent": hybrid_meta.get("coverage_percent", 0.0),
             "availability_percent": summary_dict['fleet_aggregate']['value'],
@@ -3378,9 +4003,13 @@ def api_availability():
             "entries": summary_dict['per_server']['values'],
             "targets": {e['id']: e['availability_pct'] for e in summary_dict['per_server']['values']},
             "analytics": summary_dict.get('analytics', {}),
+            "trend": _build_fleet_trend(db_bucket_records, req_end),
+            "trend_end_ts": int(req_end),
             "source": hybrid_meta.get("source", "fallback"),
             "_trace": trace_data,
         }
+        if not request.args.get("debug"):
+            payload.pop("_trace", None)
 
         with _AVAILABILITY_CACHE_LOCK:
             _AVAILABILITY_CACHE[avail_cache_key] = (now_under_lock, payload)
@@ -3400,6 +4029,7 @@ def target_history_api():
         minutes = int(float(minutes_param))
     except (ValueError, TypeError):
         minutes = 1440
+    minutes = max(1, min(minutes, 366 * 1440))  # ceiling matches /api/availability
 
     if not target_url:
         return jsonify({"ok": False, "error": "Target parameter is required"}), 400
@@ -3688,11 +4318,26 @@ def health():
         (poller_tick_age is not None and poller_tick_age < ALERT_POLL_INTERVAL_SECONDS * 3)
     )
 
+    # Availability aggregator heartbeat (audit F5) — a silently dead aggregator
+    # stops all hourly bucket materialization.
+    aggregator_enabled = (
+        os.environ.get("DISABLE_AVAILABILITY_AGGREGATOR") != "1"
+        and os.environ.get("DISABLE_ALERT_POLLER") != "1"
+    )
+    aggregator_tick_age = (now - _LAST_AGGREGATOR_TICK[0]) if _LAST_AGGREGATOR_TICK[0] else None
+    aggregator_ok = (
+        not aggregator_enabled or
+        (aggregator_tick_age is not None and aggregator_tick_age < AVAIL_AGGREGATE_INTERVAL_SECONDS * 3)
+    )
+
     components = {
         "prometheus":     {"ok": prometheus_ok, "url": prom_base},
         "monitoring_api":  {"ok": True},
         "alarm_service":   {"ok": alarm_service_ok, "last_tick_seconds_ago": (
             round(poller_tick_age, 1) if poller_tick_age is not None else None)},
+        "availability_aggregator": {"ok": aggregator_ok, "last_tick_seconds_ago": (
+            round(aggregator_tick_age, 1) if aggregator_tick_age is not None else None),
+            "enabled": aggregator_enabled},
         "storage":         {"ok": storage_ok},
     }
     overall_ok = all(c["ok"] for c in components.values())
@@ -3719,7 +4364,8 @@ WEBHOOK_ACTIVE_WINDOW_SECONDS = 120
 
 # SlowResponse (warning-severity, up-but-degraded) config. See
 # compute_slow_response_transitions() for the debounce rule this backs.
-DEFAULT_SLOW_RESPONSE_THRESHOLD_MS = float(os.environ.get("SLOW_RESPONSE_THRESHOLD_MS", "500"))
+# DEFAULT_SLOW_RESPONSE_THRESHOLD_MS is defined near the top of this file so
+# build_canonical_monitoring_state() can use it for the live grid too (F4).
 SLOW_RESPONSE_DEBOUNCE_N = int(os.environ.get("SLOW_RESPONSE_DEBOUNCE_N", "3"))
 
 _poller_state = {}  # instance -> 'up' | 'down', seeded from status.json at startup
@@ -3800,12 +4446,11 @@ def compute_slow_response_transitions(readings, prev_state, thresholds, debounce
     return transitions, new_state
 
 def _seed_poller_state():
-    # Currently-firing alerts (survived from before a backend restart) seed
+    # Currently-firing incidents (survived from before a backend restart) seed
     # as 'down' so we don't re-fire a duplicate "went offline" for an outage
-    # that's already recorded in history.json — only its eventual recovery
-    # still needs to be observed and resolved.
-    status_data = load_json(STATUS_FILE, {"alerts": []})
-    for a in status_data.get('alerts', []):
+    # that's already recorded — only its eventual recovery still needs to be
+    # observed and resolved. SQLite is the source of truth (audit F1).
+    for a in active_incident_list():
         inst = a.get('instance')
         if inst:
             _poller_state[inst] = 'down'
@@ -3817,12 +4462,14 @@ def _reconcile_orphaned_alerts(monitored_instances):
     such an alert can never be observed recovering (compute_state_transitions
     / compute_slow_response_transitions only look at instances still present
     in success_map/instances) and stays firing forever, permanently pinning
-    status.json to CRITICAL/WARNING. See AUDIT.md.
-    Only touches poller-owned alerts, and only runs when `instances` is
-    non-empty (i.e. Prometheus itself is reachable) — see call site."""
-    status_data = load_json(STATUS_FILE, {"alerts": []})
+    system status to CRITICAL/WARNING.
+    Reads the active set from SQLite (single source of truth, audit F1) so a
+    phantom incident that only exists in the DB — not in the status.json
+    cache — is still reconciled here. Only touches poller-owned alerts, and
+    only runs when `instances` is non-empty (Prometheus reachable) — see call
+    site."""
     orphaned = [
-        a for a in status_data.get('alerts', [])
+        a for a in active_incident_list()
         if a.get('name') in (ALERTNAME_TARGET_DOWN, ALERTNAME_SLOW_RESPONSE) and a.get('instance') not in monitored_instances
     ]
     for a in orphaned:
@@ -4023,7 +4670,7 @@ def _poller_loop():
         try:
             _poll_targets_once()
         except Exception as e:
-            print(f"Alert poller error: {e}", flush=True)
+            logger.error(f"Alert poller error: {e}", exc_info=True)
         time.sleep(ALERT_POLL_INTERVAL_SECONDS)
 
 _poller_thread_started = False
@@ -4039,6 +4686,10 @@ def start_alert_poller():
 _AVAIL_AGGREGATOR_WORKER_ID = f"{os.getpid()}_{uuid.uuid4().hex[:8]}"
 AVAIL_AGGREGATE_INTERVAL_SECONDS = 60.0
 _avail_aggregator_started = False
+# Heartbeat for /health — set at the top of every aggregator cycle (leader or
+# not), so a wedged/crashed aggregator thread is visible instead of silently
+# stopping all bucket materialization (audit F5).
+_LAST_AGGREGATOR_TICK = [0.0]
 
 def _availability_aggregation_windows(now, latest_end):
     """Time windows the aggregator should (re)aggregate this cycle.
@@ -4074,6 +4725,7 @@ def _availability_aggregation_windows(now, latest_end):
 
 def _aggregate_availability_cycle():
     """Incremental availability aggregation run executed only by the elected leader worker."""
+    _LAST_AGGREGATOR_TICK[0] = time.time()
     is_leader = AggregationLeaseRepository.acquire_or_renew(
         lease_name="avail_aggregator",
         owner_id=_AVAIL_AGGREGATOR_WORKER_ID,
@@ -4343,12 +4995,14 @@ def _aggregate_availability_cycle():
             try:
                 AvailabilityBucketRepository.save_buckets(bucket_records)
             except Exception:
-                pass
+                # Was silently swallowed (audit F5) — a persistently failing
+                # write silently stops all bucket materialization.
+                logger.exception("availability aggregator: save_buckets failed for %d record(s)", len(bucket_records))
 
     try:
         AvailabilityBucketRepository.prune_old_buckets(35 * 86400)
     except Exception:
-        pass
+        logger.exception("availability aggregator: prune_old_buckets failed")
 
 
 def _availability_aggregator_loop():
@@ -4356,7 +5010,7 @@ def _availability_aggregator_loop():
         try:
             _aggregate_availability_cycle()
         except Exception as e:
-            print(f"Availability aggregator error: {e}", flush=True)
+            logger.error(f"Availability aggregator error: {e}", exc_info=True)
         time.sleep(AVAIL_AGGREGATE_INTERVAL_SECONDS)
 
 
@@ -4367,6 +5021,45 @@ def start_availability_aggregator():
     _avail_aggregator_started = True
     threading.Thread(target=_availability_aggregator_loop, daemon=True, name="avail-aggregator").start()
 
+
+def _reconcile_status_json_into_sqlite():
+    """One-shot at boot: SQLite `incidents` is the source of truth for
+    active-alert state (audit F1), but an ops restore that brings back only
+    status.json (the denormalized cache) would otherwise lose the active
+    incident entirely. Import any firing alert in status.json that SQLite
+    doesn't already have as a firing incident, so recovery still works from
+    either artefact. No-op when status.json is absent/empty (the common case).
+    """
+    try:
+        status_data = load_json(STATUS_FILE, None)
+        if not isinstance(status_data, dict):
+            return
+        alerts = status_data.get("alerts") or []
+        if not alerts:
+            return
+        try:
+            active_keys = {a.get("key") for a in IncidentRepository.get_active_incidents()}
+        except Exception:
+            active_keys = set()
+        imported = 0
+        for a in alerts:
+            key = a.get("key") or f"{a.get('name')}|{a.get('instance')}"
+            if key in active_keys:
+                continue
+            IncidentRepository.record_alert_event(
+                name=a.get("name", "Unknown"), severity=a.get("severity", "critical"),
+                instance=a.get("instance", "-"), summary=a.get("summary", ""),
+                job=a.get("job", ""), event_time=float(a.get("time", time.time())),
+                is_now_firing=True, key=key,
+            )
+            imported += 1
+        if imported:
+            logger.info("Recovered %d active incident(s) from status.json into SQLite on boot", imported)
+    except Exception:
+        logger.exception("status.json -> SQLite active-incident reconcile failed")
+
+
+_reconcile_status_json_into_sqlite()
 
 if os.environ.get("DISABLE_ALERT_POLLER") != "1":
     start_alert_poller()

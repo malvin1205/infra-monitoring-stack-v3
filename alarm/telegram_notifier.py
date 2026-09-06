@@ -3,6 +3,7 @@ import json
 import time
 import html
 import logging
+import threading
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -16,6 +17,21 @@ CONFIG_FILE = os.path.join(os.path.dirname(__file__), "telegram_config.json")
 
 # Asynchronous worker pool for non-blocking notifications
 _EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="tg-alert")
+
+# Backpressure: a fleet-wide flap can hand this module hundreds of alerts in
+# seconds. With 2 workers and a ~10s-per-send API, an unbounded submit queue
+# grows without limit and drains for the better part of an hour. Cap the
+# in-flight+queued count; past the cap, drop and count — one summary line goes
+# out when the backlog clears.
+_MAX_PENDING = 40
+_pending_lock = threading.Lock()
+_pending = 0
+_suppressed = 0
+
+# mtime-keyed config cache — get_telegram_config() was re-reading and
+# re-parsing telegram_config.json once per alert.
+_cfg_cache = {"mtime": None, "data": None}
+_cfg_lock = threading.Lock()
 
 # Local timezone offset (WIB / UTC+7 default, can be overridden). A bad value
 # (e.g. "UTC+7", empty string) must not crash the whole app at import time --
@@ -73,14 +89,28 @@ def get_telegram_config() -> Dict[str, Any]:
         "min_severity": "critical"
     }
 
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                saved = json.load(f)
-                if isinstance(saved, dict):
-                    config.update(saved)
-        except Exception as e:
-            logger.warning(f"Failed to read {CONFIG_FILE}: {e}")
+    saved = None
+    try:
+        mtime = os.path.getmtime(CONFIG_FILE)
+    except OSError:
+        mtime = None
+    if mtime is not None:
+        with _cfg_lock:
+            if _cfg_cache["mtime"] == mtime and _cfg_cache["data"] is not None:
+                saved = _cfg_cache["data"]
+        if saved is None:
+            try:
+                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    saved = loaded
+                    with _cfg_lock:
+                        _cfg_cache["mtime"] = mtime
+                        _cfg_cache["data"] = loaded
+            except Exception as e:
+                logger.warning(f"Failed to read {CONFIG_FILE}: {e}")
+    if isinstance(saved, dict):
+        config.update(saved)
 
     # Environment variables take precedence if present
     env_token = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -99,20 +129,27 @@ def get_telegram_config() -> Dict[str, Any]:
 
 
 def save_telegram_config(new_config: Dict[str, Any]) -> bool:
-    """Persist telegram configuration to telegram_config.json."""
+    """Persist telegram configuration to telegram_config.json (atomic write)."""
     try:
         current = get_telegram_config()
         current.update(new_config)
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        tmp = f"{CONFIG_FILE}.tmp.{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(current, f, indent=2)
+        os.replace(tmp, CONFIG_FILE)
+        with _cfg_lock:
+            _cfg_cache["mtime"] = None
+            _cfg_cache["data"] = None
         return True
     except Exception as e:
         logger.error(f"Failed to save telegram config: {e}")
         return False
 
 
-def send_telegram_raw(bot_token: str, chat_id: str, text: str, parse_mode: str = "HTML") -> Tuple[bool, str]:
-    """Synchronous HTTP call to Telegram Bot API sendMessage."""
+def send_telegram_raw(bot_token: str, chat_id: str, text: str, parse_mode: str = "HTML",
+                      _attempt: int = 0) -> Tuple[bool, str]:
+    """Synchronous HTTP call to Telegram Bot API sendMessage. On HTTP 429
+    (rate limited) it honours the API's retry_after once, then gives up."""
     if not bot_token or not chat_id:
         return False, "Bot token or Chat ID is not configured"
 
@@ -140,11 +177,24 @@ def send_telegram_raw(bot_token: str, chat_id: str, text: str, parse_mode: str =
                 return False, resp_json.get("description", "Unknown Telegram API error")
     except urllib.error.HTTPError as e:
         err_msg = f"HTTP error {e.code}: {e.reason}"
+        retry_after = None
         try:
             err_body = json.loads(e.read().decode("utf-8"))
             err_msg = f"Telegram API error {e.code}: {err_body.get('description', e.reason)}"
+            retry_after = (err_body.get("parameters") or {}).get("retry_after")
         except Exception:
             pass
+        if retry_after is None:
+            try:
+                retry_after = int(e.headers.get("Retry-After", ""))
+            except (TypeError, ValueError):
+                retry_after = None
+        if (e.code == 429 and _attempt == 0 and retry_after is not None
+                and not os.environ.get("PYTEST_CURRENT_TEST")):
+            wait = max(1, min(int(retry_after), 30))
+            logger.warning(f"Telegram rate limited; retrying once after {wait}s")
+            time.sleep(wait)
+            return send_telegram_raw(bot_token, chat_id, text, parse_mode, _attempt=1)
         logger.error(f"Telegram alert delivery failed: {err_msg}")
         return False, err_msg
     except Exception as e:
@@ -166,6 +216,7 @@ def build_alert_message(
     """Build a clean, structured HTML message for Telegram."""
     safe_instance = html.escape(str(instance or "-"))
     safe_job = html.escape(str(job or "blackbox"))
+    safe_summary = html.escape(str(summary).strip()) if summary else ""
     time_str = format_timestamp(event_time)
 
     if is_now_firing:
@@ -182,9 +233,11 @@ def build_alert_message(
         table_lines.append(f"{'Time':<11}{time_str}")
         table_content = "\n".join(table_lines)
 
+        detail = f"<i>{safe_summary}</i>\n\n" if safe_summary else ""
         return (
             "<b>🔴 InfraWatch — Service Down</b>\n\n"
             f"<pre>{table_content}</pre>\n\n"
+            f"{detail}"
             "Investigate host availability."
         )
     else:
@@ -267,6 +320,20 @@ def _async_send_worker(
         logger.warning(f"Telegram alert send failed for {instance}: {msg}")
 
 
+def _worker_done(_fut):
+    """Decrement the in-flight counter; when the backlog clears, emit one line
+    saying how many alerts were dropped while it was saturated."""
+    global _pending, _suppressed
+    with _pending_lock:
+        _pending = max(0, _pending - 1)
+        drained = _pending == 0 and _suppressed > 0
+        dropped = _suppressed
+        if drained:
+            _suppressed = 0
+    if drained:
+        logger.warning(f"Telegram backlog cleared — {dropped} alert(s) were dropped while saturated")
+
+
 def dispatch_alert_async(
     name: str,
     severity: str,
@@ -278,14 +345,28 @@ def dispatch_alert_async(
     duration_seconds: Optional[float] = None,
     latency_ms: Optional[float] = None
 ):
-    """Non-blocking asynchronous alert dispatcher. Call from record_alert_event."""
+    """Non-blocking asynchronous alert dispatcher. Call from record_alert_event.
+    Bounded: past _MAX_PENDING in-flight+queued sends, new alerts are dropped
+    and counted rather than growing the queue without limit during a flap
+    storm."""
+    global _pending, _suppressed
+    with _pending_lock:
+        if _pending >= _MAX_PENDING:
+            _suppressed += 1
+            if _suppressed == 1 or _suppressed % 25 == 0:
+                logger.warning(f"Telegram queue saturated ({_pending} pending) — dropping alerts (suppressed={_suppressed})")
+            return
+        _pending += 1
     try:
-        _EXECUTOR.submit(
+        fut = _EXECUTOR.submit(
             _async_send_worker,
             name, severity, instance, summary, job,
             event_time, is_now_firing, duration_seconds, latency_ms
         )
+        fut.add_done_callback(_worker_done)
     except Exception as e:
+        with _pending_lock:
+            _pending = max(0, _pending - 1)
         logger.error(f"Failed to submit telegram alert task: {e}")
 
 

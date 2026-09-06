@@ -14,10 +14,17 @@ DEFAULT_DB_PATH = os.path.join(DB_DIR, "infrawatch.db")
 _INITIALIZED_DBS = set()
 
 
-def _connect_raw(path: str) -> sqlite3.Connection:
+def _connect_raw(path: str, set_wal: bool = False) -> sqlite3.Connection:
     conn = sqlite3.connect(path, timeout=30.0, check_same_thread=False, isolation_level=None)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode = WAL;")
+    # journal_mode = WAL is persisted in the database file header once set, so
+    # every later connection opens in WAL automatically. Re-issuing it on every
+    # connection is the most expensive of these pragmas (it can force a
+    # checkpoint) and pure waste on the per-request hot path — only init_db
+    # needs to establish it. synchronous / busy_timeout are per-connection and
+    # cheap, so they stay here.
+    if set_wal:
+        conn.execute("PRAGMA journal_mode = WAL;")
     conn.execute("PRAGMA synchronous = NORMAL;")
     conn.execute("PRAGMA busy_timeout = 30000;")
     return conn
@@ -58,7 +65,7 @@ def db_read(db_path: Optional[str] = None):
 
 def init_db(db_path: Optional[str] = None):
     path = db_path or os.environ.get("INFRAWATCH_DB_PATH", DEFAULT_DB_PATH)
-    conn = _connect_raw(path)
+    conn = _connect_raw(path, set_wal=True)
     try:
         with conn:
             conn.executescript("""
@@ -200,7 +207,8 @@ def init_db(db_path: Optional[str] = None):
                 is_active INTEGER NOT NULL DEFAULT 1,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL,
-                last_login REAL
+                last_login REAL,
+                session_epoch INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
@@ -280,6 +288,13 @@ def init_db(db_path: Optional[str] = None):
             conn.execute("ALTER TABLE incidents ADD COLUMN acknowledged_by TEXT")
         if "acknowledged_at" not in inc_cols:
             conn.execute("ALTER TABLE incidents ADD COLUMN acknowledged_at REAL")
+
+        # session_epoch: bumped on password change so signed-cookie sessions
+        # (which have no server-side store) held on other devices stop
+        # authenticating. Pre-existing DBs get it at 0.
+        user_cols = {r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
+        if "session_epoch" not in user_cols:
+            conn.execute("ALTER TABLE users ADD COLUMN session_epoch INTEGER NOT NULL DEFAULT 0")
         conn.commit()
 
         # Seed from JSON files only if using the default production DB and table is empty
@@ -794,13 +809,18 @@ class EndpointRepository:
         with db_read(db_path) as conn:
             rows = conn.execute("SELECT * FROM endpoints ORDER BY created_at ASC").fetchall()
         if not rows:
-            with db_transaction(db_path) as conn:
-                ep_id = f"ep_{int(time.time() * 1000)}"
-                conn.execute("""
-                    INSERT OR IGNORE INTO endpoints (id, name, url, is_active, created_at)
-                    VALUES (?, ?, ?, 1, ?)
-                """, (ep_id, default_url, default_url, time.time()))
-            return {"active": default_url, "endpoints": [default_url]}
+            # Seed from default_url only when the operator actually configured
+            # one (PROMETHEUS_URL). A blank default means "no endpoint" — leave
+            # the table empty instead of resurrecting a bogus seed every boot.
+            if default_url:
+                with db_transaction(db_path) as conn:
+                    ep_id = f"ep_{int(time.time() * 1000)}"
+                    conn.execute("""
+                        INSERT OR IGNORE INTO endpoints (id, name, url, is_active, created_at)
+                        VALUES (?, ?, ?, 1, ?)
+                    """, (ep_id, default_url, default_url, time.time()))
+                return {"active": default_url, "endpoints": [default_url]}
+            return {"active": None, "endpoints": []}
 
         urls = [r["url"] for r in rows]
         active_row = next((r for r in rows if r["is_active"]), rows[0])
@@ -1043,6 +1063,16 @@ class AvailabilityBucketRepository:
             return float(row["max_end"]) if row and row["max_end"] is not None else None
 
     @staticmethod
+    def get_earliest_bucket_start(job: str = 'all', db_path: Optional[str] = None) -> Optional[float]:
+        """Oldest materialized bucket — the start of "since data began" ranges."""
+        with db_read(db_path) as conn:
+            row = conn.execute(
+                "SELECT MIN(bucket_start) as min_start FROM availability_buckets WHERE (job = ? OR ? = 'all')",
+                (job, job)
+            ).fetchone()
+            return float(row["min_start"]) if row and row["min_start"] is not None else None
+
+    @staticmethod
     def get_bucket_count_in_range(job: str, start_time: float, end_time: float, db_path: Optional[str] = None) -> int:
         with db_read(db_path) as conn:
             if job == 'all':
@@ -1217,6 +1247,9 @@ class UserRepository:
         if password_hash is not None:
             fields.append("password_hash = ?")
             params.append(password_hash)
+            # Invalidate this user's other signed-cookie sessions on a
+            # password change (checked in auth.get_current_authenticated_user).
+            fields.append("session_epoch = session_epoch + 1")
         if not fields:
             return False
         fields.append("updated_at = ?")
@@ -1291,12 +1324,18 @@ class AcknowledgmentRepository:
 
     @staticmethod
     def clear_resolved(active_down_instances: set, db_path: Optional[str] = None):
-        """Clean up acknowledgments for targets that are no longer down."""
+        """Clean up acknowledgments for targets that are no longer down.
+        Single DELETE with a NOT IN filter rather than SELECT + per-row DELETE."""
+        instances = list(active_down_instances)
         with db_transaction(db_path) as conn:
-            rows = conn.execute("SELECT target_key, instance FROM alert_acknowledgments").fetchall()
-            for r in rows:
-                if r["instance"] not in active_down_instances:
-                    conn.execute("DELETE FROM alert_acknowledgments WHERE target_key = ?", (r["target_key"],))
+            if instances:
+                placeholders = ",".join("?" for _ in instances)
+                conn.execute(
+                    f"DELETE FROM alert_acknowledgments WHERE instance NOT IN ({placeholders})",
+                    instances,
+                )
+            else:
+                conn.execute("DELETE FROM alert_acknowledgments")
 
 
 class AuditLogRepository:

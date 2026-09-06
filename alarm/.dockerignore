@@ -6,9 +6,23 @@ __pycache__
 .pytest_cache
 .env
 .env.*
+
+# Auto-generated per-deployment secrets — must never be baked into an image
+# layer (a shared image would then ship a known session-signing key / API key,
+# allowing forged admin sessions). They are regenerated on first run, or
+# mounted, at the target.
+.api_key
+.webhook_secret
+.session_secret
+
 *.db
 *.db-*
 telegram_config.json
+targets/websites.yml
+targets/websites.yml.bak
+targets/websites.yml.tmp
+targets/websites.yml.lock
+!targets/websites.yml.example
 history.json
 history_archive.json
 logs.json
@@ -17,4 +31,3 @@ endpoints.json
 deleted_targets.json
 dependencies.json
 maintenance.json
-test_*.py

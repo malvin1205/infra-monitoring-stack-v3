@@ -72,6 +72,13 @@ function closeLoginModal() {
 }
 
 function showUsersModal() {
+  // Manage Users needs an admin session. The header button is already hidden
+  // for non-admins, but a stale click (session expired since page load) or a
+  // direct call should route to login, not open a modal that only 401s.
+  if (!window.currentUser || window.currentUser.role !== 'admin') {
+    showLoginModal();
+    return;
+  }
   const modal = document.getElementById('usersModal');
   if (modal) {
     modal.classList.remove('hidden');
@@ -126,9 +133,9 @@ function initUsersListActions() {
     }
     const resetBtn = e.target.closest('.user-reset-pw-btn');
     if (resetBtn) {
-      const newPassword = prompt('New password (min 6 chars):');
+      const newPassword = prompt('New password (min 12 chars):');
       if (newPassword === null) return;
-      if (newPassword.length < 6) { alert('Password must be at least 6 characters'); return; }
+      if (newPassword.length < 12) { alert('Password must be at least 12 characters'); return; }
       resetBtn.disabled = true;
       const ok = await patchUser(resetBtn.dataset.userId, { password: newPassword });
       resetBtn.disabled = false;
@@ -140,8 +147,22 @@ function initUsersListActions() {
 async function fetchUsersList() {
   const container = document.getElementById('usersListContainer');
   if (!container) return;
+  const createForm = document.getElementById('createUserForm');
   try {
     const res = await apiFetch('/api/auth/users');
+    if (res.status === 401 || res.status === 403) {
+      // apiFetch suppresses its auto login-modal for /api/auth/* URLs, so a
+      // 401 here just rendered a bare "Unauthorized". Make it actionable and
+      // hide the create form (pointless without admin access).
+      if (createForm) createForm.classList.add('hidden');
+      container.innerHTML = `<div style="padding: 16px; text-align: center; font-size: 12px; color: var(--text-secondary);">`
+        + `Your session has expired or you are not signed in as an administrator.`
+        + `<div style="margin-top: 10px;"><button type="button" id="usersModalLoginBtn" class="btn btn-primary btn-sm">Log In</button></div>`
+        + `</div>`;
+      document.getElementById('usersModalLoginBtn')?.addEventListener('click', () => { closeUsersModal(); showLoginModal(); });
+      return;
+    }
+    if (createForm) createForm.classList.remove('hidden');
     const data = await res.json();
     if (res.ok && data.ok) {
       if (!data.users || data.users.length === 0) {
@@ -188,6 +209,7 @@ async function fetchUsersList() {
       container.innerHTML = `<div style="padding: 12px; text-align: center; color: var(--critical); font-size: 12px;">${data.error || 'Failed to load users'}</div>`;
     }
   } catch (err) {
+    if (createForm) createForm.classList.remove('hidden');
     container.innerHTML = '<div style="padding: 12px; text-align: center; color: var(--critical); font-size: 12px;">Network error loading users</div>';
   }
 }
@@ -231,6 +253,30 @@ function updateUserUI(user) {
     if (logoutBtn) logoutBtn.classList.add('hidden');
     if (manageUsersBtn) manageUsersBtn.classList.add('hidden');
   }
+}
+
+// One place to change the date/time locale for every chart axis, drawer
+// timestamp and log row. 'id-ID' renders 24h "HH.MM" and "DD Mmm"; switch to
+// e.g. 'en-GB' for "HH:MM" if the wallboard audience is non-Indonesian.
+const DATE_LOCALE = 'id-ID';
+
+// Single HTML-escaper for all innerHTML string building. Each page class
+// exposes it as this._esc() for call-site brevity; this is the one impl.
+function htmlEscape(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+// Effective "slow" latency threshold (ms) for a target. The backend now sends
+// a per-instance slowThresholdMs on every /instances row (honouring
+// SlowThresholdRepository overrides); fall back to 500 for an older payload.
+// Note `!= null` not `||` — an override of 0 ("always slow") is valid.
+function slowThresholdMs(t) {
+  return (t && t.slowThresholdMs != null) ? t.slowThresholdMs : 500;
 }
 
 // Global API Fetch helper using secure session cookie and CSRF protection
@@ -557,9 +603,11 @@ class InstancesPage {
     // Job select filter
     const jobSelect = document.getElementById('jobSelect');
     if (jobSelect) {
-      jobSelect.addEventListener('change', e => {
+      jobSelect.addEventListener('change', async e => {
         this.selectedJob = e.target.value;
         this._lastDataSignature = null;
+        // "Since start" span is job-scoped — re-resolve before reloading.
+        if (this.periodLabel === 'since') this.periodMinutes = await this._resolveSinceMinutes();
         this.load();
         this.loadAvailability();
         this._updateJobDefaultUI();
@@ -573,7 +621,7 @@ class InstancesPage {
 
     // Period / time-range chips (24h / 7d / 30d / Custom Range)
     if (this.rangeChipsGroup) {
-      this.rangeChipsGroup.addEventListener('click', e => {
+      this.rangeChipsGroup.addEventListener('click', async e => {
         const btn = e.target.closest('[data-range]');
         if (!btn) return;
         const range = btn.dataset.range;
@@ -586,6 +634,19 @@ class InstancesPage {
         this._closeCustomRangePopover();
         this._setActiveRangeChip(range);
 
+        if (range === 'since') {
+          this.isRealtime = false;
+          if (this.availabilityDetailBtn) this.availabilityDetailBtn.style.display = '';
+          this.periodEnd = null;
+          this.periodLabel = 'since';
+          this.periodMinutes = await this._resolveSinceMinutes();
+          const modalRangeSelectEl = document.getElementById('modalRangeSelect');
+          if (modalRangeSelectEl) modalRangeSelectEl.value = 'since';
+          this.loadAvailability(true);
+          if (this.selectedTarget) this.loadTargetHistory(this.selectedTarget.instance);
+          return;
+        }
+
         if (range === 'realtime') {
           this.isRealtime = true;
           this.periodLabel = 'realtime';
@@ -593,8 +654,6 @@ class InstancesPage {
           if (this.availabilityLabel) this.availabilityLabel.textContent = 'Availability (Realtime)';
           const drawerUptimeLabel = document.getElementById('drawerUptimeLabel');
           if (drawerUptimeLabel) drawerUptimeLabel.textContent = 'Uptime (Realtime)';
-          const breakdownRangeEl = document.getElementById('availabilityBreakdownRange');
-          if (breakdownRangeEl) breakdownRangeEl.textContent = '(Realtime)';
           const drawerSparklineRangeEl = document.getElementById('drawerSparklineRange');
           if (drawerSparklineRangeEl) drawerSparklineRangeEl.textContent = '(Realtime)';
           // Fleet-aggregate/lowest-availability breakdown is inherently a
@@ -663,7 +722,16 @@ class InstancesPage {
 
     const modalRangeSelect = document.getElementById('modalRangeSelect');
     if (modalRangeSelect) {
-      modalRangeSelect.addEventListener('change', e => {
+      modalRangeSelect.addEventListener('change', async e => {
+        if (e.target.value === 'since') {
+          this.isRealtime = false;
+          this.periodEnd = null;
+          this.periodLabel = 'since';
+          this.periodMinutes = await this._resolveSinceMinutes();
+          this._setActiveRangeChip('since');
+          this.loadAvailability(true);
+          return;
+        }
         const mins = parseFloat(e.target.value);
         if (!isNaN(mins) && mins > 0) {
           this.periodMinutes = mins;
@@ -749,6 +817,10 @@ class InstancesPage {
             this._renderAvailabilityBreakdown('sortMenu:enter');
           }
         } else if (e.key === 'Escape' || e.key === 'Tab') {
+          // Close only this dropdown — don't let the keystroke bubble to the
+          // window-level BACK/Escape interceptor, which would then also close
+          // the whole Availability Breakdown modal.
+          if (e.key === 'Escape') e.stopPropagation();
           toggleSortMenu(false);
           availSortTrigger.focus();
         }
@@ -1221,7 +1293,8 @@ class InstancesPage {
     else if (respMinutes === 4320) label = '3d';
     else if (respMinutes === 10080) label = '7d';
     else if (respMinutes === 43200) label = '30d';
-    else if (this.periodLabel === 'custom') label = 'custom';
+    if (this.periodLabel === 'custom') label = 'Custom';
+    else if (this.periodLabel === 'since') label = 'Since start';
 
     if (this.availabilityLabel) this.availabilityLabel.textContent = `Availability (${label})`;
 
@@ -1278,13 +1351,11 @@ class InstancesPage {
     const hasMatchingData = this.availabilityBreakdown && Math.round(this.availabilityBreakdown.period_minutes || 0) === Math.round(this.periodMinutes);
     this._updateAvailLoadingUI(!hasMatchingData);
 
-    const rangeText = this.periodLabel === 'custom' ? 'Custom' : this.periodLabel;
+    const rangeText = this._rangeDisplay();
 
     if (this.availabilityLabel) this.availabilityLabel.textContent = `Availability (${rangeText})`;
     const drawerUptimeLabel = document.getElementById('drawerUptimeLabel');
     if (drawerUptimeLabel) drawerUptimeLabel.textContent = `Uptime (${rangeText})`;
-    const breakdownRangeEl = document.getElementById('availabilityBreakdownRange');
-    if (breakdownRangeEl) breakdownRangeEl.textContent = `(${rangeText})`;
     const drawerSparklineRangeEl = document.getElementById('drawerSparklineRange');
     if (drawerSparklineRangeEl) drawerSparklineRangeEl.textContent = `(${rangeText})`;
 
@@ -1360,6 +1431,33 @@ class InstancesPage {
     this.rangeChipsGroup.querySelectorAll('.chip').forEach(b => {
       b.classList.toggle('chip-active', b.dataset.range === range);
     });
+  }
+
+  // Human label for the active range, used in every "Availability (…)" caption.
+  _rangeDisplay() {
+    if (this.periodLabel === 'custom') return 'Custom';
+    if (this.periodLabel === 'since') return 'Since start';
+    return this.periodLabel || '24h';
+  }
+
+  // "Since start" is dynamic — ask the backend for the span from the oldest
+  // recorded telemetry (scoped to the current job filter) to now, in minutes.
+  // Falls back to 24h when nothing has been recorded yet. Re-resolved on each
+  // explicit range/job change, not on the 15s poll (the span only creeps by
+  // 15s a tick — not worth a request each time).
+  async _resolveSinceMinutes() {
+    try {
+      let u = '/api/availability/data-range';
+      if (this.selectedJob && this.selectedJob !== 'all') u += `?job=${encodeURIComponent(this.selectedJob)}`;
+      const r = await fetch(u);
+      const d = await r.json();
+      if (d && d.ok && d.minutes) {
+        this._sinceStartTs = d.since_ts || null;
+        return Math.max(1, Math.round(d.minutes));
+      }
+    } catch (e) { /* fall through to default */ }
+    this._sinceStartTs = null;
+    return 1440;
   }
 
   _toggleCustomRangePopover() {
@@ -1466,6 +1564,9 @@ class InstancesPage {
       btnAudit.classList.toggle('is-active', isAudit);
       btnRanking.setAttribute('aria-selected', String(!isAudit));
       btnAudit.setAttribute('aria-selected', String(isAudit));
+      // Roving tabindex: only the active tab is a Tab stop (WAI-ARIA APG).
+      btnRanking.tabIndex = isAudit ? -1 : 0;
+      btnAudit.tabIndex = isAudit ? 0 : -1;
       if (isAudit) this._renderTelemetryAudit();
     };
     this._showAvailTab = showAvailTab;
@@ -1473,6 +1574,22 @@ class InstancesPage {
     btnRanking.addEventListener('click', () => showAvailTab('ranking'));
     btnAudit.addEventListener('click', () => showAvailTab('audit'));
     if (btnReturn) btnReturn.addEventListener('click', () => showAvailTab('ranking'));
+
+    // Arrow / Home / End key navigation between the two tabs (APG tab pattern);
+    // moving to a tab also activates it.
+    const onTabKey = (e) => {
+      if (e.key === 'ArrowRight' || e.key === 'ArrowDown' || e.key === 'End') {
+        e.preventDefault();
+        showAvailTab('audit');
+        btnAudit.focus();
+      } else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp' || e.key === 'Home') {
+        e.preventDefault();
+        showAvailTab('ranking');
+        btnRanking.focus();
+      }
+    };
+    btnRanking.addEventListener('keydown', onTabKey);
+    btnAudit.addEventListener('keydown', onTabKey);
     // The fleet card's "Limited data" warning links straight to the audit
     // view that explains why — same idea as its "View Telemetry Audit ➔"
     // label already promises.
@@ -1514,7 +1631,13 @@ class InstancesPage {
       if (!wrap.contains(e.target)) close();
     });
     document.addEventListener('keydown', e => {
-      if (e.key === 'Escape' && !popover.classList.contains('hidden')) { close(); btn.focus(); }
+      if (e.key === 'Escape' && !popover.classList.contains('hidden')) {
+        // Swallow the Escape here so the window-level BACK interceptor doesn't
+        // also close the whole Availability Breakdown modal underneath.
+        e.stopPropagation();
+        close();
+        btn.focus();
+      }
     });
   }
 
@@ -1656,6 +1779,9 @@ class InstancesPage {
     const coverageSec = audit.coverage_seconds ?? data.coverage_seconds ?? 0;
     const missingSec = audit.missing_seconds ?? data.missing_seconds ?? 0;
     const winSec = audit.requested_window_seconds || data.requested_window_seconds || (coverageSec + missingSec) || 1;
+    // Compact window label for the sub-line: "24h" reads cleaner than
+    // fmtDur's "24h 00m" when the window is a whole number of hours.
+    const winLabel = winSec % 3600 === 0 ? `${winSec / 3600}h` : fmtDur(winSec);
     const covPct = typeof audit.coverage_percent === 'number' ? audit.coverage_percent : (data.coverage_percent || 0);
     const missPct = typeof audit.missing_percent === 'number' ? audit.missing_percent : Math.max(0, 100 - covPct);
 
@@ -1663,18 +1789,31 @@ class InstancesPage {
       const valEl = document.getElementById(valId);
       const subEl = document.getElementById(subId);
       if (valEl) valEl.textContent = fmtDur(sec);
-      if (subEl) subEl.textContent = subText || `${pct.toFixed(1)}% of window`;
+      if (subEl) subEl.textContent = subText || `${pct.toFixed(1)}% of ${winLabel}`;
     };
     setCoverageCard('auditMetricObserved', 'auditMetricObservedPct', coverageSec, covPct);
     setCoverageCard('auditMetricMissing', 'auditMetricMissingPct', missingSec, missPct);
 
     const maintCard = document.getElementById('auditMaintCard');
     const auditGrid = document.getElementById('auditGrid');
-    if (maintSec > 0) {
+    // Headline = wall-clock planned-maintenance time scheduled inside the
+    // selected range (what the operator expects to see — "4m", not "4s").
+    // Sub-line = how much of that has actually left the SLA denominator so
+    // far; it lags the headline while the last minutes of telemetry are
+    // still being aggregated, then catches up. Both are fleet totals.
+    const maintSchedSec = data.maintenance_scheduled_seconds || 0;
+    if (maintSchedSec > 0 || maintSec > 0) {
       if (maintCard) maintCard.hidden = false;
       if (auditGrid) auditGrid.classList.add('has-maint');
-      const maintPct = winSec > 0 ? (maintSec / winSec) * 100 : 0;
-      setCoverageCard('auditMetricMaint', 'auditMetricMaintPct', maintSec, maintPct, 'excluded from SLA');
+      const mVal = document.getElementById('auditMetricMaint');
+      const mSub = document.getElementById('auditMetricMaintPct');
+      // Always minutes:seconds, even for a value under 60s — fmtDur alone
+      // would render the carved figure as a bare "4s" and hide that it is
+      // 4s *of 4 minutes scheduled* (the rest is telemetry not yet
+      // aggregated). Showing both makes the lag self-evident.
+      const fmtMS = s => { s = Math.max(0, Math.round(s)); return `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, '0')}s`; };
+      if (mVal) mVal.textContent = fmtDur(maintSchedSec || maintSec);
+      if (mSub) mSub.textContent = `${fmtMS(maintSec)} of ${fmtMS(maintSchedSec)} excl. from SLA so far`;
     } else {
       if (maintCard) maintCard.hidden = true;
       if (auditGrid) auditGrid.classList.remove('has-maint');
@@ -1716,7 +1855,7 @@ class InstancesPage {
 
     // Worst coverage first — an audit view exists to surface problems, not
     // to repeat the Overview pane's default ordering.
-    rows = rows.slice().sort((a, b) => (a.coverage_pct ?? a.coverage_percent ?? 0) - (b.coverage_pct ?? b.coverage_percent ?? 0));
+    rows.sort((a, b) => (a.coverage_pct ?? a.coverage_percent ?? 0) - (b.coverage_pct ?? b.coverage_percent ?? 0));
 
     tbody.innerHTML = rows.map(e => {
       const cov = e.coverage_pct ?? e.coverage_percent ?? 0;
@@ -1726,11 +1865,18 @@ class InstancesPage {
       const budget = e.sla_budget || {};
       const targetPct = typeof e.sla_target_pct === 'number' ? e.sla_target_pct : budget.target_pct;
       const downtimeSec = e.sla_downtime_seconds ?? e.downtime_seconds ?? 0;
-      const budgetLeftTxt = budget.has_data
-        ? (budget.window?.breached ? 'Breached' : this._formatDowntimeDuration(budget.window?.remaining_seconds || 0).replace(' downtime', ''))
-        : '—';
-      const budgetCls = !budget.has_data ? 'text-dim'
+      // Below the SLA coverage gate there isn't enough observed time to judge
+      // the error budget — an 86s/24h allowance measured against 20min of
+      // data would read "Breached" on almost anything. Show n/a instead.
+      // (undefined sla_eligible = legacy entry, keep prior behaviour.)
+      const slaEligible = e.sla_eligible !== false;
+      const budgetLeftTxt = !slaEligible ? 'n/a'
+        : budget.has_data
+          ? (budget.window?.breached ? 'Breached' : this._formatDowntimeDuration(budget.window?.remaining_seconds || 0).replace(' downtime', ''))
+          : '—';
+      const budgetCls = (!slaEligible || !budget.has_data) ? 'text-dim'
         : (budget.window?.breached ? 'text-bad' : ((budget.window?.used_percent || 0) >= 75 ? 'text-mid' : 'text-ok'));
+      const budgetTitle = !slaEligible ? ' title="Coverage below the SLA threshold — not enough data to score the error budget"' : '';
 
       return `<tr>
         <td>
@@ -1748,7 +1894,7 @@ class InstancesPage {
           <span class="audit-tgt"> / ${typeof targetPct === 'number' ? targetPct.toFixed(1) : '—'}%</span>
         </td>
         <td class="ta-r mono">${this._formatDowntimeDuration(downtimeSec).replace(' downtime', '')}</td>
-        <td class="ta-r mono"><span class="${budgetCls}">${budgetLeftTxt}</span></td>
+        <td class="ta-r mono"${budgetTitle}><span class="${budgetCls}">${budgetLeftTxt}</span></td>
       </tr>`;
     }).join('');
   }
@@ -1756,10 +1902,17 @@ class InstancesPage {
   /* ── Availability breakdown modal (Historical service health) ── */
   _openAvailabilityBreakdown() {
     if (!this.availabilityBreakdownModal) return;
+    // Remember what had focus so it can be restored on close (WCAG 2.4.3).
+    this._preBreakdownFocusEl = document.activeElement;
     this.availabilityBreakdownModal.classList.remove('hidden');
     document.body.classList.add('modal-open');
     if (this._untrapBreakdown) this._untrapBreakdown();
     this._untrapBreakdown = window.trapModalFocus(this.availabilityBreakdownModal);
+
+    // Move focus into the dialog. The close button is always present and is a
+    // safe first stop (Enter on it just re-closes).
+    const closeBtn = document.getElementById('closeAvailabilityBreakdown');
+    if (closeBtn) setTimeout(() => closeBtn.focus(), 0);
 
     const modalRangeSelect = document.getElementById('modalRangeSelect');
     if (modalRangeSelect) {
@@ -1787,7 +1940,7 @@ class InstancesPage {
   _closeAvailabilityBreakdown() {
     if (this._untrapBreakdown) { this._untrapBreakdown(); this._untrapBreakdown = null; }
     if (this.availabilityBreakdownModal) this.availabilityBreakdownModal.classList.add('hidden');
-    
+
     const availSortMenu = document.getElementById('availSortMenu');
     const availSortTrigger = document.getElementById('availSortTrigger');
     availSortMenu?.classList.add('hidden');
@@ -1796,6 +1949,12 @@ class InstancesPage {
     if (!document.querySelector('.modal-backdrop:not(.hidden):not(#availabilityBreakdownModal)')) {
       document.body.classList.remove('modal-open');
     }
+
+    // Return focus to whatever opened the modal (usually the Detail button).
+    if (this._preBreakdownFocusEl && document.contains(this._preBreakdownFocusEl)) {
+      this._preBreakdownFocusEl.focus();
+    }
+    this._preBreakdownFocusEl = null;
   }
 
   // Format downtime in seconds to human-readable format: "12h 18m downtime", "4m 20s downtime", "0s downtime"
@@ -1837,12 +1996,94 @@ class InstancesPage {
     return avail >= 99.9 ? { cls: 'alt-ok', label: 'COMPLIANT' } : { cls: 'alt-warning', label: 'NON-COMPLIANT' };
   }
 
+  /* ── Availability Trend chart (24h hourly fleet availability) ──
+     Draws data.trend ([{ts, availability_pct}], newest last) as an SVG line +
+     area into #avbTrendPlot. Fewer than 2 points -> keep the placeholder. The
+     y-axis auto-zooms to the data (100% pinned at top) and the 3 grid labels
+     are rewritten to match. ── */
+  _renderAvailabilityTrend(data) {
+    const plot = document.getElementById('avbTrendPlot');
+    if (!plot) return;
+    const emptyEl = plot.querySelector('.avb-trend-empty');
+    const gridLabels = plot.querySelectorAll('.avb-trend-grid span i');
+    let wrap = document.getElementById('avbTrendSvgWrap');
+
+    const pts = Array.isArray(data && data.trend)
+      ? data.trend.filter(p => p && typeof p.ts === 'number' && typeof p.availability_pct === 'number')
+      : [];
+
+    const resetGrid = () => {
+      if (gridLabels.length === 3) {
+        gridLabels[0].textContent = '100%';
+        gridLabels[1].textContent = '50%';
+        gridLabels[2].textContent = '0%';
+      }
+    };
+
+    if (pts.length < 2) {
+      if (wrap) wrap.remove();
+      if (emptyEl) emptyEl.classList.remove('hidden');
+      resetGrid();
+      return;
+    }
+    pts.sort((a, b) => a.ts - b.ts);
+
+    if (emptyEl) emptyEl.classList.add('hidden');
+
+    const endTs = typeof data.trend_end_ts === 'number' ? data.trend_end_ts : (Date.now() / 1000);
+    const startTs = endTs - 86400;
+
+    // y-domain: 100% pinned at the top, lower bound snapped below the worst
+    // hour (never above 95, never below 0) so a near-flat healthy line still
+    // shows shape without lying about the scale.
+    const worst = Math.min(...pts.map(p => p.availability_pct));
+    const yMax = 100;
+    let yMin = Math.max(0, Math.floor((worst - 2) / 5) * 5);
+    if (yMin >= yMax) yMin = yMax - 5;
+    const yMid = Math.round((yMin + yMax) / 2);
+    if (gridLabels.length === 3) {
+      gridLabels[0].textContent = `${yMax}%`;
+      gridLabels[1].textContent = `${yMid}%`;
+      gridLabels[2].textContent = `${yMin}%`;
+    }
+
+    const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+    const xOf = ts => clamp(((ts - startTs) / 86400) * 100, 0, 100);
+    const yOf = v => clamp(((yMax - v) / (yMax - yMin)) * 100, 0, 100);
+    const coords = pts.map(p => [xOf(p.ts), yOf(p.availability_pct)]);
+
+    const lineD = coords.map(([x, y], i) => `${i === 0 ? 'M' : 'L'}${x.toFixed(2)} ${y.toFixed(2)}`).join(' ');
+    const areaD = `${lineD} L${coords[coords.length - 1][0].toFixed(2)} 100 L${coords[0][0].toFixed(2)} 100 Z`;
+
+    if (!wrap) {
+      // Build the <svg> as a string inside an HTML <div> — same pattern as
+      // _renderSparkline; avoids relying on SVGElement.innerHTML. Appended
+      // after .avb-trend-grid so the line paints over the grid lines.
+      wrap = document.createElement('div');
+      wrap.id = 'avbTrendSvgWrap';
+      wrap.className = 'avb-trend-svg-wrap';
+      wrap.setAttribute('aria-hidden', 'true');
+      plot.appendChild(wrap);
+    }
+    wrap.innerHTML =
+      `<svg class="avb-trend-svg" viewBox="0 0 100 100" preserveAspectRatio="none">` +
+      `<path class="avb-trend-area" d="${areaD}"></path>` +
+      `<path class="avb-trend-line" d="${lineD}" vector-effect="non-scaling-stroke"></path>` +
+      `</svg>`;
+  }
+
   _renderAvailabilityBreakdown(source = 'direct') {
     const data = this.availabilityBreakdown;
     const expectedMins = Math.round(this.periodMinutes);
     const isMatchingData = data && Math.round(data.period_minutes || 0) === expectedMins;
 
     this._updateAvailLoadingUI(this._availLoading && !isMatchingData);
+
+    // Render the audit pane + trend chart FIRST — the ranking code below has
+    // several early returns (no entries, healthy fleet -> empty attention list)
+    // that would otherwise skip these and leave stale content after a poll.
+    this._renderTelemetryAudit();
+    this._renderAvailabilityTrend(data);
 
     // 1. Fleet Availability (Card 1)
     const fleetAvail = (data?.fleet_aggregate && typeof data.fleet_aggregate.value === 'number')
@@ -1856,7 +2097,17 @@ class InstancesPage {
     const ringEl = document.getElementById('avbFleetRing');       // donut ring on the Fleet card
     const splitUpEl = document.getElementById('avbHealthyUpBar');  // uptime/downtime split bar on the Healthy Hosts card
     const splitDownEl = document.getElementById('avbHealthyDownBar');
-    const RING_CIRCUMFERENCE = 163.36; // 2 * PI * r, r = 26 (see .avb-ring markup)
+    const RING_CIRCUMFERENCE = 2 * Math.PI * 26; // r = 26 (see .avb-ring markup)
+
+    // Drive the ring via inline style props (strokeDasharray + strokeDashoffset),
+    // not setAttribute: an inline style reliably wins the cascade, and the
+    // dasharray must be re-asserted here so it exactly matches the computed
+    // circumference (the markup's rounded "163.36" left a hairline gap at 100%).
+    const setRing = pct => {
+      if (!ringEl) return;
+      ringEl.style.strokeDasharray = `${RING_CIRCUMFERENCE}`;
+      ringEl.style.strokeDashoffset = `${RING_CIRCUMFERENCE * (1 - Math.max(0, Math.min(100, pct)) / 100)}`;
+    };
 
     if (fleetAvail !== null) {
       const clamped = Math.max(0, Math.min(100, fleetAvail));
@@ -1867,14 +2118,14 @@ class InstancesPage {
       if (aggEl) aggEl.textContent = upPctStr;
       if (legendUpEl) legendUpEl.textContent = upPctStr;
       if (legendDownEl) legendDownEl.textContent = downPctStr;
-      if (ringEl) ringEl.setAttribute('stroke-dashoffset', (RING_CIRCUMFERENCE * (1 - clamped / 100)).toFixed(2));
+      setRing(clamped);
       if (splitUpEl) splitUpEl.style.width = `${clamped.toFixed(2)}%`;
       if (splitDownEl) splitDownEl.style.width = `${(100 - clamped).toFixed(2)}%`;
     } else {
       if (aggEl) aggEl.textContent = '—';
       if (legendUpEl) legendUpEl.textContent = '—';
       if (legendDownEl) legendDownEl.textContent = '—';
-      if (ringEl) ringEl.setAttribute('stroke-dashoffset', RING_CIRCUMFERENCE.toFixed(2));
+      setRing(0);
       if (splitUpEl) splitUpEl.style.width = '0%';
       if (splitDownEl) splitDownEl.style.width = '0%';
     }
@@ -1905,25 +2156,24 @@ class InstancesPage {
     }
 
     // 2. Healthy Hosts (Card 2)
-    const healthRatio = (data?.health_ratio && typeof data.health_ratio.value === 'number')
-      ? data.health_ratio.value
-      : null;
+    // Denominator = every monitored host (server_count), NOT just the ones with
+    // telemetry: a host we have no data for is not demonstrably "healthy", and
+    // "41 / 50" next to "View all (51)" / "51 hosts" elsewhere reads as a bug.
+    // The % is recomputed from the same two numbers so the headline and the
+    // sub-label can never disagree.
     const healthyCount = data?.health_ratio?.healthy_count ?? data?.healthy_hosts_count ?? null;
-    const totalCount = data?.health_ratio?.total_count ?? data?.counts?.total ?? (data?.entries ? data.entries.length : null);
+    const totalCount = data?.health_ratio?.server_count
+      ?? data?.health_ratio?.total_count
+      ?? data?.counts?.total
+      ?? (data?.entries ? data.entries.length : null);
 
     const healthEl = document.getElementById('metricHealthRatio');
     const healthyCountEl = document.getElementById('metricHealthyHostsCount');
 
-    // The headline number is the "N / total" count — that's what an
-    // engineer scans for first — with the percentage as supporting detail
-    // underneath, same as it's already computed for the fleet-wide ratio.
-    if (healthRatio !== null) {
-      if (healthEl) {
-        healthEl.textContent = (healthyCount !== null && totalCount !== null)
-          ? `${healthyCount} / ${totalCount}`
-          : `${healthRatio.toFixed(2)}%`;
-      }
-      if (healthyCountEl) healthyCountEl.textContent = `${healthRatio.toFixed(2)}% healthy`;
+    if (healthyCount !== null && typeof totalCount === 'number' && totalCount > 0) {
+      const healthyPct = (healthyCount / totalCount) * 100;
+      if (healthEl) healthEl.textContent = `${healthyCount} / ${totalCount}`;
+      if (healthyCountEl) healthyCountEl.textContent = `${healthyPct.toFixed(2)}% healthy`;
     } else {
       if (healthEl) healthEl.textContent = '—';
       if (healthyCountEl) healthyCountEl.textContent = '— healthy';
@@ -2088,17 +2338,18 @@ class InstancesPage {
       lbl.textContent = this._showAllHostsInBreakdown ? 'Show top hosts' : `View all (${processedHosts.length})`;
     }
 
-    // Filter priority hosts if not viewing all
+    // Filter to the hosts that actually match the current "attention" lens.
+    // If none match, priorityHosts is left empty on purpose so the empty
+    // state below renders instead of falling back to showing healthy hosts
+    // under a "Hosts Requiring Attention" heading. The "avail_desc" /
+    // "name_asc" / "name_desc" modes are plain rankings and keep every host.
     let priorityHosts = processedHosts;
     if (sortMode === 'incidents_desc') {
-      const withIncidents = processedHosts.filter(h => h.incidentCount > 0);
-      if (withIncidents.length > 0) priorityHosts = withIncidents;
+      priorityHosts = processedHosts.filter(h => h.incidentCount > 0);
     } else if (sortMode === 'downtime_desc') {
-      const withDowntime = processedHosts.filter(h => h.downtimeDurationSeconds > 0);
-      if (withDowntime.length > 0) priorityHosts = withDowntime;
+      priorityHosts = processedHosts.filter(h => h.downtimeDurationSeconds > 0);
     } else if (sortMode === 'avail_asc') {
-      const needAttention = processedHosts.filter(h => (h.availability !== null && h.availability < 100) || h.downtimeDurationSeconds > 0 || h.incidentCount > 0 || h.isNoData);
-      if (needAttention.length > 0) priorityHosts = needAttention;
+      priorityHosts = processedHosts.filter(h => (h.availability !== null && h.availability < 100) || h.downtimeDurationSeconds > 0 || h.incidentCount > 0 || h.isNoData);
     }
 
     const displayList = this._showAllHostsInBreakdown
@@ -2107,9 +2358,16 @@ class InstancesPage {
 
     if (displayList.length === 0) {
       const allNoData = processedHosts.length > 0 && processedHosts.every(h => h.isNoData);
-      const emptyMsg = allNoData
-        ? 'No telemetry data recorded for monitored hosts in this time range.'
-        : 'All monitored hosts currently have 100% availability with zero recorded downtime.';
+      let emptyMsg;
+      if (allNoData) {
+        emptyMsg = 'No telemetry data recorded for monitored hosts in this time range.';
+      } else if (sortMode === 'incidents_desc') {
+        emptyMsg = 'No incidents recorded for any monitored host in this time range.';
+      } else if (sortMode === 'downtime_desc') {
+        emptyMsg = 'No downtime recorded for any monitored host in this time range.';
+      } else {
+        emptyMsg = 'All monitored hosts currently have 100% availability with zero recorded downtime.';
+      }
       listEl.innerHTML = `<div class="de-empty" style="padding: 24px; text-align: center; color: var(--text-secondary);">${emptyMsg}</div>`;
       return;
     }
@@ -2197,8 +2455,6 @@ class InstancesPage {
     }).join('');
 
     listEl.innerHTML = rowsHtml;
-
-    this._renderTelemetryAudit();
   }
 
   startPolling(ms) {
@@ -2609,7 +2865,10 @@ class InstancesPage {
     newTargets.forEach(t => {
       const prev = this.previousStates[t.instance];
       const curr = t.health || 'unknown';
-      if (curr !== 'up') {
+      // Only a real 'down' ages a down-counter. 'unknown' = no Prometheus
+      // sample (e.g. an un-scraped websites.yml entry) — stamping now here is
+      // what produced the phantom "Down 57s" ticker on every startup.
+      if (curr === 'down') {
         if (t.downSince && t.downSince > 0) {
           this.downStartTimes[t.instance] = t.downSince * 1000;
         } else if (!this.downStartTimes[t.instance]) {
@@ -2620,7 +2879,7 @@ class InstancesPage {
       }
 
       if (prev && prev !== curr) {
-        const label = curr === 'up' ? 'back online' : 'went offline';
+        const label = curr === 'up' ? 'back online' : (curr === 'down' ? 'went offline' : 'reporting no data');
         this._triggerEventToast(`${t.instance} ${label}`);
       }
       this.previousStates[t.instance] = curr;
@@ -2684,8 +2943,8 @@ class InstancesPage {
     // snapshot also drives those cards directly (see block below).
     const total = this.data.length;
     const up = this.data.filter(t => t.health === 'up').length;
-    const down = total - up;
-    const slow = this.data.filter(t => t.health === 'up' && t.responseTimeMs > 500).length;
+    const down = this.data.filter(t => t.health === 'down').length;
+    const slow = this.data.filter(t => t.health === 'up' && t.responseTimeMs > slowThresholdMs(t)).length;
 
     // Backend authoritative state (Phase 2 canonical monitoring model)
     const serverSummary = this.serverPayload ? this.serverPayload.summary : null;
@@ -2825,11 +3084,11 @@ class InstancesPage {
 
     // Status filter (Warning threshold = 500ms)
     if (this.activeStatus === 'up') {
-      rows = rows.filter(t => t.health === 'up' && !(t.responseTimeMs > 500));
+      rows = rows.filter(t => t.health === 'up' && !(t.responseTimeMs > slowThresholdMs(t)));
     } else if (this.activeStatus === 'down') {
       rows = rows.filter(t => t.health !== 'up');
     } else if (this.activeStatus === 'slow') {
-      rows = rows.filter(t => t.health === 'up' && t.responseTimeMs > 500);
+      rows = rows.filter(t => t.health === 'up' && t.responseTimeMs > slowThresholdMs(t));
     }
 
     // Search filter
@@ -2885,8 +3144,8 @@ class InstancesPage {
         return a.instance.localeCompare(b.instance, undefined, { numeric: true, sensitivity: 'base' });
       } else {
         // default: Prioritas (Down Pertama, lalu slow >500ms, lalu online)
-        const ao = a.health !== 'up' ? 2 : (a.responseTimeMs > 500 ? 1 : 0);
-        const bo = b.health !== 'up' ? 2 : (b.responseTimeMs > 500 ? 1 : 0);
+        const ao = a.health !== 'up' ? 2 : (a.responseTimeMs > slowThresholdMs(a) ? 1 : 0);
+        const bo = b.health !== 'up' ? 2 : (b.responseTimeMs > slowThresholdMs(b) ? 1 : 0);
         if (ao !== bo) return bo - ao;
         return a.instance.localeCompare(b.instance, undefined, { numeric: true, sensitivity: 'base' });
       }
@@ -2922,10 +3181,11 @@ class InstancesPage {
       rows.forEach((t, i) => {
         const card = existingDomCards[i];
         const isUp = t.health === 'up';
-        const isSlow = isUp && t.responseTimeMs > 500;
-        const isDown = !isUp;
+        const isDown = t.health === 'down';
+        const isNoData = !isUp && !isDown;   // 'unknown' — Prometheus has no probe sample; not an outage
+        const isSlow = isUp && t.responseTimeMs > slowThresholdMs(t);
 
-        const stateClass = t.maintenance ? 'hc-maintenance' : (isDown ? 'hc-down' : (isSlow ? 'hc-slow' : 'hc-up'));
+        const stateClass = t.maintenance ? 'hc-maintenance' : (isDown ? 'hc-down' : (isNoData ? 'hc-nodata' : (isSlow ? 'hc-slow' : 'hc-up')));
         const isAcked = isDown && !t.maintenance && this.acknowledgedDownInstances.has(t.instance);
         const fullClass = `host-card ${stateClass}${t.suppressedBy ? ' hc-suppressed' : ''}${isAcked ? ' hc-acked' : ''}`;
         if (card.className !== fullClass) {
@@ -2936,6 +3196,8 @@ class InstancesPage {
         if (t.maintenance) {
           const remainMs = t.maintenanceUntil ? Math.max(0, t.maintenanceUntil * 1000 - now) : 0;
           latencyText = `Maint ${this._fmtDownAging(remainMs)} left`;
+        } else if (isNoData) {
+          latencyText = 'No data';
         } else if (isDown) {
           let downMs = 0;
           if (t.downSince && t.downSince > 0) {
@@ -2976,16 +3238,19 @@ class InstancesPage {
       // Re-render only when structure/filter changes
       this.table.innerHTML = rows.map((t, i) => {
         const isUp = t.health === 'up';
-        const isSlow = isUp && t.responseTimeMs > 500;
-        const isDown = !isUp;
+        const isDown = t.health === 'down';
+        const isNoData = !isUp && !isDown;   // 'unknown' — Prometheus has no probe sample; not an outage
+        const isSlow = isUp && t.responseTimeMs > slowThresholdMs(t);
 
-        const stateClass = t.maintenance ? 'hc-maintenance' : (isDown ? 'hc-down' : (isSlow ? 'hc-slow' : 'hc-up'));
+        const stateClass = t.maintenance ? 'hc-maintenance' : (isDown ? 'hc-down' : (isNoData ? 'hc-nodata' : (isSlow ? 'hc-slow' : 'hc-up')));
         const isAcked = isDown && !t.maintenance && this.acknowledgedDownInstances.has(t.instance);
         const fullClass = `host-card ${stateClass}${t.suppressedBy ? ' hc-suppressed' : ''}${isAcked ? ' hc-acked' : ''}`;
         let latencyText = '';
         if (t.maintenance) {
           const remainMs = t.maintenanceUntil ? Math.max(0, t.maintenanceUntil * 1000 - now) : 0;
           latencyText = `Maint ${this._fmtDownAging(remainMs)} left`;
+        } else if (isNoData) {
+          latencyText = 'No data';
         } else if (isDown) {
           let downMs = 0;
           if (t.downSince && t.downSince > 0) {
@@ -3002,7 +3267,7 @@ class InstancesPage {
                      data-instance="${this._esc(t.instance)}"
                      role="listitem"
                      tabindex="0"
-                     aria-label="${this._esc(t.instance)} — ${t.maintenance ? 'Under maintenance' : (isDown ? (t.suppressedBy ? `Offline, correlated with ${t.suppressedBy}` : 'Offline') : (isSlow ? 'Slow' : 'Online'))}"
+                     aria-label="${this._esc(t.instance)} — ${t.maintenance ? 'Under maintenance' : (isDown ? (t.suppressedBy ? `Offline, correlated with ${this._esc(t.suppressedBy)}` : 'Offline') : (isSlow ? 'Slow' : 'Online'))}"
                      title="Click to view details or delete target">
           <div class="hc-ip">${this._esc(t.instance)}</div>
           <div class="hc-latency">${this._esc(latencyText)}</div>
@@ -3181,7 +3446,7 @@ class InstancesPage {
       }
 
       const slotDate = new Date(slotStart * 1000);
-      const timeStr = slotDate.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' });
+      const timeStr = slotDate.toLocaleTimeString(DATE_LOCALE, { hour: '2-digit', minute: '2-digit' });
 
       barsHtml += `<div title="${timeStr} • ${statusText}" style="flex:1; height:${barHeight}; background:${barColor}; border-radius:2px; transition:all 0.2s ease;"></div>`;
     }
@@ -3192,7 +3457,7 @@ class InstancesPage {
       const markers = [0, 6, 12, 18, 24];
       const labels = markers.map(hAgo => {
         const dObj = new Date((now_ts - (24 - hAgo) * 3600) * 1000);
-        return dObj.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' });
+        return dObj.toLocaleTimeString(DATE_LOCALE, { hour: '2-digit', minute: '2-digit' });
       });
       timeLabelsEl.innerHTML = labels.map(l => `<span>${l}</span>`).join('');
     }
@@ -3217,7 +3482,7 @@ class InstancesPage {
       const title = isOnline ? 'Up' : 'Down';
       const desc = isOnline ? 'Probe successful' : 'Timeout / No response';
       const dObj = new Date(ev.start_ts * 1000);
-      const timeStr = dObj.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      const timeStr = dObj.toLocaleTimeString(DATE_LOCALE, { hour: '2-digit', minute: '2-digit', second: '2-digit' });
       const agoStr = this._relTime(ev.start_ts * 1000);
 
       return `
@@ -3247,7 +3512,7 @@ class InstancesPage {
 
     if (!target) return;
 
-    const rangeText = this.periodLabel === 'custom' ? 'Custom' : (this.periodLabel || '24h');
+    const rangeText = this._rangeDisplay();
     const rangeLabelEl = document.getElementById('spSummaryRangeLabel');
     if (rangeLabelEl) rangeLabelEl.textContent = `(${rangeText})`;
 
@@ -3292,7 +3557,7 @@ class InstancesPage {
       if (downEvents.length > 0) {
         const lastEv = downEvents[0];
         const dObj = new Date(lastEv.start_ts * 1000);
-        elLastOutage.textContent = dObj.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        elLastOutage.textContent = dObj.toLocaleTimeString(DATE_LOCALE, { hour: '2-digit', minute: '2-digit', second: '2-digit' });
       } else if (!haveDowntimeData) {
         elLastOutage.textContent = '—';
       } else if (downMin > 0) {
@@ -3310,7 +3575,7 @@ class InstancesPage {
 
     this.selectedTarget = target;
     const isUp = target.health === 'up';
-    const isSlow = isUp && target.responseTimeMs > 500;
+    const isSlow = isUp && target.responseTimeMs > slowThresholdMs(target);
     const isDown = !isUp;
     const now = Date.now();
 
@@ -3381,7 +3646,7 @@ class InstancesPage {
     // Status pill & status text
     const pill = document.getElementById('drawerStatusPill');
     const statusTextEl = document.getElementById('drawerStatusText');
-    const label = isDown ? 'Offline' : (isSlow ? 'Slow (>500ms)' : 'Online');
+    const label = isDown ? 'Offline' : (isSlow ? 'Slow' : 'Online');
     const cls = isDown ? 'dsp-down' : (isSlow ? 'dsp-slow' : 'dsp-up');
     if (pill) {
       pill.textContent = label;
@@ -3926,9 +4191,9 @@ class InstancesPage {
       const d = new Date(ts * 1000);
       const isLongRange = (tN - t0) > 86400; // >24h
       if (isLongRange) {
-        return d.toLocaleDateString('id-ID', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' });
+        return d.toLocaleDateString(DATE_LOCALE, { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' });
       }
-      return d.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      return d.toLocaleTimeString(DATE_LOCALE, { hour: '2-digit', minute: '2-digit', second: '2-digit' });
     };
 
     const t0Str = fmtTime(t0);
@@ -4054,7 +4319,7 @@ class InstancesPage {
       dot.style.boxShadow = `0 0 8px ${valColor}`;
 
       const dObj = new Date(closest.t * 1000);
-      const timeLabel = dObj.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      const timeLabel = dObj.toLocaleTimeString(DATE_LOCALE, { hour: '2-digit', minute: '2-digit', second: '2-digit' });
       const statusText = closest.val > 500 ? 'SLOW' : (closest.val === 0 ? 'DOWN' : 'UP');
 
       tooltip.innerHTML = `
@@ -4155,8 +4420,8 @@ class InstancesPage {
       const recentPts = [...points].reverse();
       elList.innerHTML = recentPts.map(p => {
         const dObj = new Date(p[0] * 1000);
-        const timeStr = dObj.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-        const dateStr = dObj.toLocaleDateString('id-ID', { day: '2-digit', month: 'short' });
+        const timeStr = dObj.toLocaleTimeString(DATE_LOCALE, { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        const dateStr = dObj.toLocaleDateString(DATE_LOCALE, { day: '2-digit', month: 'short' });
         const latVal = p[1];
         const isSlow = latVal > 500;
         const color = isSlow ? '#F59E0B' : '#22C55E';
@@ -4216,9 +4481,9 @@ class InstancesPage {
       const d = new Date(ts * 1000);
       const isLongRange = (tN - t0) > 86400; // >24h
       if (isLongRange) {
-        return d.toLocaleDateString('id-ID', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' });
+        return d.toLocaleDateString(DATE_LOCALE, { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' });
       }
-      return d.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      return d.toLocaleTimeString(DATE_LOCALE, { hour: '2-digit', minute: '2-digit', second: '2-digit' });
     };
 
     const t0Str = fmtTime(t0);
@@ -4308,7 +4573,7 @@ class InstancesPage {
       dot.style.boxShadow = `0 0 8px ${valColor}`;
 
       const dObj = new Date(closest.t * 1000);
-      const timeLabel = dObj.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      const timeLabel = dObj.toLocaleTimeString(DATE_LOCALE, { hour: '2-digit', minute: '2-digit', second: '2-digit' });
       const statusText = closest.val > 500 ? 'SLOW' : (closest.val === 0 ? 'DOWN' : 'UP');
 
       tooltip.innerHTML = `
@@ -4339,7 +4604,7 @@ class InstancesPage {
     const seq = ++this._targetHistorySeq;
     const isStale = () => seq !== this._targetHistorySeq || this.selectedTarget?.instance !== targetInstance;
 
-    const rangeText = this.periodLabel === 'custom' ? 'Custom' : (this.periodLabel || '24h');
+    const rangeText = this._rangeDisplay();
     const drawerSparklineRangeEl = document.getElementById('drawerSparklineRange');
     if (drawerSparklineRangeEl) drawerSparklineRangeEl.textContent = `(${rangeText})`;
     const historyRangeTag = document.getElementById('historyRangeTag');
@@ -4532,6 +4797,8 @@ class InstancesPage {
         return;
       }
       this._closeModal();
+      if (data.warning) this._triggerEventToast(data.warning);
+      else if (data.message) this._triggerEventToast(data.message);
       this.load();
     } catch (ex) {
       if (err) {
@@ -4588,11 +4855,7 @@ class InstancesPage {
     } catch { return '—'; }
   }
 
-  _esc(s) {
-    return String(s)
-      .replace(/&/g, '&amp;').replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-  }
+  _esc(s) { return htmlEscape(s); }
 }
 
 
@@ -4807,9 +5070,7 @@ class LogsPage {
     return `${(s / 3600).toFixed(1)}h`;
   }
 
-  _esc(s) {
-    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-  }
+  _esc(s) { return htmlEscape(s); }
 }
 
 
@@ -4920,6 +5181,12 @@ class HistoryPage {
     // D-pad/remote nav) — opens the existing target detail drawer (task #5)
     // instead of an inline expand: one detail surface per host, not two.
     this.tableEl.addEventListener('click', e => {
+      const resolveBtn = e.target.closest('[data-resolve-key]');
+      if (resolveBtn) {
+        e.stopPropagation();
+        this._resolveIncident(resolveBtn.dataset.resolveKey);
+        return;
+      }
       const row = e.target.closest('[data-row-key]');
       if (row) this._openRowDrawer(row.dataset.rowKey);
     });
@@ -5178,7 +5445,10 @@ class HistoryPage {
   }
 
   _renderRow(inc) {
-    const sev = (inc.severity || 'critical').toLowerCase();
+    const rawSev = (inc.severity || 'critical').toLowerCase();
+    // Clamp to the known set — the value is stored from the Alertmanager
+    // webhook and flows straight into a class name and text below.
+    const sev = ['critical', 'warning', 'info'].includes(rawSev) ? rawSev : 'critical';
     const ongoing = this._isOngoing(inc);
     const rowKey = inc.key || `${inc.instance}|${inc.name}|${inc.time}`;
     const jobSub = [inc.job, inc.name].filter(Boolean).join(' · ');
@@ -5198,6 +5468,15 @@ class HistoryPage {
       ? `<div class="history-ack">✓ Acked by ${this._esc(inc.acknowledged_by)} · ${this._fmt(inc.acknowledged_at)}</div>`
       : '';
 
+    // Force-resolve control (audit F1) — only for an admin, only on a still
+    // -Ongoing incident. Backstop for a stuck incident that no automatic path
+    // can clear (host removed from Prometheus, so the poller never sees it
+    // recover). Lives inside the Host cell so it needs no grid-column change.
+    const canResolve = ongoing && window.currentUser && window.currentUser.role === 'admin' && inc.key;
+    const resolveLine = canResolve
+      ? `<button type="button" class="history-resolve-btn" data-resolve-key="${this._esc(inc.key)}" title="Force-resolve this stuck incident">Force-resolve</button>`
+      : '';
+
     // Severity color is a property of the alert (critical=red, warning=amber),
     // independent of open/resolved — that distinction lives on the Status
     // column and the row background (.history-row-active) instead.
@@ -5211,10 +5490,11 @@ class HistoryPage {
           <div class="history-host">${this._esc(inc.instance || '—')}</div>
           <div class="history-sub">${this._esc(jobSub || '—')}${errDetail ? ` — ${this._esc(errDetail)}` : ''}</div>
           ${ackLine}
+          ${resolveLine}
         </div>
       </div>
       <span class="history-status ${statusClass}"><span class="history-status-dot"></span>${statusLabel}</span>
-      <span class="history-sev ${sevClass}">${sev.toUpperCase()}</span>
+      <span class="history-sev ${sevClass}">${this._esc(sev.toUpperCase())}</span>
       <span class="history-occurrences">×${inc.occurrences || 1}</span>
       <span class="history-firstseen">${this._fmt(inc.first_seen || inc.time)}</span>
       <span class="history-downtime">${downtime}</span>
@@ -5244,6 +5524,40 @@ class HistoryPage {
       active_alerts: []
     };
     this.monitor.instancesPage._openDrawer(target);
+  }
+
+  // Force-resolve a stuck incident via POST /api/alerts/resolve (audit F1).
+  async _resolveIncident(key) {
+    if (!key) return;
+    const toast = (m) => this.monitor?.instancesPage?._triggerEventToast?.(m);
+    const ok = await window.showConfirmDialog({
+      title: 'Force-Resolve Incident',
+      message: `Mark "${key}" as resolved? Use this only for a stuck incident that no longer reflects reality — e.g. a host removed from Prometheus, whose recovery the poller can never observe.`,
+      confirmText: 'Force-resolve',
+      cancelText: 'Cancel',
+      isDanger: true
+    });
+    if (!ok) return;
+    try {
+      const res = await apiFetch('/api/alerts/resolve', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.ok) {
+        toast(data.changed ? 'Incident force-resolved.' : 'Incident was not firing — no change.');
+        this.load();
+        this.monitor?.instancesPage?.load?.();
+      } else if (res.status === 403) {
+        toast('Permission denied: admin required to resolve incidents.');
+      } else {
+        toast(data.error || 'Failed to resolve incident.');
+      }
+    } catch (ex) {
+      console.warn('[InfraWatch] resolve incident failed:', ex);
+      toast('Failed to resolve incident — see console.');
+    }
   }
 
   _fmt(ts) {
@@ -5285,9 +5599,7 @@ class HistoryPage {
     URL.revokeObjectURL(a.href);
   }
 
-  _esc(s) {
-    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-  }
+  _esc(s) { return htmlEscape(s); }
 }
 
 HistoryPage.PAGE_SIZE = 40;
@@ -5370,15 +5682,35 @@ class ServerMonitor {
     this.logsPage._startPolling(30000);
     this.logsPage.load();
     this._checkSelfHealth();
-    setInterval(() => this._checkSelfHealth(), 20000);
+    this._selfHealthInterval = setInterval(() => this._checkSelfHealth(), 20000);
 
-    // Kiosk / TV Standby lifecycle management: pause/resume cleanly on wake
+    // Kiosk / TV Standby lifecycle management: fully pause every recurring
+    // timer while the tab/display is hidden (a backgrounded wallboard was
+    // still hammering /instances every 5s, /api/availability every 15s,
+    // /health every 20s and ticking 1/s), then resume with one immediate
+    // clean sync on wake — no timer accumulation.
     document.addEventListener('visibilitychange', () => {
+      const ip = this.instancesPage;
       if (document.visibilityState === 'visible') {
-        // Immediate clean sync on wake without timer accumulation
-        this.instancesPage.load();
-        this.instancesPage.loadAvailability();
+        ip.startPolling(ip.currentInterval);
+        ip.startAvailabilityPolling();
+        ip.startDownCounterTicker();
+        if (ip.autoRotate) ip._startAutoRotate();
+        if (!this._selfHealthInterval) {
+          this._selfHealthInterval = setInterval(() => this._checkSelfHealth(), 20000);
+        }
+        ip.load();
+        ip.loadAvailability();
         this._checkSelfHealth();
+      } else {
+        ip.stopPolling();
+        ip.stopAvailabilityPolling();
+        ip.stopDownCounterTicker();
+        ip._stopAutoRotate();
+        if (this._selfHealthInterval) {
+          clearInterval(this._selfHealthInterval);
+          this._selfHealthInterval = null;
+        }
       }
     });
   }
@@ -5544,21 +5876,25 @@ class ServerMonitor {
         // Populate modal list
         if (listContainer) {
           listContainer.innerHTML = '';
+          if (data.endpoints.length === 0) {
+            listContainer.innerHTML = '<div style="padding:10px; font-size:12px; color:var(--text-secondary);">No Prometheus endpoint configured. Add one above — until then, no metric data is fetched.</div>';
+          }
           data.endpoints.forEach(ep => {
             const row = document.createElement('div');
             row.style.cssText = 'display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px; padding:8px 10px; background:var(--surface); border:1px solid var(--border); border-radius:var(--r-sm); font-size:12px; margin-bottom:6px;';
             const statusDot = ep.online ? '<span style="color:#22C55E; margin-right:6px;">● Online</span>' : '<span style="color:#EF4444; margin-right:6px;">● Offline</span>';
             const activeBadge = ep.active ? '<span style="background:var(--accent-bg); color:var(--accent); padding:2px 6px; border-radius:4px; font-size:10px; font-weight:600; margin-left:6px;">ACTIVE</span>' : '';
-            
+            const safeUrl = htmlEscape(ep.url);
+
             row.innerHTML = `
               <div style="display:flex; align-items:center; overflow:hidden; flex:1; min-width:0;">
                 ${statusDot}
-                <span style="font-family:var(--font-mono); font-weight:500; text-overflow:ellipsis; overflow:hidden; white-space:nowrap; color:var(--text-primary); min-width:0; flex:1;">${ep.url}</span>
+                <span style="font-family:var(--font-mono); font-weight:500; text-overflow:ellipsis; overflow:hidden; white-space:nowrap; color:var(--text-primary); min-width:0; flex:1;">${safeUrl}</span>
                 ${activeBadge}
               </div>
               <div style="display:flex; gap:6px; flex-shrink:0; margin-left:10px; flex-wrap:wrap; justify-content:flex-end;">
-                ${!ep.active ? `<button class="btn btn-secondary btn-sm select-ep-btn" data-url="${ep.url}" style="padding:2px 8px; font-size:11px;">Select</button>` : ''}
-                ${data.endpoints.length > 1 ? `<button class="btn btn-danger btn-sm del-ep-btn" data-url="${ep.url}" style="padding:2px 8px; font-size:11px; background:rgba(239,68,68,0.15); color:#EF4444; border:1px solid rgba(239,68,68,0.3);">Delete</button>` : ''}
+                ${!ep.active ? `<button class="btn btn-secondary btn-sm select-ep-btn" data-url="${safeUrl}" style="padding:2px 8px; font-size:11px;">Select</button>` : ''}
+                <button class="btn btn-danger btn-sm del-ep-btn" data-url="${safeUrl}" style="padding:2px 8px; font-size:11px; background:rgba(239,68,68,0.15); color:#EF4444; border:1px solid rgba(239,68,68,0.3);">Delete</button>
               </div>
             `;
             listContainer.appendChild(row);
@@ -5692,25 +6028,6 @@ class ServerMonitor {
   /* ── onActivate (dashboard page) ───────────────── */
   onActivate() { /* already polling */ }
 
-  /* ── Time helpers ──────────────────────────────── */
-  formatTimeAgo(ts) {
-    const diff = Math.max(0, Math.floor(Date.now() / 1000) - ts);
-    if (diff < 5) return 'Just now';
-    if (diff < 60) return `${diff}s ago`;
-    if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
-    if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
-    return `${Math.floor(diff / 86400)}d ago`;
-  }
-
-  formatTime(ts) {
-    const d = new Date(ts * 1000);
-    const hh = String(d.getHours()).padStart(2, '0');
-    const mm = String(d.getMinutes()).padStart(2, '0');
-    const dd = String(d.getDate()).padStart(2, '0');
-    const mo = String(d.getMonth() + 1).padStart(2, '0');
-    return `${hh}:${mm} · ${dd}/${mo}`;
-  }
-
   /* ── Sound control ─────────────────────────────── */
   _getAudioContext() {
     if (!this.audioCtx) {
@@ -5831,25 +6148,8 @@ class ServerMonitor {
     this.stopAlarm();
   }
 
-  // Manual "test sound" trigger — routes through the same guarded playAlarm()
-  // path (pure-MP3 policy: exactly one play call site in the whole app)
-  // instead of a second ad-hoc play, so a test click gets identical
-  // success/failure reporting to a real outage alarm.
-  testAlarm() {
-    if (this.isMuted) this.toggleSound(true);
-    this.unlockAudio();
-    this.resetOutageAlarm();
-    this.playAlarm();
-  }
-
   /* ── Escape HTML ───────────────────────────────── */
-  _esc(str) {
-    return String(str)
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;');
-  }
+  _esc(str) { return htmlEscape(str); }
 
   /* ── Cleanup ───────────────────────────────────── */
   destroy() {

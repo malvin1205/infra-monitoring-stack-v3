@@ -319,18 +319,26 @@ def derive_bucket_inputs(
     merged: Dict[str, Dict[str, Any]] = {name: {} for name in metric_names}
     probe_avail = probe_results.get("avail", {})
     probe_count = probe_results.get("count", {})
+    up_avail = up_results.get("avail", {})
+    up_count = up_results.get("count", {})
     for inst in instances:
-        # A target is treated as node/exporter-style (falls back to the raw
-        # `up` metric) only by name, AND only when the probe_* series has no
-        # data for it at all — an explicit blackbox probe target named e.g.
-        # "node-exporter-proxy.internal" still resolves through probe_success
-        # first if that series actually has samples for it.
-        is_node_target = (
-            ("node" in inst.lower() or "exporter" in inst.lower())
-            and inst not in probe_avail
-            and inst not in probe_count
-        )
-        source = up_results if is_node_target else probe_results
+        # Route each instance to whichever series ACTUALLY has data for it
+        # (audit F14) — a node_exporter target named by bare IP (e.g.
+        # "10.0.0.5:9100") never matched the old "node"/"exporter" name
+        # substring and was silently forced onto probe_success (empty ->
+        # under-counted coverage). Probe wins when both have data (an explicit
+        # blackbox target); the name hint is only a last-resort tiebreaker
+        # when neither series carries samples, where the choice is moot.
+        probe_has = inst in probe_avail or inst in probe_count
+        up_has = inst in up_avail or inst in up_count
+        if probe_has:
+            source = probe_results
+        elif up_has:
+            source = up_results
+        elif "node" in inst.lower() or "exporter" in inst.lower():
+            source = up_results
+        else:
+            source = probe_results
         for name in metric_names:
             m = source.get(name, {})
             if inst in m:
@@ -838,8 +846,8 @@ def merge_hybrid_target_availability(
         is_eligible = False
         sla_reason = "Zero observed telemetry in requested window"
         root_cause_code = "NO_DATA"
-        root_cause_hint = "Belum ada sampel telemetri yang tercatat dalam jendela waktu yang dipilih."
-        recommendation = "Pastikan target aktif dan endpoint blackbox/exporter dapat di-scrape oleh Prometheus."
+        root_cause_hint = "No telemetry samples recorded for this target in the selected time window."
+        recommendation = "Confirm the target is active and its blackbox/exporter endpoint is scrapable by Prometheus."
     else:
         is_eligible = (cov_pct >= min_sla_coverage_pct)
         if not is_eligible:
@@ -848,26 +856,26 @@ def merge_hybrid_target_availability(
             sla_reason = f"Insufficient coverage ({cov_pct}% < {min_sla_coverage_pct}%)"
             if first_seen_ts and first_seen_ts > (req_start + 1800):
                 root_cause_code = "NEW_TARGET"
-                root_cause_hint = "Target baru aktif dipantau di tengah jendela waktu yang diminta (Late Discovery)."
-                recommendation = "Gunakan jendela waktu yang lebih pendek (misal 6h/24h) agar persentase ketersediaan mencerminkan periode aktif target."
+                root_cause_hint = "Target was first monitored partway through the requested window (late discovery)."
+                recommendation = "Use a shorter time window (e.g. 6h/24h) so the availability percentage reflects the target's active period."
             elif sqlite_cov_sec <= 0 and prom_cov_sec > 0:
                 root_cause_code = "RETENTION_WINDOW"
-                root_cause_hint = "Telemetri hanya tersedia di buffer memori Prometheus, belum teragregasi penuh ke arsip SQLite."
-                recommendation = "Tunggu proses agregasi berkala atau perkecil jendela waktu sesuai retensi Prometheus aktif."
+                root_cause_hint = "Telemetry is only available in Prometheus's in-memory buffer and has not been fully aggregated into the SQLite archive yet."
+                recommendation = "Wait for the periodic aggregation to run, or shorten the window to match the active Prometheus retention."
             else:
                 root_cause_code = "SCRAPE_GAPS"
-                root_cause_hint = "Ditemukan jeda/kekosongan sampel telemetri pada target selama jendela waktu ini."
-                recommendation = "Periksa stabilitas koneksi jaringan target atau cek log blackbox exporter untuk outage scraping."
+                root_cause_hint = "Gaps were found in this target's telemetry samples during the window."
+                recommendation = "Check the target's network stability, or review the blackbox exporter logs for scrape outages."
         else:
             data_status = "COMPLETE" if cov_pct >= 95.0 else "PARTIAL"
             if cov_pct < 95.0:
                 root_cause_code = "PARTIAL_COVERAGE"
-                root_cause_hint = "Cakupan telemetri memadai untuk analisis awal, namun terdapat jeda observasi minor."
-                recommendation = "Sebagian kecil data tidak teramati; nilai ketersediaan valid dengan tingkat keyakinan moderat."
+                root_cause_hint = "Telemetry coverage is adequate for a first look, but there are minor observation gaps."
+                recommendation = "A small fraction of data was not observed; the availability figure is valid with moderate confidence."
             else:
                 root_cause_code = "OPTIMAL"
-                root_cause_hint = "Cakupan telemetri optimal (≥95%) untuk evaluasi performa dan audit SLA."
-                recommendation = "Data telemetri lengkap dan representatif untuk audit SLA resmi."
+                root_cause_hint = "Telemetry coverage is optimal (>=95%) for performance evaluation and SLA audit."
+                recommendation = "Telemetry data is complete and representative for a formal SLA audit."
 
             _maint_note = f" (excl. {round(maint_excluded_sec / 60.0, 1)}m planned)" if maint_excluded_sec > 0 else ""
             if sla_avail_eff >= sla_threshold:
@@ -1020,6 +1028,12 @@ def merge_hybrid_fleet_availability(
     tot_cov_sec = 0.0
     tot_unk_sec = 0.0
     tot_maint_excluded_sec = 0.0
+    # Wall-clock planned-maintenance time scheduled inside [req_start, req_end],
+    # independent of coverage. tot_maint_excluded_sec (what actually left the
+    # SLA denominator) can only ever be <= this, and lags it while the last
+    # few minutes of telemetry are still being aggregated — so the two are
+    # reported side by side ("Xm scheduled / Ys excluded so far").
+    tot_maint_window_sec = 0.0
 
     for inst in monitored_instances:
         target_prom = {
@@ -1035,6 +1049,7 @@ def merge_hybrid_fleet_availability(
             inst_interval_sec = expected_interval_sec.get(inst) or DEFAULT_SCRAPE_INTERVAL_SEC
         else:
             inst_interval_sec = expected_interval_sec
+        inst_maint_wins = (maintenance_by_instance or {}).get(inst)
         entry = merge_hybrid_target_availability(
             req_start=req_start,
             req_end=req_end,
@@ -1047,10 +1062,12 @@ def merge_hybrid_fleet_availability(
             gap_tolerance=gap_tolerance,
             min_sla_coverage_pct=min_sla_coverage_pct,
             sla_threshold=float((sla_threshold_by_instance or {}).get(inst, sla_threshold)),
-            maintenance_windows=(maintenance_by_instance or {}).get(inst),
+            maintenance_windows=inst_maint_wins,
         )
         entries.append(entry)
         tot_maint_excluded_sec += entry.get("maintenance_excluded_seconds", 0.0)
+        if inst_maint_wins:
+            tot_maint_window_sec += maintenance_overlap_seconds(inst_maint_wins, req_start, req_end)
         tot_sqlite_sec += entry.get("sqlite_seconds", 0.0)
         tot_prom_sec += entry.get("prometheus_seconds", 0.0)
         tot_overlap_removed += entry.get("overlap_removed_seconds", 0.0)
@@ -1091,35 +1108,46 @@ def merge_hybrid_fleet_availability(
 
     avg_cov_sec = round(tot_cov_sec / max(1, len(monitored_instances)), 1) if monitored_instances else 0.0
     avg_unk_sec = round(tot_unk_sec / max(1, len(monitored_instances)), 1) if monitored_instances else 0.0
+    # Fleet TOTAL planned-maintenance time carved out of the SLA denominator.
+    # NOT a per-host mean: maintenance windows are per-host events (most hosts
+    # have none), so dividing the total by the whole fleet turned a real
+    # 10-minute window into a meaningless "7s". The audit/SLA cards render
+    # this as an absolute duration ("X excluded"), never as a % of window, so
+    # the fleet total is the correct — and only non-misleading — quantity.
+    # Matches summary.fleet_aggregate.maintenance_excluded_minutes exactly
+    # (both are Σ per-host (coverage − sla_coverage)).
+    maint_excluded_sec_total = round(tot_maint_excluded_sec, 1)
+    maint_scheduled_sec_total = round(tot_maint_window_sec, 1)
     req_win_sec = round(period_minutes * 60.0, 1)
 
     if tot_cov_sec <= 0:
         fleet_root_code = "NO_DATA"
-        fleet_root_hint = "Belum ada telemetri yang tercatat untuk seluruh host dalam armada pada jendela ini."
-        fleet_recom = "Periksa konektivitas Prometheus dan pastikan exporter aktif mengumpulkan metrik."
+        fleet_root_hint = "No telemetry recorded for any host in the fleet during this window."
+        fleet_recom = "Check Prometheus connectivity and confirm the exporters are actively collecting metrics."
     elif fleet_cov_pct < (min_sla_coverage_pct or DEFAULT_MIN_SLA_COVERAGE_PERCENT):
         if len(limited_hosts) == len(entries):
             fleet_root_code = "FLEET_RETENTION_WINDOW"
-            fleet_root_hint = f"Seluruh armada ({len(entries)} host) baru diobservasi {fleet_cov_pct}% dari jendela waktu."
-            fleet_recom = "Gunakan filter rentang waktu yang lebih pendek (misal Last 24 Hours) atau tunggu backfill database SQLite."
+            fleet_root_hint = f"The entire fleet ({len(entries)} hosts) has only been observed for {fleet_cov_pct}% of the window."
+            fleet_recom = "Use a shorter time range (e.g. Last 24 Hours) or wait for the SQLite database to backfill."
         else:
             fleet_root_code = "PARTIAL_FLEET_ONBOARDING"
-            fleet_root_hint = f"{len(limited_hosts)} dari {len(entries)} host memiliki data terbatas (<50% coverage)."
-            fleet_recom = "Periksa host-host yang baru onboard pada tabel audit di bawah untuk evaluasi mendalam."
+            fleet_root_hint = f"{len(limited_hosts)} of {len(entries)} hosts have limited data (<50% coverage)."
+            fleet_recom = "Review the newly onboarded hosts in the audit table below for a closer look."
     elif fleet_cov_pct < 95.0:
         fleet_root_code = "MODERATE_COVERAGE"
-        fleet_root_hint = f"Cakupan armada mencakup {fleet_cov_pct}% dari jendela waktu. Sebagian host mengalami jeda observasi."
-        fleet_recom = "Data armada representatif untuk tren performa internal."
+        fleet_root_hint = f"Fleet coverage spans {fleet_cov_pct}% of the window. Some hosts had observation gaps."
+        fleet_recom = "Fleet data is representative for internal performance trends."
     else:
         fleet_root_code = "OPTIMAL_COVERAGE"
-        fleet_root_hint = "Cakupan telemetri armada optimal (≥95%) untuk pelaporan operasional dan kepatuhan SLA."
-        fleet_recom = "Armada dalam status monitoring prima."
+        fleet_root_hint = "Fleet telemetry coverage is optimal (>=95%) for operational reporting and SLA compliance."
+        fleet_recom = "Fleet is in a healthy monitoring state."
 
     fleet_audit = {
         "requested_window_seconds": req_win_sec,
         "coverage_seconds": avg_cov_sec,
         "missing_seconds": avg_unk_sec,
-        "maintenance_excluded_seconds": round(tot_maint_excluded_sec, 1),
+        "maintenance_excluded_seconds": maint_excluded_sec_total,
+        "maintenance_scheduled_seconds": maint_scheduled_sec_total,
         "coverage_percent": fleet_cov_pct,
         "missing_percent": round(max(0.0, 100.0 - fleet_cov_pct), 2),
         "data_status": fleet_data_status,
@@ -1147,7 +1175,8 @@ def merge_hybrid_fleet_availability(
         "coverage_seconds": avg_cov_sec,
         "unknown_seconds": avg_unk_sec,
         "missing_seconds": avg_unk_sec,
-        "maintenance_excluded_seconds": round(tot_maint_excluded_sec, 1),
+        "maintenance_excluded_seconds": maint_excluded_sec_total,
+        "maintenance_scheduled_seconds": maint_scheduled_sec_total,
         "sqlite_seconds": round(tot_sqlite_sec / max(1, len(monitored_instances)), 1) if monitored_instances else 0.0,
         "prometheus_seconds": round(tot_prom_sec / max(1, len(monitored_instances)), 1) if monitored_instances else 0.0,
         "overlap_removed_seconds": round(tot_overlap_removed / max(1, len(monitored_instances)), 1) if monitored_instances else 0.0,

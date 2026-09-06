@@ -74,8 +74,8 @@ docker compose ps
 
 1. Buka browser dan akses `http://<IP-SERVER>:5000`.
 2. Saat pertama kali dijalankan, sistem otomatis memunculkan pop-up **"Create Administrator Account"**.
-3. Masukkan **Nama Tampilan**, **Username Admin**, dan **Password** (minimal 6 karakter).
-4. Klik **"Create Admin Account"**. Anda akan langsung login sebagai Administrator.
+3. Masukkan **Nama Tampilan**, **Username Admin** (min. 3 karakter), dan **Password** (minimal 12 karakter).
+4. Klik **"Initialize & Log In"**. Anda akan langsung login sebagai Administrator.
 5. Klik **"Masuk & Aktifkan Audio Alarm"** pada splash screen untuk mengizinkan pemutaran audio sirine di browser TV NOC.
 
 ---
@@ -105,23 +105,46 @@ docker compose ps
 | `/api/auth/setup` | `POST` | Setup akun administrator pertama kali |
 | `/api/auth/login` | `POST` | Login user (session-based) |
 | `/api/auth/logout` | `POST` | Logout user |
+| `/api/auth/me` | `GET` 🔒 | Profil user yang sedang login |
 | `/api/auth/users` | `GET` 🔒 / `POST` 🔒 | Manajemen daftar user (khusus Admin) |
-| `/api/targets` | `GET` / `POST` 🔒 / `DELETE` 🔒 | Kelola daftar target monitoring (`targets/websites.yml`) |
+| `/api/auth/users/<id>` | `PATCH` 🔒 | Ubah role / status aktif / password user |
+| `/api/prometheus-targets` | `GET` | Daftar target hasil discovery Prometheus (untuk dropdown Add Target) |
+| `/api/targets` | `GET` / `POST` 🔒 / `DELETE` 🔒 | Kelola daftar kurasi target (`targets/websites.yml`) |
+| `/api/jobs` | `GET` | Daftar nama job Prometheus (diagnostik curl) |
 | `/api/maintenance` | `GET` / `POST` 🔒 | List & pembuatan jadwal Maintenance Window |
 | `/api/maintenance/<id>` | `DELETE` 🔒 | Hapus jadwal Maintenance Window |
 | `/api/dependencies` | `GET` / `POST` 🔒 | List & pembuatan relasi Parent-Child (korelasi insiden) |
 | `/api/dependencies/<id>` | `DELETE` 🔒 | Hapus relasi dependency |
 | `/api/endpoints` | `GET` / `POST` 🔒 / `DELETE` 🔒 | Manajemen daftar failover endpoint Prometheus |
 | `/api/endpoints/select` | `POST` 🔒 | Ganti endpoint Prometheus aktif secara manual |
+| `/api/alerts/ack` | `POST` 🔒 | Acknowledge (bungkam) outage down yang aktif |
+| `/api/alerts/unack` | `POST` 🔒 | Batalkan acknowledge sebuah instance |
+| `/api/alerts/resolve` | `POST` 🔒 | Paksa-resolve sebuah incident (backstop untuk phantom incident) |
+| `/api/audit/logs` | `GET` 🔒 | Jejak audit tindakan operator |
+| `/api/sla-targets` | `GET` 🔒 / `<instance>` `PUT` 🔒 / `DELETE` 🔒 | Target SLA availability per-instance |
+| `/api/slow-thresholds` | `GET` 🔒 / `<instance>` `PUT` 🔒 / `DELETE` 🔒 | Threshold latensi SlowResponse per-instance |
+| `/api/settings/availability` | `GET` 🔒 / `POST` 🔒 | Toggle korelasi Node Exporter untuk availability |
 | `/api/telegram` | `GET` 🔒 / `POST` 🔒 | Baca status token & simpan konfigurasi bot Telegram |
 | `/api/telegram/test` | `POST` 🔒 | Uji kirim notifikasi pesan ke Telegram |
 | `/status` | `GET` | Status global (`NORMAL`, `WARNING`, `CRITICAL`) & active alerts |
 | `/logs` | `GET` | Log kejadian insiden |
 | `/history` | `GET` | Riwayat insiden lengkap |
-| `/webhook` | `POST` | Webhook receiver dari Alertmanager (opsional) |
-| `/health` | `GET` | Healthcheck konektivitas Prometheus, storage, dan poller |
+| `/webhook`, `/api/webhook` | `POST` | Webhook receiver dari Alertmanager (opsional, butuh header `X-Webhook-Secret`) |
+| `/health` | `GET` | Healthcheck: konektivitas Prometheus, storage, poller, & availability aggregator |
+| `/health/live`, `/health/ready` | `GET` | Liveness / readiness probe ringan |
 
 > 🔒 = Membutuhkan login sesi Administrator atau header `X-API-Key: <key>` / `Authorization: Bearer <key>`.
+
+---
+
+## Manajemen Target (`targets/websites.yml`)
+
+`targets/websites.yml` adalah **daftar kurasi milik InfraWatch**, bukan konfigurasi scrape Prometheus. Isinya: subset target hasil *discovery* Prometheus yang di-*pin* operator lewat tombol **Add Target**. Efek nyata sebuah entri: target tetap tampil di wallboard dan tetap ikut kalkulasi SLA **meskipun** Prometheus berhenti men-scrape-nya (mem-`POST` ulang target yang belum di-hapus tidak mengubah apa-apa — sudah dimonitor). Synthetic poller & dashboard tetap men-scan **semua** target hasil discovery, bukan hanya yang di-pin.
+
+- **Sumber utama data tetap Prometheus.** Poller & dashboard membaca `probe_success` / `probe_duration_seconds` dari `PROMETHEUS_URL`. Sebuah entri di `websites.yml` yang **belum** di-scrape Prometheus manapun akan muncul berstatus **Unknown** (tanpa latency / HTTP code) sampai scrape config Prometheus eksternal Anda menjangkaunya. API `POST /api/targets` mengembalikan field `warning` bila mendeteksi kondisi ini.
+- **InfraWatch tidak mem-provision Prometheus.** Tidak ada `file_sd_config` yang di-generate dari repo ini dan tidak ada panggilan `/-/reload`. Bila Anda memang ingin `websites.yml` dipakai Prometheus, wiring `file_sd_config` + reload adalah tanggung jawab konfigurasi Prometheus Anda sendiri (di luar repo ini).
+- **Persistensi.** File ini di-*bind mount* (`./alarm/targets:/app/targets`) sehingga selamat dari restart container, tetapi **tidak di-track git** dan tidak masuk image. Setiap `save` menulis `websites.yml.bak` sebagai titik pulih. Untuk migrasi host, salin `alarm/targets/websites.yml` secara manual — kalau tidak, host baru mulai dari daftar kosong (`websites.yml.example`).
+- **Hapus target bersifat reversibel.** `DELETE /api/targets` menyembunyikan target dari InfraWatch (tombstone di SQLite) — bukan menghentikan Prometheus men-scrape-nya. `GET /api/targets` mengembalikan daftar `deleted`; mem-`POST` ulang URL yang sama akan memulihkannya.
 
 ---
 

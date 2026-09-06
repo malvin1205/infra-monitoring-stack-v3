@@ -1,0 +1,3 @@
+- labels:
+    job: blackbox_http
+  targets: []

@@ -40,6 +40,12 @@ alarm/telegram_config.json
 !alarm/telegram_config.json.example
 alarm/availability_settings.json
 !alarm/availability_settings.json.example
+alarm/targets/websites.yml
+alarm/targets/websites.yml.bak
+alarm/targets/websites.yml.tmp
+alarm/targets/websites.yml.lock
+!alarm/targets/websites.yml.example
+
 alarm/.api_key
 alarm/.webhook_secret
 alarm/.session_secret

@@ -12,12 +12,19 @@ services:
       # can view the dashboard but can't mutate config or forge alerts.
       - "5000:5000"
     environment:
-      - PROMETHEUS_URL=${PROMETHEUS_URL:-http://prometheus:9090}
+      # Blank/unset => InfraWatch starts with no Prometheus endpoint; add one
+      # in the UI (Manage Prometheus Endpoints). Set it here to pre-seed.
+      - PROMETHEUS_URL=${PROMETHEUS_URL-}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
       - TELEGRAM_ENABLED=${TELEGRAM_ENABLED:-true}
       - INFRAWATCH_API_KEY=${INFRAWATCH_API_KEY:-}
       - WEBHOOK_SECRET=${WEBHOOK_SECRET:-}
+      # This compose serves plain HTTP on the LAN (no TLS). A Secure session
+      # cookie would never round-trip over http:// — the browser drops it and
+      # every /api/* call comes back unauthenticated ("login again" loop). Set
+      # to 1 only when InfraWatch sits behind an HTTPS reverse proxy.
+      - SESSION_COOKIE_SECURE=${SESSION_COOKIE_SECURE:-0}
     volumes:
       - ./alarm:/app
       - ./alarm/targets:/app/targets

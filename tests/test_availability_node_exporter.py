@@ -126,6 +126,31 @@ class NodeExporterCorrelationIntegrationTests(unittest.TestCase):
         app.config['TESTING'] = True
         self.client = app.test_client()
         self.client.environ_base = {"HTTP_X_API_KEY": TEST_API_KEY, "HTTP_X_WEBHOOK_SECRET": TEST_WEBHOOK_SECRET}
+        # Own SQLite + status.json so exact alarmable_down counts here aren't
+        # perturbed by an incident another test left in a shared DB (audit F2).
+        import shutil
+        from storage import init_db
+        self.tmpdir = tempfile.mkdtemp()
+        self._orig_files = (alarm_app.STATUS_FILE, alarm_app.HISTORY_FILE,
+                            alarm_app.HISTORY_ARCHIVE_FILE, alarm_app.LOGS_FILE)
+        alarm_app.STATUS_FILE = os.path.join(self.tmpdir, "status.json")
+        alarm_app.HISTORY_FILE = os.path.join(self.tmpdir, "history.json")
+        alarm_app.HISTORY_ARCHIVE_FILE = os.path.join(self.tmpdir, "history_archive.json")
+        alarm_app.LOGS_FILE = os.path.join(self.tmpdir, "logs.json")
+        self.db_path = os.path.join(self.tmpdir, "test.db")
+        init_db(self.db_path)
+        self._orig_db_env = os.environ.get("INFRAWATCH_DB_PATH")
+        os.environ["INFRAWATCH_DB_PATH"] = self.db_path
+        self._shutil = shutil
+
+    def tearDown(self):
+        if self._orig_db_env is not None:
+            os.environ["INFRAWATCH_DB_PATH"] = self._orig_db_env
+        else:
+            os.environ.pop("INFRAWATCH_DB_PATH", None)
+        (alarm_app.STATUS_FILE, alarm_app.HISTORY_FILE,
+         alarm_app.HISTORY_ARCHIVE_FILE, alarm_app.LOGS_FILE) = self._orig_files
+        self._shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def _down_target_response(self, use_node_exporter, node_exporter_map):
         raw_targets = {
