@@ -107,6 +107,16 @@ except (TypeError, ValueError):
 # slack multiplier already used for the aggregator's leader-election lease.
 _AVAIL_FRESHNESS_TOLERANCE_SEC = 150.0  # 60.0 * 2.5
 
+# Separately: how old the NEWEST matched bucket's `updated_at` may be before the
+# SQLite fast path is abandoned for a live window. The freshness tolerance above
+# is about the bucket's nominal time span (which always reads as current, since
+# an in-progress hour is stored with a future hour-end); this one catches a
+# silently dead aggregator — buckets whose span still looks current but that
+# stopped being rewritten. ~5 aggregator cycles (AVAIL_AGGREGATE_INTERVAL_SECONDS
+# = 60s); older => fall through to the live Prometheus hybrid path instead of
+# serving an ever-staler archive as "COMPLETE".
+_AVAIL_STALE_BUCKET_TOLERANCE_SEC = 300.0
+
 app = Flask(__name__)
 app.secret_key = get_session_secret()
 # Behind a reverse proxy, trust X-Forwarded-For/-Proto ONLY when explicitly
@@ -2663,9 +2673,17 @@ def fetch_down_since_prom_map(cache_ttl=10.0):
                 except ValueError:
                     pass
 
-    # 2. PromQL query for initial DOWN timestamp from Prometheus log history for targets continuously DOWN
-    query_down = 'min_over_time(timestamp(probe_success == 0)[1d:1m])'
+    # 2. Initial DOWN timestamp for targets continuously DOWN (no `== 1` sample
+    #    in the query-1 window). Range widened to 32d so an outage older than a
+    #    day is no longer clamped to "~24h ago" — it now reads its real age up
+    #    to a month back. 15m step keeps the point count bounded (~3k); the
+    #    outage-start estimate is then accurate to ±15m, which is immaterial for
+    #    a multi-day outage. Falls back to `up == 0` the same way query 1 does.
+    query_down = 'min_over_time(timestamp(probe_success == 0)[32d:15m])'
     raw_down, _ = fetch_prometheus_json(f"/api/v1/query?query={quote(query_down)}", use_cache=True, cache_ttl=cache_ttl)
+    if not raw_down or not raw_down.get('data', {}).get('result'):
+        query_down = 'min_over_time(timestamp(up == 0)[32d:15m])'
+        raw_down, _ = fetch_prometheus_json(f"/api/v1/query?query={quote(query_down)}", use_cache=True, cache_ttl=cache_ttl)
     if raw_down and raw_down.get('status') == 'success':
         for r in raw_down.get('data', {}).get('result', []):
             metric = r.get('metric', {})
@@ -2678,6 +2696,29 @@ def fetch_down_since_prom_map(cache_ttl=10.0):
                     pass
 
     return last_up_map
+
+def _earliest_outage_start(prom_down_since, matched_alerts, health):
+    """downSince for the wallboard's "Down for X" aging and the drawer's ongoing
+    -outage duration. fetch_down_since_prom_map() is bounded by its subquery
+    lookback, so a genuinely long outage still reads as roughly that bound. A
+    firing incident row carries the authoritative outage start (poller stamps it
+    at first-observed-down; a webhook carries Alertmanager's startsAt) — when one
+    exists for this DOWN target, take whichever start is EARLIER, i.e. the
+    longer, truer outage. Returns prom_down_since untouched for an up target or
+    when there is no usable incident timestamp."""
+    if health == 'up':
+        return prom_down_since
+    starts = []
+    if prom_down_since:
+        starts.append(prom_down_since)
+    for a in matched_alerts or []:
+        nm = (a.get('name') or '').lower()
+        if a.get('severity') == 'critical' or 'down' in nm or 'unreachable' in nm or 'probe' in nm:
+            ts = _sane_epoch(a.get('time'))
+            if ts:
+                starts.append(ts)
+    return min(starts) if starts else prom_down_since
+
 
 # ── Scrape failure classification ────────────────────────────────────────────
 # Single source of truth for turning raw Prometheus/blackbox_exporter data into
@@ -2811,7 +2852,12 @@ def _derive_probe_readings(keys, probe_success_map, probe_duration_map, probe_st
     and `lastScrapeDuration` when probe_duration_seconds has no reading yet —
     plus lastError for classification. Custom (manually-added, non-Prometheus
     -discovered) targets pass raw_target=None and keep the narrower fallbacks
-    (health='unknown', response_time_ms=0.0, last_error='') they always had.
+    (health='unknown', last_error='') they always had.
+
+    response_time_ms is None when there is genuinely no latency reading (no
+    probe_duration_seconds sample and no lastScrapeDuration) — callers must not
+    treat that as "0ms"/"< 1 ms". A real numeric 0.0 only comes from an actual
+    zero-valued sample.
 
     This only extracts what both loops were already computing identically —
     it does not change either path's behavior, including one small existing
@@ -2845,18 +2891,18 @@ def _derive_probe_readings(keys, probe_success_map, probe_duration_map, probe_st
         try:
             response_time_ms = round(float(p_duration) * 1000, 1)
         except ValueError:
-            response_time_ms = 0.0
+            response_time_ms = None
     elif raw_target is not None:
         scrape_dur = raw_target.get('lastScrapeDuration')
         if scrape_dur is not None:
             try:
                 response_time_ms = round(float(scrape_dur) * 1000, 1)
             except ValueError:
-                response_time_ms = 0.0
+                response_time_ms = None
         else:
-            response_time_ms = 0.0
+            response_time_ms = None
     else:
-        response_time_ms = 0.0
+        response_time_ms = None
 
     p_code = _first(probe_status_code_map)
     if raw_target is not None:
@@ -2992,6 +3038,7 @@ def build_canonical_monitoring_state(job_param=None):
                     a for a in alerts_by_instance.get(scrape_url, [])
                     if a not in alerts_by_instance.get(inst_name, [])
                 ]
+                down_since_val = _earliest_outage_start(down_since_val, matched_alerts, health)
 
                 result.append({
                     "instance":        inst_name,
@@ -3022,6 +3069,7 @@ def build_canonical_monitoring_state(job_param=None):
             classification = classify_scrape_failure(health, last_error, http_code)
             infra_correlation = _infra_correlation_for(health, target_url)
             matched_alerts = alerts_by_instance.get(target_url, [])
+            down_since_val = _earliest_outage_start(down_since_val, matched_alerts, health)
 
             result.append({
                 "instance":        target_url,
@@ -3056,7 +3104,7 @@ def build_canonical_monitoring_state(job_param=None):
                     "job":             alert_job,
                     "health":          health,
                     "probe_state":     health,
-                    "responseTimeMs":  0.0,
+                    "responseTimeMs":  None,
                     "httpStatusCode":  None,
                     "lastScrape":      "—",
                     "scrapeUrl":       inst,
@@ -3115,7 +3163,8 @@ def build_canonical_monitoring_state(job_param=None):
         is_supp = bool(item.get('suppressedBy'))
         slow_threshold_ms = _slow_threshold_for(item['instance'])
         item['slowThresholdMs'] = slow_threshold_ms
-        is_slow = (item['health'] == 'up' and item['responseTimeMs'] > slow_threshold_ms)
+        is_slow = (item['health'] == 'up' and item['responseTimeMs'] is not None
+                   and item['responseTimeMs'] > slow_threshold_ms)
         has_crit_alert = any(a.get('severity') == 'critical' for a in item.get('active_alerts', []))
         has_warn_alert = any(a.get('severity') == 'warning' for a in item.get('active_alerts', []))
 
@@ -3177,7 +3226,7 @@ def build_canonical_monitoring_state(job_param=None):
     up_count = sum(1 for t in result if t['health'] == 'up')
     down_count = sum(1 for t in result if t['health'] == 'down')
     nodata_count = sum(1 for t in result if t['health'] not in ('up', 'down'))
-    slow_count = sum(1 for t in result if t['health'] == 'up' and t['responseTimeMs'] > _slow_threshold_for(t['instance']))
+    slow_count = sum(1 for t in result if t['health'] == 'up' and t['responseTimeMs'] is not None and t['responseTimeMs'] > _slow_threshold_for(t['instance']))
     maint_count = sum(1 for t in result if t['maintenance'])
     supp_count = sum(1 for t in result if t.get('suppressedBy'))
     alarmable_down = sum(1 for t in result if t['is_alarmable'] and t['health'] != 'up')
@@ -3336,6 +3385,24 @@ def get_instance_cadence_map(job_filter=None):
                 sec = _parse_prom_duration_sec(t.get('scrapeInterval'))
                 if sec:
                     cadence_map[inst_name] = sec
+
+    # Custom (websites.yml) targets are never in Prometheus's activeTargets, so
+    # they carry no scrapeInterval here and — on windows > 60m, where the
+    # observed-cadence estimate is also unavailable — fall through to
+    # DEFAULT_SCRAPE_INTERVAL_SEC (2s) in merge_hybrid_target_availability,
+    # collapsing their coverage to a few percent and flagging them
+    # INSUFFICIENT_DATA. Give them the fleet's observed median cadence instead
+    # (the best available guess for whatever job actually probes them); fall
+    # back to the deployment scrape interval only when nothing else is known.
+    if matches_job_filter("custom", "custom", job_filter):
+        if cadence_map:
+            _vals = sorted(cadence_map.values())
+            _fallback_cadence = _vals[len(_vals) // 2]
+        else:
+            _fallback_cadence = SCRAPE_INTERVAL_SECONDS
+        for target_url in load_website_targets():
+            if target_url not in deleted_targets:
+                cadence_map.setdefault(target_url, _fallback_cadence)
     return cadence_map
 
 
@@ -3365,6 +3432,34 @@ def _attach_sla_budgets(summary_dict, window_sec, default_target_pct, project_da
     # "BREACHED" on a healthy fleet).
     n_scored = int(summary_dict.get("scored_count") or 0) or 1
     return sla_budget(f_dt, f_obs, default_target_pct, window_sec * n_scored, project_days)
+
+
+def _availability_status_counts(entries, live_map=None):
+    """online / warning / offline split by historical availability_pct, with the
+    live probe_success snapshot breaking the tie for entries that have no
+    historical coverage yet (availability_pct is None). Shared verbatim by
+    api_availability's SQLite fast path and its Prometheus hybrid path so the
+    same target is never bucketed differently depending on which path served the
+    request (audit m4)."""
+    live_map = live_map or {}
+    counts = {"online": 0, "warning": 0, "offline": 0}
+    for e in entries:
+        avail_pct = e.get("availability_pct")
+        if avail_pct is not None:
+            if avail_pct >= 99.9:
+                st_val = 'online'
+            elif avail_pct >= 95.0:
+                st_val = 'warning'
+            else:
+                st_val = 'offline'
+        else:
+            live_val = live_map.get(e.get("id"))
+            if live_val is not None:
+                st_val = 'online' if str(live_val) in ('1', '1.0') else 'offline'
+            else:
+                st_val = 'warning'
+        counts[st_val] += 1
+    return counts
 
 
 def _build_fleet_trend(db_bucket_records, trend_end_ts, hours=24):
@@ -3404,10 +3499,13 @@ def _build_fleet_trend(db_bucket_records, trend_end_ts, hours=24):
 @app.route('/api/availability/data-range')
 @rate_limit(120, 60)
 def api_availability_data_range():
-    """Resolve the "Since data began" range: earliest telemetry we hold for
-    this job filter -> now, expressed as a minutes span the rest of the
-    range pipeline (/api/availability, /api/target-history, charts) already
-    understands. `minutes` is null when there is nothing recorded yet."""
+    """Resolve the "Max history" range: oldest bucket still in the archive for
+    this job filter -> now, expressed as a minutes span the rest of the range
+    pipeline (/api/availability, /api/target-history, charts) already
+    understands. Bounded by AVAIL_BUCKET_RETENTION_SECONDS — the aggregator
+    prunes anything older, so this is NOT "since server start", it is "as far
+    back as the archive still reaches". `minutes` is null when there is
+    nothing recorded yet."""
     job_filter = request.args.get('job', DEFAULT_JOB_FILTER)
     job_key = job_filter if (job_filter and job_filter != 'all') else 'all'
     since_ts = None
@@ -3431,8 +3529,12 @@ def api_availability_data_range():
     now = time.time()
     if since_ts is None or since_ts >= now:
         return jsonify({"ok": True, "since_ts": None, "minutes": None})
+    # Clamp to retention: the created_at fallback (and a stale-clock bucket) can
+    # point past the prune horizon, and a window wider than the archive just
+    # reads as "unmonitored" for the missing part.
+    since_ts = max(since_ts, now - AVAIL_BUCKET_RETENTION_SECONDS)
     minutes = max(1, int(round((now - since_ts) / 60.0)))
-    minutes = min(minutes, 366 * 1440)  # same ceiling as api_availability
+    minutes = min(minutes, int(AVAIL_BUCKET_RETENTION_SECONDS // 60))
     return jsonify({"ok": True, "since_ts": round(since_ts, 1), "minutes": minutes})
 
 
@@ -3602,6 +3704,7 @@ def api_availability():
         if db_bucket_records and monitored_instances:
             instances_in_db = set()
             instance_spans = {}
+            newest_bucket_update = 0.0
             for b in db_bucket_records:
                 inst = b.get("instance")
                 cov_sec = float(b.get("coverage_seconds", 0) or 0)
@@ -3609,13 +3712,30 @@ def api_availability():
                     instances_in_db.add(inst)
                     st = float(b.get("bucket_start", 0))
                     en = float(b.get("bucket_end", 0))
+                    try:
+                        newest_bucket_update = max(newest_bucket_update, float(b.get("updated_at", 0) or 0))
+                    except (TypeError, ValueError):
+                        pass
                     cur = instance_spans.get(inst)
                     if cur is None:
                         instance_spans[inst] = (st, en, 1)
                     else:
                         instance_spans[inst] = (min(cur[0], st), max(cur[1], en), cur[2] + 1)
 
-            if len(instances_in_db) == len(monitored_instances):
+            # For a live window (no ?end=), a bucket's stored span always reads as
+            # current — an in-progress hour is written with a future hour-end —
+            # so the span check alone can't tell a healthy archive from one the
+            # aggregator silently stopped refreshing. Require the newest matched
+            # bucket to have been rewritten recently too; otherwise drop to the
+            # live Prometheus hybrid path rather than serve an ageing archive as
+            # COMPLETE. Fixed historical ranges (end_ts set) are immutable once
+            # materialized, so this staleness gate does not apply to them.
+            aggregator_fresh = (
+                end_ts is not None
+                or (newest_bucket_update > 0.0 and (now - newest_bucket_update) < _AVAIL_STALE_BUCKET_TOLERANCE_SEC)
+            )
+
+            if len(instances_in_db) == len(monitored_instances) and aggregator_fresh:
                 expected_hours = max(1, int(round((req_end - req_start) / 3600.0)))
                 all_covered = True
                 for inst in monitored_instances:
@@ -3644,19 +3764,14 @@ def api_availability():
 
             fleet_sla_budget = _attach_sla_budgets(summary_dict, minutes * 60.0, sla_target_pct, sla_days, target_map=sla_target_map)
             hybrid_meta = summary_dict.get("hybrid", {})
-            counts = {"online": 0, "warning": 0, "offline": 0}
-            for e in entries:
-                avail_pct = e.get("availability_pct")
-                if avail_pct is not None:
-                    if avail_pct >= 99.9:
-                        st_val = 'online'
-                    elif avail_pct >= 95.0:
-                        st_val = 'warning'
-                    else:
-                        st_val = 'offline'
-                else:
-                    st_val = 'warning'
-                counts[st_val] += 1
+            # Same online/warning/offline rule as the hybrid path. Only pay for a
+            # live probe_success snapshot if an entry actually has no historical
+            # coverage (rare on the fully-materialized fast path) — otherwise
+            # this stays a zero-Prometheus-query path.
+            if any(e.get("availability_pct") is None for e in entries):
+                counts = _availability_status_counts(entries, fetch_prom_query_map("probe_success"))
+            else:
+                counts = _availability_status_counts(entries)
 
             lowest_availability = sorted(
                 [e for e in summary_dict['per_server']['values'] if e.get('availability_pct') is not None and e['availability_pct'] < 100.0],
@@ -3915,25 +4030,8 @@ def api_availability():
             except Exception:
                 pass
 
-        # Live status count resolution
-        counts = {"online": 0, "warning": 0, "offline": 0}
-        for e in entries:
-            inst = e.get("id")
-            avail_pct = e.get("availability_pct")
-            if avail_pct is not None:
-                if avail_pct >= 99.9:
-                    st_val = 'online'
-                elif avail_pct >= 95.0:
-                    st_val = 'warning'
-                else:
-                    st_val = 'offline'
-            else:
-                live_val = live_map.get(inst)
-                if live_val is not None:
-                    st_val = 'online' if str(live_val) in ('1', '1.0') else 'offline'
-                else:
-                    st_val = 'warning'
-            counts[st_val] += 1
+        # Live status count resolution (shared rule with the SQLite fast path).
+        counts = _availability_status_counts(entries, live_map)
 
         lowest_availability = sorted(
             [e for e in summary_dict['per_server']['values'] if e.get('availability_pct') is not None and e['availability_pct'] < 100.0],
@@ -4145,6 +4243,22 @@ def target_history_api():
                             break
                 if down_ts and down_ts > 0:
                     state_start_ts = int(down_ts)
+
+                # A firing incident's started_at is the authoritative outage
+                # start when it predates whatever the (lookback-bounded)
+                # Prometheus estimate or the range samples imply — otherwise a
+                # multi-week outage's "current outage" duration reads as capped
+                # at the query lookback while Incident History shows the real
+                # age (audit M1).
+                try:
+                    for a in active_incident_list():
+                        a_inst = a.get('instance') or ''
+                        if a_inst == target_url or (clean_target and clean_target in a_inst):
+                            a_ts = _sane_epoch(a.get('time'))
+                            if a_ts and a_ts < state_start_ts:
+                                state_start_ts = int(a_ts)
+                except Exception:
+                    pass
 
             duration_sec = int(end_ts - state_start_ts)
             events.append({
@@ -4685,6 +4799,10 @@ def start_alert_poller():
 # ── Background Availability Aggregator ───────────────────────────────────────
 _AVAIL_AGGREGATOR_WORKER_ID = f"{os.getpid()}_{uuid.uuid4().hex[:8]}"
 AVAIL_AGGREGATE_INTERVAL_SECONDS = 60.0
+# Buckets older than this are pruned every aggregator cycle, so it is also the
+# real floor for the "Max history" range — the archive holds nothing older, and
+# the chip must not claim a window the data can't back.
+AVAIL_BUCKET_RETENTION_SECONDS = 35 * 86400
 _avail_aggregator_started = False
 # Heartbeat for /health — set at the top of every aggregator cycle (leader or
 # not), so a wedged/crashed aggregator thread is visible instead of silently
@@ -4879,9 +4997,13 @@ def _aggregate_availability_cycle():
                         # per-hour outages + still-in-outage-at-hour-start/end
                         # flags: merge_hybrid_target_availability drops the
                         # duplicate incident where one outage straddles the
-                        # boundary between two contiguous buckets.
+                        # boundary between two contiguous buckets. "i" carries
+                        # each outage's absolute [start, end] so the maintenance
+                        # carve-out can intersect the real outage, not the hour.
                         "outage_json": {
                             "d": [round(float(x), 1) for x in rec.get("outage_durations_sec", [])],
+                            "i": [[round(float(s), 1), round(float(e), 1)]
+                                  for s, e in rec.get("outage_intervals_sec", [])],
                             "ongoing_start": bool(hour_pts and hour_pts[0] == 0),
                             "ongoing_end": bool(rec.get("is_ongoing_outage")),
                         },
@@ -5000,7 +5122,7 @@ def _aggregate_availability_cycle():
                 logger.exception("availability aggregator: save_buckets failed for %d record(s)", len(bucket_records))
 
     try:
-        AvailabilityBucketRepository.prune_old_buckets(35 * 86400)
+        AvailabilityBucketRepository.prune_old_buckets(AVAIL_BUCKET_RETENTION_SECONDS)
     except Exception:
         logger.exception("availability aggregator: prune_old_buckets failed")
 

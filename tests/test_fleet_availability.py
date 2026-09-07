@@ -259,6 +259,14 @@ class FleetAvailabilityTests(unittest.TestCase):
         self.assertEqual(res["max_outage_minutes"], 5.0)  # 300s = 5m
         self.assertIsNotNone(res["mean_outage_minutes"])
         self.assertIsNotNone(res["median_outage_minutes"])
+        # audit M3: absolute [start, end] per outage, clipped to the window, one
+        # entry per closed outage, each landing on the down slice above.
+        ivs = res["outage_intervals_sec"]
+        self.assertEqual(len(ivs), 3)
+        for (s, e), (lo, hi) in zip(ivs, [(500, 560), (1500, 1620), (3000, 3300)]):
+            self.assertAlmostEqual(s, start_ts + lo, delta=15.0)
+            self.assertAlmostEqual(e, start_ts + hi, delta=15.0)
+            self.assertGreater(e, s)
 
     def test_zero_samples_handling(self):
         start_ts = 1000000.0
@@ -478,6 +486,40 @@ class FleetAvailabilityTests(unittest.TestCase):
         self.assertIn("recommendation", fleet_audit)
         self.assertIn("root_cause_hint", fleet_audit)
         self.assertEqual(summary["hybrid"]["telemetry_audit"], fleet_audit)
+
+    def test_every_range_scores_targets_over_the_same_window(self):
+        """No per-target window rescoping: a target first seen partway through
+        the range reads as honestly low-coverage, and coverage_pct is always
+        observed / requested-window for every entry."""
+        from fleet_availability import merge_hybrid_fleet_availability
+        req_start = 1000000.0
+        req_end = req_start + 3600.0
+        instances = ["srv-old", "srv-new"]
+        prom_results = {
+            "first_ts": {"srv-old": req_start, "srv-new": req_end - 600.0},
+            "last_ts": {"srv-old": req_end, "srv-new": req_end},
+            "count": {"srv-old": 1800, "srv-new": 300},
+            "avail": {"srv-old": 100.0, "srv-new": 100.0},
+            "incidents": {"srv-old": 0, "srv-new": 0},
+            "duration": {"srv-old": 0.02, "srv-new": 0.02},
+        }
+        entries, summary = merge_hybrid_fleet_availability(
+            req_start=req_start, req_end=req_end, monitored_instances=instances,
+            sqlite_buckets=[], prom_results_map=prom_results, expected_interval_sec=2.0,
+        )
+        rw = req_end - req_start
+        for e in entries:
+            win = e["observed_seconds"] + e["unknown_seconds"]
+            self.assertAlmostEqual(win, rw, delta=1.0, msg=f"{e['id']} window != requested")
+            exp = round(e["observed_seconds"] / rw * 100.0, 2)
+            self.assertAlmostEqual(e["coverage_pct"], exp, delta=0.5, msg=f"{e['id']} coverage_pct")
+        new = next(e for e in entries if e["id"] == "srv-new")
+        self.assertLess(new["coverage_pct"], 50.0)
+        self.assertTrue(new["is_limited_data"])
+        # summarize_entries agrees with the raw entry (no "100% avail / 0% cov" split).
+        ps_new = next(e for e in summary["per_server"]["values"] if e["id"] == "srv-new")
+        self.assertAlmostEqual(ps_new["coverage_pct"], new["coverage_pct"], delta=0.5)
+        self.assertAlmostEqual(ps_new["coverage_pct"] + ps_new["unknown_pct"], 100.0, places=1)
 
 
 if __name__ == "__main__":

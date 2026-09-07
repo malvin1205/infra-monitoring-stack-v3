@@ -1,5 +1,6 @@
-"""'/api/availability/data-range' — resolves the "Since start" range to a
-minutes span from the oldest recorded telemetry to now."""
+"""'/api/availability/data-range' — resolves the "Max history" range to a
+minutes span from the oldest bucket still in the archive to now, capped at
+bucket retention (AVAIL_BUCKET_RETENTION_SECONDS)."""
 import os
 import time
 import unittest
@@ -36,11 +37,17 @@ class TestSinceRange(unittest.TestCase):
             d = self.client.get("/api/availability/data-range").get_json()
         self.assertAlmostEqual(d["minutes"], 120, delta=2)
 
-    def test_ceiling_clamps_to_366d(self):
+    def test_clamps_to_bucket_retention(self):
+        # Archive is pruned to AVAIL_BUCKET_RETENTION_SECONDS, so a since_ts
+        # older than that (stale clock, created_at fallback) must not stretch
+        # the window past what the data can back.
         two_years_ago = time.time() - 730 * 86400
+        retention_min = alarm_app.AVAIL_BUCKET_RETENTION_SECONDS // 60
         with patch.object(storage.AvailabilityBucketRepository, "get_earliest_bucket_start", return_value=two_years_ago):
             d = self.client.get("/api/availability/data-range").get_json()
-        self.assertLessEqual(d["minutes"], 366 * 1440)
+        self.assertLessEqual(d["minutes"], retention_min)
+        self.assertGreaterEqual(d["minutes"], retention_min - 2)
+        self.assertAlmostEqual(d["since_ts"], time.time() - alarm_app.AVAIL_BUCKET_RETENTION_SECONDS, delta=120)
 
 
 if __name__ == "__main__":

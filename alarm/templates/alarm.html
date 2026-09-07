@@ -317,7 +317,8 @@
               <button class="chip chip-active" data-range="24h" id="rangePreset24h">24h</button>
               <button class="chip" data-range="7d" id="rangePreset7d">7d</button>
               <button class="chip" data-range="30d" id="rangePreset30d">30d</button>
-              <button class="chip" data-range="since" id="rangePresetSince" title="From the first recorded telemetry up to now">Since start</button>
+              <button class="chip" data-range="since" id="rangePresetSince" title="As far back as the archive still reaches (up to ~35 days) → now">Max history</button>
+              <button class="chip" data-range="mtd" id="rangePresetMtd" title="From 00:00 UTC on the 1st of this month → now (calendar SLA period)">Month to date</button>
               <button class="chip" data-range="custom" id="rangePresetCustom">Custom Range</button>
             </div>
 
@@ -890,10 +891,10 @@
             </svg>
             <select id="modalRangeSelect" class="avail-range-select" aria-label="Select time range">
               <option value="1440" selected>Last 24 Hours</option>
-              <option value="4320">Last 3 Days</option>
               <option value="10080">Last 7 Days</option>
               <option value="43200">Last 30 Days</option>
-              <option value="since">Since data began</option>
+              <option value="since">Max history</option>
+              <option value="mtd">Month to date</option>
             </select>
           </div>
 

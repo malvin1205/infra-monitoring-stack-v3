@@ -265,16 +265,49 @@ def _num(value: Any) -> float:
         return 0.0
 
 
-def _outage_flag(bucket: Dict[str, Any], key: str) -> bool:
-    """Read a boolean flag out of a bucket's outage_json (stored as a JSON
-    string by the aggregator, may be a dict in tests / absent on legacy rows)."""
+def _outage_json(bucket: Dict[str, Any]) -> Dict[str, Any]:
+    """Parse a bucket's outage_json (a JSON string from the aggregator, a dict
+    in tests, absent on legacy rows) into a dict — {} when unavailable."""
     oj = bucket.get("outage_json")
     if isinstance(oj, str):
         try:
             oj = json.loads(oj)
         except (ValueError, TypeError):
-            return False
-    return bool(oj.get(key)) if isinstance(oj, dict) else False
+            return {}
+    return oj if isinstance(oj, dict) else {}
+
+
+def _outage_flag(bucket: Dict[str, Any], key: str) -> bool:
+    """Read a boolean flag out of a bucket's outage_json (stored as a JSON
+    string by the aggregator, may be a dict in tests / absent on legacy rows)."""
+    return bool(_outage_json(bucket).get(key))
+
+
+def _bucket_outage_downtime_in_maintenance(
+    bucket: Dict[str, Any],
+    clip_start: float,
+    clip_end: float,
+    maintenance_windows: Optional[List[Tuple[float, float]]],
+) -> Optional[float]:
+    """Seconds of THIS bucket's actual outages (from outage_json["i"]) that fall
+    inside both [clip_start, clip_end] and a maintenance window. Returns None
+    when the bucket carries no per-outage intervals (legacy row / approximate
+    fallback path) — the caller then keeps the older coarse estimate."""
+    intervals = _outage_json(bucket).get("i")
+    if not isinstance(intervals, list):
+        return None
+    total = 0.0
+    for iv in intervals:
+        try:
+            o_s = max(float(clip_start), float(iv[0]))
+            o_e = min(float(clip_end), float(iv[1]))
+        except (TypeError, ValueError, IndexError):
+            continue
+        if o_e > o_s:
+            # maintenance_overlap_seconds() merges overlapping windows, so an
+            # outage isn't excused twice by two windows that touch.
+            total += maintenance_overlap_seconds(maintenance_windows, o_s, o_e)
+    return total
 
 
 def calculate_percentile(values: List[float], percentile: float) -> Optional[float]:
@@ -724,7 +757,20 @@ def merge_hybrid_target_availability(
                         maintenance_windows, clipped["bucket_start"], clipped["bucket_end"])
                     if bm > 0:
                         maint_cov_sec += min(clipped["coverage_seconds"], bm)
-                        maint_down_sec += min(clipped["downtime_seconds"], bm)
+                        # Excuse only the downtime that ACTUALLY fell inside a
+                        # maintenance window, from the bucket's per-outage
+                        # intervals — not `min(bucket_downtime, bm)`, which
+                        # assumed every second of downtime in the hour was
+                        # planned even when the outage and the window never
+                        # overlapped in time (audit M3). Legacy / approximate
+                        # buckets carry no intervals -> fall back to the coarse
+                        # estimate for those.
+                        exact_md = _bucket_outage_downtime_in_maintenance(
+                            b, clipped["bucket_start"], clipped["bucket_end"], maintenance_windows)
+                        if exact_md is None:
+                            maint_down_sec += min(clipped["downtime_seconds"], bm)
+                        else:
+                            maint_down_sec += min(clipped["downtime_seconds"], exact_md)
 
     sqlite_lat = (sqlite_lat_weighted / sqlite_cov_sec) if sqlite_cov_sec > 0 else 0.0
 
@@ -749,12 +795,19 @@ def merge_hybrid_target_availability(
                 sqlite_inc -= 1
         sqlite_inc = max(0, sqlite_inc)
 
-    # Prometheus-attributed interval [p_start, p_end]: same coarse carve.
+    # Prometheus-attributed interval [p_start, p_end]: only a scalar avail% is
+    # known here, no per-outage timestamps, so the carve stays proportional —
+    # excuse the maintenance-overlapping FRACTION of this segment's downtime
+    # (downtime assumed uniform across the segment), not `min(prom_down_sec, pm)`
+    # which excused up to all of it regardless of when the outage happened
+    # (audit M3).
     if maintenance_windows and prom_cov_sec > 0:
         pm = maintenance_overlap_seconds(maintenance_windows, p_start, p_end)
         if pm > 0:
+            seg_len = max(1.0, p_end - p_start)
+            pm_frac = max(0.0, min(1.0, pm / seg_len))
             maint_cov_sec += min(prom_cov_sec, pm)
-            maint_down_sec += min(prom_down_sec, pm)
+            maint_down_sec += prom_down_sec * pm_frac
 
     # 3. Merge non-overlapping intervals — prom_up_sec/prom_down_sec were
     # already computed in step 1 (identical formula there, plus a sane
@@ -778,7 +831,16 @@ def merge_hybrid_target_availability(
         )
     total_cov_sec = round(max(0.0, min(window_sec, raw_cov_sum)), 2)
     total_unk_sec = round(max(0.0, window_sec - total_cov_sec), 2)
-    total_samples = sqlite_samples + (s_count or 0)
+    # s_count is count_over_time() over the WHOLE window; the SQLite side only
+    # contributes [req_start, min(req_end, p_start)]. When both contribute, the
+    # slice [req_start, p_start] is in s_count AND in sqlite_samples — scale
+    # s_count down to just the Prometheus-attributed tail so the reported
+    # sample_count isn't inflated on the seam (audit m3).
+    if sqlite_cov_sec > 0 and window_sec > 0 and p_start > req_start:
+        prom_sample_frac = max(0.0, min(1.0, (req_end - p_start) / window_sec))
+        total_samples = sqlite_samples + int(round((s_count or 0) * prom_sample_frac))
+    else:
+        total_samples = sqlite_samples + (s_count or 0)
     total_inc = sqlite_inc + prom_inc
 
     avg_lat = 0.0
@@ -791,12 +853,14 @@ def merge_hybrid_target_availability(
     cov_pct = round(_clamp_pct((total_cov_sec / window_sec) * 100.0), 2) if window_sec > 0 else 0.0
     unk_pct = round(_clamp_pct(100.0 - cov_pct), 2)
 
-    # 3b. Maintenance carve-out. `maint_cov_sec` (planned time removed from
-    # the SLA denominator) and `maint_down_sec` (planned downtime not counted
-    # against SLA) were accumulated per bucket / prom interval above, so a
-    # window over a healthy hour excuses coverage but no downtime. Exact
-    # per-outage intersection (sub-hour) is a later refinement; carving at
-    # the bucket-interval granularity is the honest coarse version.
+    # 3b. Maintenance carve-out. `maint_cov_sec` (planned time removed from the
+    # SLA denominator) is coarse — the maintenance window's overlap with each
+    # covered bucket/segment. `maint_down_sec` (planned downtime not counted
+    # against SLA) is exact where the bucket carries per-outage intervals
+    # (outage_json["i"]): only downtime whose outage actually overlapped the
+    # window in time is excused, so a maintenance window over an hour that also
+    # had an unrelated outage no longer wipes that outage from the SLA number.
+    # The Prometheus scalar segment has no timestamps, so it stays proportional.
     # `availability_pct` above stays the raw number; SLA status uses `sla_avail`.
     maint_excluded_sec = round(min(total_cov_sec, maint_cov_sec), 2)
     maint_down_excused = round(min(total_down_sec, maint_down_sec, maint_excluded_sec), 2)
@@ -1001,6 +1065,12 @@ def merge_hybrid_fleet_availability(
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
     Merges per-target availability for all monitored instances and calculates fleet metrics.
+
+    Every target is scored over the SAME requested window [req_start, req_end].
+    A target first monitored partway through it honestly reads as low-coverage
+    (and is flagged NEW_TARGET / limited-data by merge_hybrid_target_availability)
+    rather than being silently rescoped to its own shorter life — the range the
+    caller asked for is the range every number is measured against.
 
     sla_threshold_by_instance: {instance: target_pct} per-target SLA target
     overrides; a target missing from the map uses `sla_threshold`.
@@ -1252,6 +1322,7 @@ def reconstruct_time_series_intervals(
             "availability_pct": None,
             "incident_count": 0,
             "outage_durations_sec": [],
+            "outage_intervals_sec": [],
             "outage_durations_min": [],
             "mean_outage_minutes": None,
             "median_outage_minutes": None,
@@ -1267,6 +1338,12 @@ def reconstruct_time_series_intervals(
     downtime_sec = 0.0
     unknown_sec = 0.0
     outage_durations_sec: List[float] = []
+    # Absolute [start_ts, end_ts] of each closed outage in this window, clipped
+    # to [window_start_ts, window_end_ts]. Lets a downstream consumer intersect
+    # planned-maintenance windows against the actual outage, not the whole hour
+    # (see merge_hybrid_target_availability's maintenance carve-out, audit M3).
+    outage_intervals_sec: List[Tuple[float, float]] = []
+    current_outage_start_ts: Optional[float] = None
     incident_count = 0
 
     first_ts, first_val = cleaned[0]
@@ -1294,6 +1371,7 @@ def reconstruct_time_series_intervals(
     if in_outage:
         incident_count += 1
         current_outage_duration += (first_ts - window_start_ts)
+        current_outage_start_ts = window_start_ts
 
     # 2. Intermediate intervals between consecutive samples
     for i in range(len(cleaned) - 1):
@@ -1326,12 +1404,16 @@ def reconstruct_time_series_intervals(
             incident_count += 1
             in_outage = True
             current_outage_duration = 0.0
+            current_outage_start_ts = t_next
         elif v_curr == 0 and v_next == 1:
             # Rising edge: DOWN -> UP (Outage resolved)
             if in_outage and current_outage_duration > 0:
                 outage_durations_sec.append(current_outage_duration)
+                _os = current_outage_start_ts if current_outage_start_ts is not None else window_start_ts
+                outage_intervals_sec.append((max(window_start_ts, _os), min(window_end_ts, t_next)))
             in_outage = False
             current_outage_duration = 0.0
+            current_outage_start_ts = None
 
     # 3. Boundary: After last sample [last_ts, window_end_ts]
     post_gap = window_end_ts - last_ts
@@ -1356,6 +1438,8 @@ def reconstruct_time_series_intervals(
     is_ongoing_outage = (last_val == 0)
     if in_outage and current_outage_duration > 0:
         outage_durations_sec.append(current_outage_duration)
+        _os = current_outage_start_ts if current_outage_start_ts is not None else window_start_ts
+        outage_intervals_sec.append((max(window_start_ts, _os), window_end_ts))
 
     # Invariant clamp
     coverage_sec = max(0.0, min(window_sec, uptime_sec + downtime_sec))
@@ -1406,6 +1490,7 @@ def reconstruct_time_series_intervals(
         "availability_pct": availability_pct,
         "incident_count": incident_count,
         "outage_durations_sec": [round(d, 1) for d in outage_durations_sec],
+        "outage_intervals_sec": [[round(s, 1), round(e, 1)] for s, e in outage_intervals_sec if e > s],
         "outage_durations_min": outage_durations_min,
         "mean_outage_minutes": mean_outage_min,
         "median_outage_minutes": median_outage_min,
@@ -1543,6 +1628,21 @@ def summarize_entries(
         elif downtime_minutes > 0:
             outage_durations.append(downtime_minutes)
 
+        # Data-quality status is re-derived from THIS window's coverage so it
+        # can't disagree with coverage_pct above; the human explanation of *why*
+        # coverage is short (retention window / new target / scrape gaps) is
+        # carried straight through from merge_hybrid_target_availability, which
+        # already did the first-seen reasoning. Legacy/server-record entries
+        # simply carry None for these.
+        if coverage_minutes <= 0 or availability_pct is None:
+            entry_data_status = "NO_DATA"
+        elif not is_eligible:
+            entry_data_status = "INSUFFICIENT_DATA"
+        elif coverage_pct >= 95.0:
+            entry_data_status = "COMPLETE"
+        else:
+            entry_data_status = "PARTIAL"
+
         per_server.append({
             "id": entry.get("id"),
             "name": entry.get("name") or entry.get("id"),
@@ -1582,6 +1682,17 @@ def summarize_entries(
             "incidents": incidents,
             "incident_count": incidents,
             "avg_latency_ms": round(avg_latency, 1),
+            # Per-host data-quality diagnostics — carried through so the audit
+            # table can explain a low-coverage row instead of only flagging it.
+            "data_status": entry_data_status,
+            "root_cause_code": entry.get("root_cause_code"),
+            "root_cause_hint": entry.get("root_cause_hint"),
+            "recommendation": entry.get("recommendation"),
+            "confidence_level": entry.get("confidence_level"),
+            "confidence_score": entry.get("confidence_score"),
+            "confidence_badge": entry.get("confidence_badge"),
+            "first_seen_ts": entry.get("first_seen_ts"),
+            "last_seen_ts": entry.get("last_seen_ts"),
         })
 
         if availability_pct is not None and coverage_minutes > 0:

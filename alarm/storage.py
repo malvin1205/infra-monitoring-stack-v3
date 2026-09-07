@@ -2,7 +2,7 @@ import sqlite3
 import os
 import time
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 
 from contextlib import contextmanager
@@ -682,11 +682,15 @@ class MaintenanceRepository:
     def create_window(scope: str, target: str, reason: str, start: float, end: float, db_path: Optional[str] = None) -> Dict[str, Any]:
         win_id = f"mw_{int(time.time() * 1000)}"
         now = time.time()
+        # start_iso/end_iso are a human-readable copy of the epoch columns —
+        # write real ISO 8601 UTC, not str(<float>) which produced "1725620000.0".
+        start_iso = datetime.fromtimestamp(float(start), tz=timezone.utc).isoformat()
+        end_iso = datetime.fromtimestamp(float(end), tz=timezone.utc).isoformat()
         with db_transaction(db_path) as conn:
             conn.execute("""
                 INSERT INTO maintenance_windows (id, scope, target, reason, start_epoch, end_epoch, start_iso, end_iso, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (win_id, scope, target, reason, start, end, str(start), str(end), now))
+            """, (win_id, scope, target, reason, start, end, start_iso, end_iso, now))
         return {
             "id": win_id,
             "scope": scope,

@@ -606,7 +606,7 @@ class InstancesPage {
       jobSelect.addEventListener('change', async e => {
         this.selectedJob = e.target.value;
         this._lastDataSignature = null;
-        // "Since start" span is job-scoped — re-resolve before reloading.
+        // "Max history" span is job-scoped — re-resolve before reloading.
         if (this.periodLabel === 'since') this.periodMinutes = await this._resolveSinceMinutes();
         this.load();
         this.loadAvailability();
@@ -634,14 +634,16 @@ class InstancesPage {
         this._closeCustomRangePopover();
         this._setActiveRangeChip(range);
 
-        if (range === 'since') {
+        if (range === 'since' || range === 'mtd') {
           this.isRealtime = false;
           if (this.availabilityDetailBtn) this.availabilityDetailBtn.style.display = '';
           this.periodEnd = null;
-          this.periodLabel = 'since';
-          this.periodMinutes = await this._resolveSinceMinutes();
+          this.periodLabel = range;
+          this.periodMinutes = range === 'mtd'
+            ? this._monthToDateMinutes()
+            : await this._resolveSinceMinutes();
           const modalRangeSelectEl = document.getElementById('modalRangeSelect');
-          if (modalRangeSelectEl) modalRangeSelectEl.value = 'since';
+          if (modalRangeSelectEl) modalRangeSelectEl.value = range;
           this.loadAvailability(true);
           if (this.selectedTarget) this.loadTargetHistory(this.selectedTarget.instance);
           return;
@@ -723,12 +725,15 @@ class InstancesPage {
     const modalRangeSelect = document.getElementById('modalRangeSelect');
     if (modalRangeSelect) {
       modalRangeSelect.addEventListener('change', async e => {
-        if (e.target.value === 'since') {
+        if (e.target.value === 'since' || e.target.value === 'mtd') {
+          const v = e.target.value;
           this.isRealtime = false;
           this.periodEnd = null;
-          this.periodLabel = 'since';
-          this.periodMinutes = await this._resolveSinceMinutes();
-          this._setActiveRangeChip('since');
+          this.periodLabel = v;
+          this.periodMinutes = v === 'mtd'
+            ? this._monthToDateMinutes()
+            : await this._resolveSinceMinutes();
+          this._setActiveRangeChip(v);
           this.loadAvailability(true);
           return;
         }
@@ -738,8 +743,7 @@ class InstancesPage {
           this.isRealtime = false;
           this.periodEnd = null;
           let label = '24h';
-          if (mins === 4320) label = '3d';
-          else if (mins === 10080) label = '7d';
+          if (mins === 10080) label = '7d';
           else if (mins === 43200) label = '30d';
           this.periodLabel = label;
           this._setActiveRangeChip(label);
@@ -1270,9 +1274,28 @@ class InstancesPage {
     return `${jobKey}:${minKey}:${endKey}`;
   }
 
+  // Minutes from 00:00 UTC on the 1st of the current month to now. A plain
+  // fixed window like every other range — just calendar-aligned so it lines up
+  // with how uptime is reported and billed.
+  _monthToDateMinutes() {
+    const now = new Date();
+    const monthStart = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1);
+    return Math.max(1, Math.round((Date.now() - monthStart) / 60000));
+  }
+
   _updateAvailLoadingUI(isLoading) {
     const updatingBadge = document.getElementById('availUpdatingBadge');
     if (updatingBadge) updatingBadge.classList.toggle('hidden', !isLoading);
+  }
+
+  // The headline % is honest math over whatever was observed, but for a young
+  // Prometheus/DB a "7d"/"30d" window can be built from a few hours of samples.
+  // Same rule the breakdown modal's own warning uses (_renderAvailabilityBreakdown).
+  _availabilityCoverageIsLimited(data) {
+    if (!data) return false;
+    const covPct = typeof data.coverage_percent === 'number' ? data.coverage_percent : null;
+    const status = data.data_status;
+    return status === 'INSUFFICIENT_DATA' || status === 'PARTIAL' || (covPct !== null && covPct < 50);
   }
 
   _applyAvailabilityData(data, source = 'loadAvailability') {
@@ -1282,21 +1305,34 @@ class InstancesPage {
 
     // Availability card (Card 5): Updated to reflect the requested historical window
     const overall = (typeof data.overall === 'number') ? data.overall : null;
+    const limited = overall !== null && this._availabilityCoverageIsLimited(data);
     if (this.statUptime) {
-      this.statUptime.textContent = overall !== null ? `${overall.toFixed(2)}%` : '—';
+      // Mark the card when the window is mostly unobserved — otherwise the big
+      // number implies full-window confidence it doesn't have. The Detail modal
+      // carries the full telemetry audit (audit M2).
+      this.statUptime.textContent = overall !== null ? `${overall.toFixed(2)}%${limited ? ' *' : ''}` : '—';
+      this.statUptime.classList.toggle('is-limited-data', limited);
+      if (limited) {
+        const covPct = typeof data.coverage_percent === 'number' ? data.coverage_percent : null;
+        this.statUptime.title = covPct !== null
+          ? `Limited data — only ${covPct.toFixed(1)}% of this window was observed. Open Detail for the telemetry audit.`
+          : 'Limited data for this window. Open Detail for the telemetry audit.';
+      } else {
+        this.statUptime.removeAttribute('title');
+      }
     }
 
     // Ensure range label is synchronized with the response data
     const respMinutes = Math.round(data.period_minutes || this.periodMinutes);
     let label = '24h';
     if (respMinutes === 60) label = '1h';
-    else if (respMinutes === 4320) label = '3d';
     else if (respMinutes === 10080) label = '7d';
     else if (respMinutes === 43200) label = '30d';
     if (this.periodLabel === 'custom') label = 'Custom';
-    else if (this.periodLabel === 'since') label = 'Since start';
+    else if (this.periodLabel === 'since') label = 'Max history';
+    else if (this.periodLabel === 'mtd') label = 'Month to date';
 
-    if (this.availabilityLabel) this.availabilityLabel.textContent = `Availability (${label})`;
+    if (this.availabilityLabel) this.availabilityLabel.textContent = `Availability (${label})${limited ? ' · limited data' : ''}`;
 
     // Refresh drawer uptime figure if a host is currently open
     if (this.selectedTarget) this._updateDrawerUptime(this.selectedTarget);
@@ -1436,13 +1472,15 @@ class InstancesPage {
   // Human label for the active range, used in every "Availability (…)" caption.
   _rangeDisplay() {
     if (this.periodLabel === 'custom') return 'Custom';
-    if (this.periodLabel === 'since') return 'Since start';
+    if (this.periodLabel === 'since') return 'Max history';
+    if (this.periodLabel === 'mtd') return 'Month to date';
     return this.periodLabel || '24h';
   }
 
-  // "Since start" is dynamic — ask the backend for the span from the oldest
-  // recorded telemetry (scoped to the current job filter) to now, in minutes.
-  // Falls back to 24h when nothing has been recorded yet. Re-resolved on each
+  // "Max history" is dynamic — ask the backend for the span from the oldest
+  // bucket still in the archive (scoped to the current job filter) to now, in
+  // minutes; the backend caps it at bucket retention (~35d). Falls back to 24h
+  // when nothing has been recorded yet. Re-resolved on each
   // explicit range/job change, not on the 15s poll (the span only creeps by
   // 15s a tick — not worth a request each time).
   async _resolveSinceMinutes() {
@@ -1860,6 +1898,11 @@ class InstancesPage {
     tbody.innerHTML = rows.map(e => {
       const cov = e.coverage_pct ?? e.coverage_percent ?? 0;
       const isLim = cov < 50;
+      // Per-host "why is coverage low" — hint + recommendation from the backend
+      // telemetry audit, so a limited row explains itself on hover.
+      const covReason = [e.root_cause_hint, e.recommendation].filter(Boolean).join(' — ')
+        || `${cov.toFixed(1)}% of this window was observed for ${e.name || e.id || 'this host'}.`;
+      const covTitle = ` title="${this._esc(covReason)}"`;
       const sla = this._slaBadgeInfo(e);
       const slaCls = sla.cls === 'alt-ok' ? 'text-ok' : (sla.cls === 'alt-warning' ? 'text-bad' : 'text-dim');
       const budget = e.sla_budget || {};
@@ -1883,7 +1926,7 @@ class InstancesPage {
           <span class="audit-host-name">${this._esc(e.name || e.id || '—')}</span>
           <span class="audit-host-job">${this._esc(e.job || '—')}</span>
         </td>
-        <td>
+        <td${covTitle}>
           <div class="audit-cov-cell">
             <span class="audit-cov-pct${isLim ? ' is-lim' : ''}">${cov.toFixed(1)}%</span>
             <div class="audit-cov-bar-wrap"><div class="audit-cov-bar-fill${isLim ? ' bar-limited' : ''}" style="width:${Math.max(0, Math.min(100, cov))}%;"></div></div>
@@ -2971,6 +3014,10 @@ class InstancesPage {
     if (this.isRealtime) {
       const pct = total > 0 ? (up / total) * 100 : 0;
       this.statUptime.textContent = `${pct.toFixed(2)}%`;
+      // Realtime is a live snapshot, never a windowed aggregate — drop any
+      // "limited data" marker left over from a historical range.
+      this.statUptime.classList.remove('is-limited-data');
+      this.statUptime.removeAttribute('title');
     }
     // Keep an open drawer's uptime figure live too.
     if (this.selectedTarget) {
@@ -3207,7 +3254,7 @@ class InstancesPage {
           }
           latencyText = this._downLabel(t, this._fmtDownAging(downMs));
         } else {
-          latencyText = t.responseTimeMs ? `${t.responseTimeMs} ms` : '< 1 ms';
+          latencyText = (t.responseTimeMs != null) ? `${t.responseTimeMs} ms` : '—';
         }
 
         const ipEl = card.querySelector('.hc-ip') || card.children[0];
@@ -3260,7 +3307,7 @@ class InstancesPage {
           }
           latencyText = this._downLabel(t, this._fmtDownAging(downMs));
         } else {
-          latencyText = t.responseTimeMs ? `${t.responseTimeMs} ms` : '< 1 ms';
+          latencyText = (t.responseTimeMs != null) ? `${t.responseTimeMs} ms` : '—';
         }
 
         return `<div class="${fullClass}"
@@ -3520,12 +3567,24 @@ class InstancesPage {
     // hasn't landed yet) means "we don't know" — never fabricate 100%
     // coverage/availability to fill the gap.
     const entry = this.availabilityBreakdown?.entries?.find(e => e.id === target.instance || e.name === target.instance);
-    const covMin = entry ? entry.coverage_minutes : null;
-    const upMin = entry ? entry.uptime_minutes : null;
-    const downMin = entry ? entry.downtime_minutes : null;
-    const covPct = entry && typeof entry.coverage_pct === 'number' ? entry.coverage_pct
-      : (entry && typeof entry.coverage_percent === 'number' ? entry.coverage_percent : null);
+    // Use the SLA (maintenance-excluded) trio so Total == Success + Failed and
+    // Success% == the availability figure even when planned maintenance is
+    // carved out — the raw uptime/downtime minutes are on a different
+    // denominator than availability_pct and made the three lines contradict
+    // each other (audit M4). == raw when there are no maintenance windows.
+    const _n = (v, fb = null) => (typeof v === 'number' ? v : fb);
+    const obsMin = entry
+      ? _n(entry.sla_observed_minutes, _n(entry.observed_minutes, _n(entry.coverage_minutes)))
+      : null;
+    const downMin = entry
+      ? _n(entry.sla_downtime_minutes, _n(entry.downtime_minutes, 0))
+      : null;
+    const upMin = (obsMin !== null && downMin !== null) ? Math.max(0, obsMin - downMin) : null;
+    const covMin = obsMin;
+    const winMin = Math.max(1, Math.round(this.periodMinutes || 1440));
+    const covPct = obsMin !== null ? Math.max(0, Math.min(100, (obsMin / winMin) * 100)) : null;
     const availPct = entry && typeof entry.availability_pct === 'number' ? entry.availability_pct : null;
+    const maintExclMin = entry ? _n(entry.maintenance_excluded_minutes, 0) : 0;
 
     const slaBadgeEl = document.getElementById('spSummarySlaBadge');
     if (slaBadgeEl) {
@@ -3538,8 +3597,9 @@ class InstancesPage {
     let failedCount = entry?.incidents || downEvents.length || (target.health !== 'up' ? 1 : 0);
 
     const fmtDur = m => (typeof m !== 'number') ? '—' : (m < 60 ? `${m.toFixed(1)}m` : `${(m / 60).toFixed(1)}h`);
+    const plannedNote = maintExclMin > 0 ? `; ${fmtDur(maintExclMin)} planned excl.` : '';
 
-    if (elTotal) elTotal.textContent = covMin !== null ? `${fmtDur(covMin)} (${covPct !== null ? covPct.toFixed(1) : '—'}% observed)` : '—';
+    if (elTotal) elTotal.textContent = covMin !== null ? `${fmtDur(covMin)} (${covPct !== null ? covPct.toFixed(1) : '—'}% of range${plannedNote})` : '—';
     if (elSuccess) elSuccess.textContent = upMin !== null ? `${fmtDur(upMin)} (${availPct !== null ? availPct.toFixed(2) + '%' : '—'})` : '—';
     if (elFailed) elFailed.textContent = downMin !== null ? `${fmtDur(downMin)} (${failedCount} incident${failedCount === 1 ? '' : 's'})` : '—';
 
@@ -3685,7 +3745,7 @@ class InstancesPage {
         }
         latEl.textContent = `Down ${this._fmtDownAging(downMs)}`;
       } else {
-        latEl.textContent = target.responseTimeMs ? `${target.responseTimeMs} ms` : (isUp ? '< 1 ms' : '—');
+        latEl.textContent = (target.responseTimeMs != null) ? `${target.responseTimeMs} ms` : '—';
       }
     }
 
@@ -4635,7 +4695,18 @@ class InstancesPage {
 
       this._renderDrawerAvailabilityBars(this.selectedTarget, data.latency_points || [], data.events || [], fetchedRangeStart);
 
-      if (!data.ok || !Array.isArray(data.events) || data.events.length === 0) {
+      if (!data.ok) {
+        // An actual backend error (bad request, Prometheus unreachable, …) —
+        // don't dress it up as "no telemetry recorded", which reads as a
+        // healthy-but-empty history (audit m9).
+        logsList.innerHTML = `<div style="padding: 12px; background: rgba(245, 158, 11, 0.1); border: 1px solid rgba(245, 158, 11, 0.25); border-radius: 8px; font-size: 12px; color: #F59E0B; display: flex; align-items: center; gap: 8px;"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg> <span>${this._esc(data.error || 'History is temporarily unavailable')}</span></div>`;
+        if (eventsBadge) eventsBadge.textContent = '—';
+        this._renderDrawerRecentEvents([]);
+        this._renderDrawerProbeSummary(this.selectedTarget, []);
+        return;
+      }
+
+      if (!Array.isArray(data.events) || data.events.length === 0) {
         const isTargetDown = this.selectedTarget?.health === 'down' || this.selectedTarget?.effective_status === 'down';
         const hasNoPoints = !Array.isArray(data.latency_points) || data.latency_points.length === 0;
 
@@ -4851,7 +4922,8 @@ class InstancesPage {
       if (diff < 5) return 'Just now';
       if (diff < 60) return `${diff}s ago`;
       if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
-      return `${Math.floor(diff / 3600)}h ago`;
+      if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+      return `${Math.floor(diff / 86400)}d ago`;
     } catch { return '—'; }
   }
 
@@ -5316,9 +5388,18 @@ class HistoryPage {
   _updateStats() {
     const base = this._rangedData();
     const now = new Date();
+    // "This Month" = incidents whose ACTIVITY falls in the current calendar
+    // month, judged the same way _rangedData() judges its range (activity end,
+    // so a still-ongoing incident counts) and against the same local
+    // month-start anchor _rangeStartEpoch() uses — previously this bucketed on
+    // the incident's START time via getMonth(), a second, differently-defined
+    // filter that disagreed with the range filter near month boundaries and
+    // shifted by the viewer's UTC offset (audit m7).
+    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).getTime() / 1000;
+    const nowSec = Date.now() / 1000;
     const month = base.filter(i => {
-      const d = new Date(i.time * 1000);
-      return d.getMonth() === now.getMonth() && d.getFullYear() === now.getFullYear();
+      const activityEnd = this._isOngoing(i) ? nowSec : (i.resolved_time || i.time || 0);
+      return activityEnd >= monthStart;
     }).length;
     const crit = base.filter(i => (i.severity || '').toLowerCase() === 'critical').length;
     const warn = base.filter(i => (i.severity || '').toLowerCase() === 'warning').length;

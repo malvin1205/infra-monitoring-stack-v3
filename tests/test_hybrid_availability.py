@@ -1146,5 +1146,70 @@ class MaintenanceExclusionTests(unittest.TestCase):
         self.assertAlmostEqual(summary2["fleet_aggregate"]["value"], 97.92, delta=0.2)
 
 
+class MaintenanceIntervalCarveTests(unittest.TestCase):
+    """audit M3: when a bucket carries per-outage intervals (outage_json["i"]),
+    the downtime excused from the SLA number is only the downtime whose outage
+    actually overlapped a maintenance window IN TIME — a window over a healthy
+    part of the same hour no longer wipes an unrelated outage from the number.
+    Buckets with no "i" keep the old coarse behaviour (covered by
+    MaintenanceExclusionTests)."""
+
+    H = 1_700_000_000.0 - (1_700_000_000.0 % 3600.0)
+    H5 = H + 5 * 3600.0  # one whole hour is the request window, so coverage == 100%
+
+    def _bucket_with_outage(self, outage_start_offset, outage_len):
+        o_s = self.H5 + outage_start_offset
+        o_e = o_s + outage_len
+        return {
+            "instance": "srv-mi", "job": "blackbox",
+            "bucket_start": self.H5, "bucket_end": self.H5 + 3600.0,
+            "uptime_seconds": 3600.0 - outage_len, "downtime_seconds": float(outage_len),
+            "coverage_seconds": 3600.0, "unknown_seconds": 0.0,
+            "sample_count": 240,
+            "availability_pct": round((3600.0 - outage_len) / 3600.0 * 100.0, 2),
+            "incident_count": 1, "avg_latency_ms": 10.0,
+            "outage_json": {"d": [float(outage_len)], "i": [[o_s, o_e]],
+                            "ongoing_start": False, "ongoing_end": False},
+        }
+
+    def _merge(self, bucket, windows):
+        return merge_hybrid_target_availability(
+            req_start=self.H5, req_end=self.H5 + 3600.0,
+            target_id="srv-mi", target_name="srv-mi", job="blackbox",
+            sqlite_buckets=[bucket], prom_metrics={}, expected_interval_sec=2.0,
+            maintenance_windows=windows,
+        )
+
+    def test_window_not_overlapping_the_outage_does_not_excuse_it(self):
+        # Outage in the first 10 min; maintenance covers the LAST 30 min (disjoint).
+        b = self._bucket_with_outage(outage_start_offset=0.0, outage_len=600.0)
+        e = self._merge(b, [(self.H5 + 1800.0, self.H5 + 3600.0)])
+        # The coarse carve would have excused min(600, 1800)=600s and reported
+        # ~100%. Interval-aware: 0s excused, the outage still counts in full.
+        self.assertAlmostEqual(e["sla_downtime_seconds"], 600.0, delta=1.0)
+        self.assertEqual(e["sla_status"], "NON_COMPLIANT")
+
+    def test_window_over_the_outage_still_excuses_it(self):
+        b = self._bucket_with_outage(outage_start_offset=0.0, outage_len=600.0)
+        e = self._merge(b, [(self.H5, self.H5 + 600.0)])
+        self.assertAlmostEqual(e["sla_downtime_seconds"], 0.0, delta=1.0)
+        self.assertAlmostEqual(e["availability_pct_excl_maintenance"], 100.0, delta=0.1)
+        self.assertEqual(e["sla_status"], "COMPLIANT")
+
+    def test_partial_time_overlap_excuses_only_the_overlap(self):
+        # Outage [0, 600); window [300, 900) -> 300s time overlap.
+        b = self._bucket_with_outage(outage_start_offset=0.0, outage_len=600.0)
+        e = self._merge(b, [(self.H5 + 300.0, self.H5 + 900.0)])
+        self.assertAlmostEqual(e["sla_downtime_seconds"], 300.0, delta=1.0)
+
+    def test_legacy_bucket_without_intervals_keeps_coarse_carve(self):
+        # No outage_json["i"] -> the pre-M3 min(downtime, window_overlap) rule,
+        # so a window over the hour still excuses the whole outage.
+        b = self._bucket_with_outage(outage_start_offset=0.0, outage_len=600.0)
+        b["outage_json"] = {"d": [600.0], "ongoing_start": False, "ongoing_end": False}
+        e = self._merge(b, [(self.H5 + 1800.0, self.H5 + 3600.0)])
+        self.assertAlmostEqual(e["sla_downtime_seconds"], 0.0, delta=1.0)
+
+
 if __name__ == '__main__':
     unittest.main()
