@@ -15,6 +15,7 @@ import time
 import unittest
 
 import app as alarm_app
+import ssrf
 from app import app, is_safe_endpoint_url, _is_blocked_ip, _filter_safe_candidates
 from conftest import TEST_API_KEY
 
@@ -106,20 +107,22 @@ class SsrfRevalidationTests(unittest.TestCase):
 
     def test_filter_safe_candidates_result_is_cached(self):
         # Second call for the same URL must hit the TTL cache, not re-resolve.
+        # _cached_is_safe_endpoint_url (prometheus_client) resolves the check
+        # through the ssrf module, so patch it there.
         calls = {"n": 0}
-        real = alarm_app.is_safe_endpoint_url
+        real = ssrf.is_safe_endpoint_url
 
         def counting(url):
             calls["n"] += 1
             return real(url)
 
-        alarm_app.is_safe_endpoint_url = counting
+        ssrf.is_safe_endpoint_url = counting
         try:
             alarm_app._SAFE_CANDIDATE_CACHE.clear()
             _filter_safe_candidates(["http://8.8.8.8:9090"])
             _filter_safe_candidates(["http://8.8.8.8:9090"])
         finally:
-            alarm_app.is_safe_endpoint_url = real
+            ssrf.is_safe_endpoint_url = real
         self.assertEqual(calls["n"], 1)
 
 

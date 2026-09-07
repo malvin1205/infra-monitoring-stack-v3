@@ -4,22 +4,17 @@ import time
 import os
 import math
 import re
-import gzip
 import hashlib
 import threading
 import sys
 import shutil
 import uuid
-import ipaddress
 import logging
-import socket
 import contextlib
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from functools import wraps
-from urllib.request import urlopen, Request
-from urllib.error import URLError
-from urllib.parse import urlparse, quote
+from urllib.parse import quote
 import yaml
 
 logging.basicConfig(
@@ -79,6 +74,55 @@ except ImportError:
         API_KEY, require_api_key, require_webhook_secret, get_api_key, get_webhook_secret,
         get_session_secret, hash_password, verify_password, get_current_authenticated_user,
         has_permission, require_permission, require_auth, require_admin, ROLE_PERMISSIONS
+    )
+
+try:
+    from web_middleware import register_web_middleware
+    import ssrf
+    from ssrf import _is_blocked_ip, is_safe_endpoint_url
+    from monitoring_primitives import (
+        parse_alert_timestamp, alert_key, TARGET_HOST_RE, _BLOCKED_TARGET_HOSTS,
+        is_valid_target, matches_job_filter, normalize_target, _parse_epoch_ts,
+        _sane_epoch, _earliest_outage_start, classify_scrape_failure,
+        _extract_host, find_node_exporter_status, OUTAGE_GRACE_SECONDS,
+        _outage_past_grace, _PROM_DURATION_RE, _parse_prom_duration_sec,
+    )
+    import prometheus_client as promclient
+    from prometheus_client import (
+        _DEFAULT_PROM_URL, load_endpoints, _ENDPOINTS_CACHE,
+        LAST_WORKING_PROMETHEUS_URL, PROMETHEUS_CACHE, PROMETHEUS_CACHE_LOCK,
+        PROMETHEUS_CACHE_TTL_DEFAULT, _SHARED_EXECUTOR,
+        _FAILED_CANDIDATES, _FAILED_CANDIDATES_LOCK, _FETCH_LOCKS,
+        _AVAILABILITY_CACHE, _AVAILABILITY_CACHE_LOCK,
+        _AVAILABILITY_FLIGHT_LOCKS, _AVAILABILITY_FLIGHT_LOCKS_GUARD,
+        _fetch_lock_for, _avail_flight_lock_for, clear_availability_cache,
+        _maybe_prune_cache, _SAFE_CANDIDATE_CACHE,
+        _cached_is_safe_endpoint_url, _filter_safe_candidates,
+        fetch_url, fetch_prometheus_json,
+    )
+except ImportError:
+    from alarm.web_middleware import register_web_middleware
+    from alarm import ssrf
+    from alarm.ssrf import _is_blocked_ip, is_safe_endpoint_url
+    from alarm.monitoring_primitives import (
+        parse_alert_timestamp, alert_key, TARGET_HOST_RE, _BLOCKED_TARGET_HOSTS,
+        is_valid_target, matches_job_filter, normalize_target, _parse_epoch_ts,
+        _sane_epoch, _earliest_outage_start, classify_scrape_failure,
+        _extract_host, find_node_exporter_status, OUTAGE_GRACE_SECONDS,
+        _outage_past_grace, _PROM_DURATION_RE, _parse_prom_duration_sec,
+    )
+    from alarm import prometheus_client as promclient
+    from alarm.prometheus_client import (
+        _DEFAULT_PROM_URL, load_endpoints, _ENDPOINTS_CACHE,
+        LAST_WORKING_PROMETHEUS_URL, PROMETHEUS_CACHE, PROMETHEUS_CACHE_LOCK,
+        PROMETHEUS_CACHE_TTL_DEFAULT, _SHARED_EXECUTOR,
+        _FAILED_CANDIDATES, _FAILED_CANDIDATES_LOCK, _FETCH_LOCKS,
+        _AVAILABILITY_CACHE, _AVAILABILITY_CACHE_LOCK,
+        _AVAILABILITY_FLIGHT_LOCKS, _AVAILABILITY_FLIGHT_LOCKS_GUARD,
+        _fetch_lock_for, _avail_flight_lock_for, clear_availability_cache,
+        _maybe_prune_cache, _SAFE_CANDIDATE_CACHE,
+        _cached_is_safe_endpoint_url, _filter_safe_candidates,
+        fetch_url, fetch_prometheus_json,
     )
 
 init_db()
@@ -147,117 +191,9 @@ app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 604800
 # webhook and every JSON API here deal in small payloads; 2 MiB is generous.
 app.config['MAX_CONTENT_LENGTH'] = int(os.environ.get("INFRAWATCH_MAX_BODY_BYTES", str(2 * 1024 * 1024)))
 
-@app.context_processor
-def inject_asset_version():
-    # Appended as ?v=<mtime> on static asset URLs so a code change busts the
-    # 5-minute browser cache immediately instead of serving stale JS/CSS.
-    def asset_version(filename):
-        path = os.path.join(app.static_folder, filename)
-        try:
-            return int(os.path.getmtime(path))
-        except OSError:
-            return 0
-    return {"asset_version": asset_version}
-
-GZIP_MIN_BYTES = 500
-# Content types worth gzipping — text/JSON/JS/CSS/SVG. Binary assets (mp3,
-# png) are already compressed; re-gzipping them wastes CPU for ~0 saving.
-_GZIP_MIMETYPES = {
-    'text/html', 'text/css', 'text/plain', 'text/xml',
-    'application/javascript', 'text/javascript',
-    'application/json', 'image/svg+xml',
-}
-# Same policy expressed as a header so it can't drift out of sync with CSP
-# tightening: everything from same origin, plus the Google Fonts stylesheet
-# (<link> in alarm.html) and the font files it pulls. 'unsafe-inline' is
-# still required for the inline theme bootstrap and the ~100 inline style=
-# attributes in the template — see frontend audit F30 for removing those.
-_CSP = (
-    "default-src 'self'; "
-    "base-uri 'self'; "
-    "object-src 'none'; "
-    "frame-ancestors 'self'; "
-    "form-action 'self'; "
-    "img-src 'self' data:; "
-    "font-src 'self' https://fonts.gstatic.com; "
-    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
-    "script-src 'self' 'unsafe-inline'; "
-    "connect-src 'self'"
-)
-
-
-def _maybe_gzip(response, is_static=False):
-    accept_encoding = request.headers.get('Accept-Encoding', '')
-    if 'gzip' not in accept_encoding or 'Content-Encoding' in response.headers:
-        return
-    if (response.mimetype or '').split(';')[0].strip() not in _GZIP_MIMETYPES:
-        return
-    # For a static FILE response (direct_passthrough + a file wrapper body),
-    # only touch a plain 200 with no Range request — never a 206/304 or a
-    # range fetch. Dynamic responses (JSON, rendered HTML) are always safe to
-    # compress regardless of status, same as the previous behaviour.
-    if is_static:
-        if response.status_code != 200 or request.headers.get('Range'):
-            return
-        if response.direct_passthrough:
-            response.direct_passthrough = False
-    body = response.get_data()
-    if len(body) < GZIP_MIN_BYTES:
-        return
-    compressed = gzip.compress(body, compresslevel=5)
-    response.set_data(compressed)
-    response.headers['Content-Encoding'] = 'gzip'
-    response.headers['Content-Length'] = str(len(compressed))
-    # Byte ranges no longer map to the (now gzipped) body — drop the offer so a
-    # cache/client can't request a range against a mismatched length.
-    response.headers.pop('Accept-Ranges', None)
-    vary = response.headers.get('Vary')
-    if not vary:
-        response.headers['Vary'] = 'Accept-Encoding'
-    elif 'accept-encoding' not in vary.lower():
-        response.headers['Vary'] = f"{vary}, Accept-Encoding"
-
-
-@app.after_request
-def add_header(response):
-    is_static = request.path.startswith('/static/')
-
-    # Security headers apply everywhere (static included — cheap, and a
-    # stray HTML error page under /static/ still benefits).
-    response.headers['X-Content-Type-Options'] = 'nosniff'
-    response.headers['X-Frame-Options'] = 'SAMEORIGIN'
-    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
-    response.headers['Content-Security-Policy'] = _CSP
-
-    if is_static:
-        # ?v=<mtime> already busts this on every change, so cache hard.
-        response.headers['Cache-Control'] = 'public, max-age=604800, immutable'
-    else:
-        response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
-        response.headers['Pragma'] = 'no-cache'
-        response.headers['Expires'] = '-1'
-
-    # Compress text/JSON/JS/CSS/SVG for both dynamic responses and static
-    # assets — gunicorn serves static itself here (no compressing proxy),
-    # so without this the ~420 KB of JS+CSS ships uncompressed every load.
-    _maybe_gzip(response, is_static=is_static)
-
-    return response
-
-@app.errorhandler(404)
-def handle_404(e):
-    if request.path.startswith('/api/') or request.path in ('/instances', '/status', '/logs', '/history', '/webhook', '/api/webhook', '/health', '/health/live', '/health/ready'):
-        return jsonify({"ok": False, "error": "Resource not found"}), 404
-    return render_template('alarm.html'), 404
-
-@app.errorhandler(405)
-def handle_405(e):
-    return jsonify({"ok": False, "error": "Method not allowed"}), 405
-
-@app.errorhandler(500)
-def handle_500(e):
-    logger.error(f"Internal server error: {e}", exc_info=True)
-    return jsonify({"ok": False, "error": "Internal server error"}), 500
+# Asset-version cache-busting, gzip for text payloads, security headers, and
+# the JSON 404/405/500 handlers — see web_middleware.py.
+register_web_middleware(app)
 
 STATUS_FILE  = os.path.join(os.path.dirname(__file__), "status.json")
 HISTORY_FILE = os.path.join(os.path.dirname(__file__), "history.json")
@@ -272,17 +208,6 @@ LOGS_FILE    = os.path.join(os.path.dirname(__file__), "logs.json")
 # place to hang relational metadata off of.
 MAX_HISTORY  = 1000
 MAX_LOGS     = 200
-
-def parse_alert_timestamp(value, fallback):
-    if value:
-        try:
-            return datetime.fromisoformat(str(value).replace('Z', '+00:00')).timestamp()
-        except (ValueError, TypeError):
-            pass
-    return fallback
-
-def alert_key(a, labels):
-    return a.get('fingerprint') or f"{labels.get('alertname', 'Unknown')}|{labels.get('instance', '-')}"
 
 
 def active_incident_list():
@@ -362,103 +287,12 @@ def save_json(path, data):
     except Exception as e:
         logger.error(f"Error saving {path}: {e}")
 
-# The one compiled-in fallback. Used to be a 4-entry topology-guessing list
-# (host.docker.internal / localhost / 127.0.0.1) — removed: /api/endpoints
-# already lets an operator register exactly the Prometheus URL their
-# deployment needs, so guessing at container-networking conventions no
-# longer earns its keep. This single default covers the common case (a
-# compose service literally named "prometheus") without guessing further.
-# Blank/unset PROMETHEUS_URL => no default endpoint: the deployment runs with
-# an empty endpoint list until the operator adds one in the UI. Only a
-# non-blank value seeds and acts as the failover fallback.
-_DEFAULT_PROM_URL = os.environ.get("PROMETHEUS_URL", "http://prometheus:9090").strip()
-
-def _is_blocked_ip(ip):
-    return (ip.is_link_local or
-            ip.is_multicast or
-            ip.is_reserved or
-            ip.is_loopback or
-            (isinstance(ip, ipaddress.IPv4Address) and str(ip).startswith('169.254.')) or
-            (isinstance(ip, ipaddress.IPv6Address) and (ip.is_site_local or ip.ipv4_mapped)))
-
-def is_safe_endpoint_url(url: str):
-    try:
-        url = url.strip()
-        # Reject characters that have no place in a URL and would let a stored
-        # endpoint break out of an HTML attribute / element when the endpoint
-        # manager renders it (defence in depth alongside client-side escaping).
-        if any(c in url for c in '"\'<>`\\ \t\n\r') or any(ord(c) < 0x20 for c in url):
-            return False, "Endpoint URL contains illegal characters"
-        parsed = urlparse(url)
-        if parsed.scheme not in ('http', 'https'):
-            return False, "Invalid scheme; only http and https are allowed"
-        if not parsed.netloc or '@' in parsed.netloc:
-            return False, "Invalid URL format or credentials not allowed"
-        hostname = (parsed.hostname or '').lower().strip('[]')
-        if not hostname:
-            return False, "Host missing in URL"
-
-        blocked_hosts = {
-            'metadata.google.internal',
-            '169.254.169.254',
-            '100.100.100.200',
-            'instance-data',
-            'fd00:ec2::254',
-            'localhost',
-        }
-        if hostname in blocked_hosts or hostname.startswith("169.254."):
-            return False, "Endpoint URL is not allowed (restricted network)"
-
-        try:
-            ip = ipaddress.ip_address(hostname)
-            if _is_blocked_ip(ip):
-                return False, "Endpoint URL is not allowed (restricted network)"
-            return True, ""
-        except ValueError:
-            pass  # hostname is a name, not a literal IP - resolve it below
-
-        # Hostname (not a literal IP): resolve and check every address it maps
-        # to, so a name pointed at a loopback/link-local/metadata IP (DNS
-        # rebinding, or just a misconfigured record) can't slip past the
-        # literal-IP checks above. A hostname that fails to resolve here is
-        # NOT rejected — it's likely a Docker Compose service name only
-        # resolvable from inside the compose network (e.g. added before that
-        # container exists), same as the pre-existing behavior for hostnames.
-        try:
-            addr_infos = socket.getaddrinfo(hostname, None)
-        except socket.gaierror:
-            return True, ""
-        for family, _, _, _, sockaddr in addr_infos:
-            ip = ipaddress.ip_address(sockaddr[0])
-            if _is_blocked_ip(ip):
-                return False, "Endpoint URL is not allowed (restricted network)"
-
-        return True, ""
-    except Exception as e:
-        return False, f"Invalid URL: {e}"
-
-_ENDPOINTS_CACHE = {"ts": 0.0, "data": None}
-_ENDPOINTS_CACHE_TTL = 2.0  # SQLite rarely changes; avoid a query on every hot-path call
-
-# EndpointRepository (SQLite) is the sole source of truth — endpoints.json
-# used to be read first (when present) and written on every mutation as a
-# parallel copy; every mutating route below now writes only through the
-# repository, and load_endpoints() reads only from it (short-TTL cached).
-def load_endpoints():
-    now = time.time()
-    cached = _ENDPOINTS_CACHE["data"]
-    if cached is not None and now - _ENDPOINTS_CACHE["ts"] < _ENDPOINTS_CACHE_TTL:
-        return cached
-
-    try:
-        data = EndpointRepository.load_endpoints_state(_DEFAULT_PROM_URL)
-    except Exception:
-        data = ({"active": _DEFAULT_PROM_URL, "endpoints": [_DEFAULT_PROM_URL]}
-                if _DEFAULT_PROM_URL else {"active": None, "endpoints": []})
-
-    _ENDPOINTS_CACHE["data"] = data
-    _ENDPOINTS_CACHE["ts"] = now
-    return data
+# The Prometheus HTTP access layer — _DEFAULT_PROM_URL, load_endpoints() and
+# its cache, is_safe_endpoint_url() (ssrf.py), the DNS-rebinding hot-path
+# re-check, the PromQL response cache + single-flight locks, and
+# fetch_url()/fetch_prometheus_json() with endpoint failover — lives in
+# prometheus_client.py. Every name is re-imported above so callers here and
+# the tests (alarm_app.PROMETHEUS_CACHE, etc.) are unchanged.
 
 DEFAULT_JOB_FILTER = os.environ.get("JOB_FILTER", "all")
 ALERTNAME_TARGET_DOWN = "TargetDown"
@@ -469,39 +303,6 @@ ALERTNAME_SLOW_RESPONSE = "SlowResponse"
 # SlowResponse alert (poller) and the live grid's severity/summary (audit F4).
 DEFAULT_SLOW_RESPONSE_THRESHOLD_MS = float(os.environ.get("SLOW_RESPONSE_THRESHOLD_MS", "500"))
 
-# Minimal shape check for the Add Target form — not full RFC validation, just
-# enough to reject obvious garbage (e.g. a bare number) before it's written to
-# websites.yml. Bare Docker/internal hostnames without a dot (e.g. "webapp")
-# are intentionally allowed — that's a real, valid target shape here.
-TARGET_HOST_RE = re.compile(r'^[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?)*$')
-
-# Cloud metadata endpoints are never a legitimate monitoring target (unlike
-# private/internal IPs, which this tool exists to monitor) — block them
-# outright rather than trying to enumerate "safe" internal ranges.
-_BLOCKED_TARGET_HOSTS = {
-    'metadata.google.internal', '169.254.169.254', '100.100.100.200',
-    'instance-data', 'fd00:ec2::254',
-}
-
-def is_valid_target(url):
-    candidate = re.sub(r'^https?://', '', url.strip()).split('/')[0].split(':')[0]
-    if not candidate:
-        return False
-    if candidate.lower() in _BLOCKED_TARGET_HOSTS or candidate.startswith('169.254.'):
-        return False
-    if re.match(r'^\d{1,3}(\.\d{1,3}){3}$', candidate):
-        return True
-    if candidate.isdigit():
-        return False  # e.g. "129391283912" — not an IPv4, not a sane hostname
-    return bool(TARGET_HOST_RE.match(candidate))
-
-def matches_job_filter(job, scrape_pool, filter_val):
-    if not filter_val or filter_val.lower() in ('all', '*'):
-        return True
-    job_lower = (job or '').lower()
-    pool_lower = (scrape_pool or '').lower()
-    val_lower = filter_val.lower()
-    return job_lower == val_lower or pool_lower == val_lower or val_lower in job_lower or val_lower in pool_lower
 
 def get_targets_file():
     # websites.yml is InfraWatch's own curation list — the subset of
@@ -527,21 +328,6 @@ def get_targets_file():
             pass
     return local_target
 
-
-def normalize_target(url):
-    """Canonical form for dedup/compare only (not for storage): lowercase host,
-    drop scheme and a default :80/:443, strip trailing slash. Two entries that
-    normalize equal are the same target — 'foo', 'FOO:80', 'http://foo/' all
-    collapse to 'foo'."""
-    s = (url or "").strip()
-    s = re.sub(r'^https?://', '', s, flags=re.I).rstrip('/')
-    m = re.match(r'^([^/]+?)(?::(\d+))?(/.*)?$', s)
-    if not m:
-        return s.lower()
-    host, port, path = m.group(1).lower(), m.group(2), m.group(3) or ''
-    if port in ('80', '443'):
-        port = None
-    return host + (f':{port}' if port else '') + path
 
 # websites.yml keeps the Prometheus file_sd shape (a list of {targets, labels}
 # groups) purely so it round-trips cleanly and could be pointed at a Prometheus
@@ -697,280 +483,12 @@ def save_website_targets(urls):
             pass
         raise
 
-LAST_WORKING_PROMETHEUS_URL = None
-PROMETHEUS_CACHE = {}
-PROMETHEUS_CACHE_LOCK = threading.Lock()
-PROMETHEUS_CACHE_TTL_DEFAULT = 8.0  # backend cache window for identical PromQL responses (5-15s band)
-
-# Shared thread pool executor to prevent continuous thread creation/destruction
-_SHARED_EXECUTOR = ThreadPoolExecutor(max_workers=16, thread_name_prefix="infrawatch-worker")
-
-# Separate, small pool for the SSRF DNS-revalidation check (_cached_is_safe_endpoint_url
-# below). socket.getaddrinfo() has no portable timeout, so a hung/slow resolver
-# can tie up a worker for well past our 1s wait — kept off _SHARED_EXECUTOR so
-# that can never queue behind (or starve) actual Prometheus query submission.
-_DNS_CHECK_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="infrawatch-dnscheck")
-
-# Cooldown circuit-breaker for unreachable candidate endpoints (prevents timeout cascades)
-_FAILED_CANDIDATES = {}
-_FAILED_CANDIDATES_LOCK = threading.Lock()
-_FAILED_CANDIDATE_TTL = 5.0
-
-# Single-flight locks: when several requests need the same (endpoint, PromQL)
-# result at once (e.g. /instances and /api/availability both polling
-# probe_success around the same tick), only the first actually calls
-# Prometheus — the rest wait and reuse its result instead of duplicating it.
-_FETCH_LOCKS = {}
-_FETCH_LOCKS_GUARD = threading.Lock()
-
-# Query params like custom time ranges / per-target history embed a live
-# timestamp, so their cache keys are effectively unique each call. Bound the
-# resulting cache/lock growth with a periodic sweep instead of a per-request
-# scan.
-_CACHE_LAST_PRUNE = [0.0]
-_CACHE_PRUNE_INTERVAL = 30.0
-_CACHE_MAX_AGE = 120.0
-
-# Availability result cache & single-flight coalescing
-_AVAILABILITY_CACHE = {}
-_AVAILABILITY_CACHE_LOCK = threading.Lock()
-_AVAILABILITY_FLIGHT_LOCKS = {}
-_AVAILABILITY_FLIGHT_LOCKS_GUARD = threading.Lock()
-
-def _fetch_lock_for(key):
-    with _FETCH_LOCKS_GUARD:
-        lock = _FETCH_LOCKS.get(key)
-        if lock is None:
-            lock = threading.Lock()
-            _FETCH_LOCKS[key] = lock
-        return lock
-
-def _avail_flight_lock_for(key):
-    with _AVAILABILITY_FLIGHT_LOCKS_GUARD:
-        lock = _AVAILABILITY_FLIGHT_LOCKS.get(key)
-        if lock is None:
-            lock = threading.Lock()
-            _AVAILABILITY_FLIGHT_LOCKS[key] = lock
-        return lock
-
-def clear_availability_cache(clear_db=True):
-    with _AVAILABILITY_CACHE_LOCK:
-        _AVAILABILITY_CACHE.clear()
-    with _AVAILABILITY_FLIGHT_LOCKS_GUARD:
-        _AVAILABILITY_FLIGHT_LOCKS.clear()
-    if clear_db:
-        try:
-            AvailabilityBucketRepository.clear_all_buckets()
-        except Exception:
-            pass
-
-def _maybe_prune_cache(now):
-    if now - _CACHE_LAST_PRUNE[0] < _CACHE_PRUNE_INTERVAL:
-        return
-    _CACHE_LAST_PRUNE[0] = now
-    with PROMETHEUS_CACHE_LOCK:
-        stale_keys = [k for k, (ts, _d, _b) in PROMETHEUS_CACHE.items() if now - ts > _CACHE_MAX_AGE]
-        for k in stale_keys:
-            PROMETHEUS_CACHE.pop(k, None)
-    with _FETCH_LOCKS_GUARD:
-        for k in stale_keys:
-            _FETCH_LOCKS.pop(k, None)
-        if len(_FETCH_LOCKS) > 500:
-            unlocked = [k for k, lock in list(_FETCH_LOCKS.items()) if not lock.locked() and k not in PROMETHEUS_CACHE]
-            for k in unlocked:
-                _FETCH_LOCKS.pop(k, None)
-    with _AVAILABILITY_CACHE_LOCK:
-        stale_avail = [k for k, (ts, _d) in _AVAILABILITY_CACHE.items() if now - ts > _CACHE_MAX_AGE]
-        for k in stale_avail:
-            _AVAILABILITY_CACHE.pop(k, None)
-    with _AVAILABILITY_FLIGHT_LOCKS_GUARD:
-        for k in stale_avail:
-            _AVAILABILITY_FLIGHT_LOCKS.pop(k, None)
-        if len(_AVAILABILITY_FLIGHT_LOCKS) > 500:
-            unlocked_avail = [k for k, lock in list(_AVAILABILITY_FLIGHT_LOCKS.items()) if not lock.locked() and k not in _AVAILABILITY_CACHE]
-            for k in unlocked_avail:
-                _AVAILABILITY_FLIGHT_LOCKS.pop(k, None)
-
-# is_safe_endpoint_url() does a real (blocking) DNS resolution — fine once,
-# at /api/endpoints registration time, but fetch_prometheus_json is called
-# for every distinct PromQL query, many times a minute. A short TTL cache
-# keeps the DNS-rebinding re-check cheap on the hot path while still closing
-# the gap within one TTL window of a hostname's record changing (registration
-# alone left it trusted forever).
-_SAFE_CANDIDATE_CACHE = {}
-_SAFE_CANDIDATE_CACHE_LOCK = threading.Lock()
-_SAFE_CANDIDATE_CACHE_TTL = 20.0
-# A hostname that doesn't resolve at all (e.g. a Compose-internal name whose
-# container isn't up yet) can take several seconds to fail via the system
-# resolver, with no way to bound socket.getaddrinfo's own timeout portably.
-# Run it off-thread with a hard deadline so a slow/hanging lookup can't stall
-# an HTTP request or poll cycle; on timeout, fail open — same treatment
-# is_safe_endpoint_url already gives an unresolvable hostname, since a name
-# that's merely slow to resolve is not the DNS-rebinding case this guards
-# against (a rebound name resolves fine, just to a different, blocked IP).
-_SAFE_CHECK_TIMEOUT_SEC = 1.0
-
-def _cached_is_safe_endpoint_url(url):
-    now = time.time()
-    with _SAFE_CANDIDATE_CACHE_LOCK:
-        cached = _SAFE_CANDIDATE_CACHE.get(url)
-        if cached and now - cached[0] < _SAFE_CANDIDATE_CACHE_TTL:
-            return cached[1], cached[2]
-    try:
-        future = _DNS_CHECK_EXECUTOR.submit(is_safe_endpoint_url, url)
-        ok, reason = future.result(timeout=_SAFE_CHECK_TIMEOUT_SEC)
-    except TimeoutError:
-        # Fail open but do NOT cache it — a slow/hanging lookup is transient;
-        # caching "safe" for the full TTL would let a deliberately-stalled
-        # DNS response buy an attacker a trusted window instead of being
-        # re-checked on the very next call like the comment above promises.
-        return True, "DNS check timed out; treated as safe (re-checked next cycle)"
-    except Exception:
-        return True, "DNS check errored; treated as safe (re-checked next cycle)"
-    with _SAFE_CANDIDATE_CACHE_LOCK:
-        _SAFE_CANDIDATE_CACHE[url] = (now, ok, reason)
-    return ok, reason
-
-def _filter_safe_candidates(urls):
-    """Re-validate each URL's currently-resolved IP right before it's used as a
-    poll target. is_safe_endpoint_url() is also run once at endpoint
-    registration time (/api/endpoints), but a hostname that resolved to a
-    public IP then can be repointed via DNS to a loopback/link-local/metadata
-    address afterwards (DNS rebinding) — the background poller and aggregator
-    would otherwise keep trusting that first check forever. Re-running the
-    same check (TTL-cached, see above) closes that gap for anything that came
-    from user/operator input: active endpoint, other saved endpoints, and
-    PROMETHEUS_URL (_DEFAULT_PROM_URL) are all revalidated here."""
-    safe = []
-    for u in urls:
-        if not u:
-            continue
-        ok, reason = _cached_is_safe_endpoint_url(u)
-        if ok:
-            safe.append(u)
-        else:
-            logger.warning("Skipping Prometheus candidate %s: %s", u, reason)
-    return safe
-
-def fetch_url(url, timeout=1.5):
-    try:
-        req = Request(url, headers={"User-Agent": "InfraWatch/1.0"})
-        with urlopen(req, timeout=timeout) as resp:
-            if resp.status == 200:
-                return resp.read().decode('utf-8', errors='ignore')
-    except URLError as e:
-        if hasattr(e, 'read'):
-            try:
-                return e.read().decode('utf-8', errors='ignore')
-            except Exception:
-                pass
-    except Exception:
-        pass
-    return None
-
-def fetch_prometheus_json(path, use_cache=True, cache_ttl=None, timeout=None):
-    global LAST_WORKING_PROMETHEUS_URL, PROMETHEUS_CACHE
-    if cache_ttl is None:
-        cache_ttl = PROMETHEUS_CACHE_TTL_DEFAULT
-    now = time.time()
-    _maybe_prune_cache(now)
-
-    endpoints_data = load_endpoints()
-    active_url = endpoints_data.get("active")
-
-    cache_key = f"{active_url}:{path}"
-    if use_cache:
-        with PROMETHEUS_CACHE_LOCK:
-            if cache_key in PROMETHEUS_CACHE:
-                cached_ts, cached_data, cached_base = PROMETHEUS_CACHE[cache_key]
-                if now - cached_ts < cache_ttl:
-                    return cached_data, cached_base
-
-    with _fetch_lock_for(cache_key):
-        # Re-check: whoever held the lock before us may have just populated it.
-        if use_cache:
-            with PROMETHEUS_CACHE_LOCK:
-                if cache_key in PROMETHEUS_CACHE:
-                    cached_ts, cached_data, cached_base = PROMETHEUS_CACHE[cache_key]
-                    if time.time() - cached_ts < cache_ttl:
-                        return cached_data, cached_base
-
-        # Primary candidates: active endpoint + last known working endpoint
-        primary_candidates = []
-        if active_url:
-            primary_candidates.append(active_url)
-        if LAST_WORKING_PROMETHEUS_URL and LAST_WORKING_PROMETHEUS_URL not in primary_candidates:
-            primary_candidates.append(LAST_WORKING_PROMETHEUS_URL)
-        primary_candidates = _filter_safe_candidates(primary_candidates)
-
-        # Try primary candidates first (2.5s default timeout)
-        for base_url in primary_candidates:
-            with _FAILED_CANDIDATES_LOCK:
-                failed_at = _FAILED_CANDIDATES.get(base_url, 0)
-                if now - failed_at < _FAILED_CANDIDATE_TTL and base_url != LAST_WORKING_PROMETHEUS_URL:
-                    continue
-
-            req_timeout = 2.5 if timeout is None else timeout
-            raw = fetch_url(f"{base_url.rstrip('/')}{path}", timeout=req_timeout)
-            if raw:
-                try:
-                    data = json.loads(raw)
-                    # Even if status is error (e.g. invalid query syntax), the server is alive
-                    LAST_WORKING_PROMETHEUS_URL = base_url
-                    with _FAILED_CANDIDATES_LOCK:
-                        _FAILED_CANDIDATES.pop(base_url, None)
-                    if data.get('status') == 'success' or 'data' in data:
-                        if use_cache:
-                            with PROMETHEUS_CACHE_LOCK:
-                                PROMETHEUS_CACHE[cache_key] = (time.time(), data, base_url)
-                    return data, base_url
-                except Exception:
-                    with _FAILED_CANDIDATES_LOCK:
-                        _FAILED_CANDIDATES[base_url] = time.time()
-                    continue
-            else:
-                with _FAILED_CANDIDATES_LOCK:
-                    _FAILED_CANDIDATES[base_url] = time.time()
-
-        # If primary candidates fail (or none exist), fallback to other registered
-        # endpoints and _DEFAULT_PROM_URL (PROMETHEUS_URL env, or the
-        # prometheus:9090 compose default) — the one an operator actually
-        # configured for this deployment, ahead of the other saved endpoints.
-        fallback_candidates = []
-        if _DEFAULT_PROM_URL and _DEFAULT_PROM_URL not in primary_candidates:
-            fallback_candidates.append(_DEFAULT_PROM_URL)
-        for ep in endpoints_data.get("endpoints", []):
-            if ep not in primary_candidates and ep not in fallback_candidates:
-                fallback_candidates.append(ep)
-        fallback_candidates = _filter_safe_candidates(fallback_candidates)
-
-        for base_url in fallback_candidates:
-            with _FAILED_CANDIDATES_LOCK:
-                failed_at = _FAILED_CANDIDATES.get(base_url, 0)
-                if now - failed_at < _FAILED_CANDIDATE_TTL:
-                    continue
-
-            req_timeout = 0.8 if timeout is None else timeout
-            raw = fetch_url(f"{base_url.rstrip('/')}{path}", timeout=req_timeout)
-            if raw:
-                try:
-                    data = json.loads(raw)
-                    LAST_WORKING_PROMETHEUS_URL = base_url
-                    with _FAILED_CANDIDATES_LOCK:
-                        _FAILED_CANDIDATES.pop(base_url, None)
-                    if data.get('status') == 'success' or 'data' in data:
-                        if use_cache:
-                            with PROMETHEUS_CACHE_LOCK:
-                                PROMETHEUS_CACHE[cache_key] = (time.time(), data, base_url)
-                    return data, base_url
-                except Exception:
-                    with _FAILED_CANDIDATES_LOCK:
-                        _FAILED_CANDIDATES[base_url] = time.time()
-                    continue
-            else:
-                with _FAILED_CANDIDATES_LOCK:
-                    _FAILED_CANDIDATES[base_url] = time.time()
-        return None, None
+# LAST_WORKING_PROMETHEUS_URL, PROMETHEUS_CACHE(+LOCK), _SHARED_EXECUTOR, the
+# failed-candidate circuit breaker, single-flight locks, cache pruning, the
+# DNS-rebinding re-check, fetch_url() and fetch_prometheus_json() are all in
+# prometheus_client.py (re-imported above). Endpoint-mutating routes set
+# promclient.LAST_WORKING_PROMETHEUS_URL directly so the failover primary
+# tracks the operator's selection.
 
 # ── Rate limiting ─────────────────────────────────────────────────────────────
 # Lightweight in-process fixed-window limiter. No Redis/external store: this
@@ -1141,17 +659,6 @@ def load_maintenance_windows():
             return []
     return _request_memo("maint_windows", _load)
 
-def _parse_epoch_ts(val):
-    if val is None:
-        return 0.0
-    try:
-        return float(val)
-    except (ValueError, TypeError):
-        try:
-            dt = datetime.fromisoformat(str(val).replace('Z', '+00:00'))
-            return dt.timestamp()
-        except Exception:
-            return 0.0
 
 def maintenance_windows_by_instance(instances, job_map, windows=None):
     """{instance: [(start_ts, end_ts), ...]} for maintenance windows overlapping
@@ -1912,7 +1419,6 @@ def get_endpoints_api():
 @rate_limit(20, 60)
 @require_permission('endpoints.write')
 def add_endpoint_api():
-    global LAST_WORKING_PROMETHEUS_URL
     body = request.json or {}
     url = body.get('url', '').strip()
     if not url:
@@ -1941,7 +1447,7 @@ def add_endpoint_api():
             return jsonify({"ok": False, "error": "Failed to save endpoint"}), 500
 
         if set_active:
-            LAST_WORKING_PROMETHEUS_URL = url
+            promclient.LAST_WORKING_PROMETHEUS_URL = url
             with PROMETHEUS_CACHE_LOCK:
                 PROMETHEUS_CACHE.clear()
 
@@ -1962,7 +1468,6 @@ def add_endpoint_api():
 @rate_limit(20, 60)
 @require_permission('endpoints.write')
 def select_endpoint_api():
-    global LAST_WORKING_PROMETHEUS_URL
     body = request.json or {}
     url = body.get('url', '').strip()
     if not url:
@@ -1982,7 +1487,7 @@ def select_endpoint_api():
         _EP_STATUS_CACHE["data"] = None
 
         # Immediately clear cache and force selected URL as primary
-        LAST_WORKING_PROMETHEUS_URL = url
+        promclient.LAST_WORKING_PROMETHEUS_URL = url
         with PROMETHEUS_CACHE_LOCK:
             PROMETHEUS_CACHE.clear()
 
@@ -1999,7 +1504,6 @@ def select_endpoint_api():
 @rate_limit(20, 60)
 @require_permission('endpoints.write')
 def delete_endpoint_api():
-    global LAST_WORKING_PROMETHEUS_URL
     body = request.json or {}
     url = body.get('url', '').strip()
 
@@ -2023,7 +1527,7 @@ def delete_endpoint_api():
         _ENDPOINTS_CACHE["data"] = None
         data = load_endpoints()
         if was_active:
-            LAST_WORKING_PROMETHEUS_URL = data["active"]
+            promclient.LAST_WORKING_PROMETHEUS_URL = data["active"]
             with PROMETHEUS_CACHE_LOCK:
                 PROMETHEUS_CACHE.clear()
         _EP_STATUS_CACHE["data"] = None
@@ -2697,100 +2201,6 @@ def fetch_down_since_prom_map(cache_ttl=10.0):
 
     return last_up_map
 
-def _earliest_outage_start(prom_down_since, matched_alerts, health):
-    """downSince for the wallboard's "Down for X" aging and the drawer's ongoing
-    -outage duration. fetch_down_since_prom_map() is bounded by its subquery
-    lookback, so a genuinely long outage still reads as roughly that bound. A
-    firing incident row carries the authoritative outage start (poller stamps it
-    at first-observed-down; a webhook carries Alertmanager's startsAt) — when one
-    exists for this DOWN target, take whichever start is EARLIER, i.e. the
-    longer, truer outage. Returns prom_down_since untouched for an up target or
-    when there is no usable incident timestamp."""
-    if health == 'up':
-        return prom_down_since
-    starts = []
-    if prom_down_since:
-        starts.append(prom_down_since)
-    for a in matched_alerts or []:
-        nm = (a.get('name') or '').lower()
-        if a.get('severity') == 'critical' or 'down' in nm or 'unreachable' in nm or 'probe' in nm:
-            ts = _sane_epoch(a.get('time'))
-            if ts:
-                starts.append(ts)
-    return min(starts) if starts else prom_down_since
-
-
-# ── Scrape failure classification ────────────────────────────────────────────
-# Single source of truth for turning raw Prometheus/blackbox_exporter data into
-# an operator-readable category. Called from /instances, the poller's alert
-# summary, and the custom-target branch — nowhere else re-derives this. Never
-# replaces lastError/httpStatusCode/probe_success; only adds to them.
-def classify_scrape_failure(health, last_error, http_status):
-    if health == 'up':
-        return {"category": None, "detail": None}
-    if health == 'unknown':
-        return {"category": "Unknown", "detail": "No probe data yet"}
-
-    err = (last_error or '').lower()
-    if err:
-        if 'no such host' in err:
-            return {"category": "DNS", "detail": last_error}
-        if 'no route to host' in err:
-            return {"category": "No Route", "detail": last_error}
-        if 'connection refused' in err:
-            return {"category": "Refused", "detail": last_error}
-        if 'context deadline exceeded' in err or 'i/o timeout' in err:
-            return {"category": "Timeout", "detail": last_error}
-        if 'x509' in err or 'certificate' in err or 'tls' in err:
-            return {"category": "TLS", "detail": last_error}
-
-    if http_status:
-        try:
-            code = int(float(http_status))
-            if code > 0:
-                return {"category": f"HTTP {code}", "detail": f"HTTP {code}"}
-        except (TypeError, ValueError):
-            pass
-
-    if last_error:
-        return {"category": "Unknown", "detail": last_error}
-
-    return {"category": "Unknown", "detail": "No error detail available (probe_success=0)"}
-
-# ── Node Exporter infrastructure correlation ─────────────────────────────────
-# Only active when the "Use Node Exporter for infrastructure-aware
-# availability" setting is ON (see get_availability_settings). Matches a
-# blackbox/custom target to a Node Exporter `up` reading by HOST alone,
-# ignoring scheme/port on both sides -- the blackbox `instance` label (a URL
-# or bare address) and Node Exporter's (host:9100) essentially never share a
-# literal string. classify_probe_failure() (fleet_availability.py) then turns
-# that match into a service-vs-infrastructure label; this function only does
-# the host lookup.
-def _extract_host(addr):
-    if not addr:
-        return ""
-    a = str(addr).strip()
-    if "://" in a:
-        a = urlparse(a).netloc or a
-    a = a.split("@")[-1].split("/")[0]
-    # Strip a trailing :port. ponytail: naive for bracketed IPv6 literals,
-    # fine for the IPv4/hostname targets this app actually manages.
-    if a.count(":") == 1:
-        host, _, port = a.rpartition(":")
-        if port.isdigit():
-            a = host
-    return a.lower()
-
-def find_node_exporter_status(target_addr, node_exporter_up_map):
-    """Returns (found, healthy) for the Node Exporter instance matching
-    target_addr's host, or (False, False) if this target has none."""
-    target_host = _extract_host(target_addr)
-    if not target_host:
-        return False, False
-    for ne_instance, val in node_exporter_up_map.items():
-        if _extract_host(ne_instance) == target_host:
-            return True, str(val) in ('1', '1.0')
-    return False, False
 
 def fetch_all_probe_metrics(cache_ttl=3.0, timeout=None):
     f_succ = _SHARED_EXECUTOR.submit(fetch_prom_query_map, "probe_success", cache_ttl, timeout)
@@ -2806,36 +2216,6 @@ def fetch_all_probe_metrics(cache_ttl=3.0, timeout=None):
 
     return success_map, duration_map, status_code_map
 
-# ── Outage debounce ────────────────────────────────────────────────────────────
-# A target must be continuously down for at least this long before it counts as
-# an outage — i.e. before it drives system_status to CRITICAL, sounds the
-# frontend alarm, or fires a Telegram alert. Suppresses false alarms from
-# momentary blips (one failed scrape, a brief network hiccup) that recover on
-# their own. Webhook-delivered alerts are NOT gated here — Alertmanager has its
-# own `for:` delay.
-OUTAGE_GRACE_SECONDS = float(os.environ.get("OUTAGE_GRACE_SECONDS", "15"))
-
-def _sane_epoch(ts):
-    """Coerce a down-since value to a plausible Unix-seconds timestamp, else 0.
-    The wallboard ages an outage as `now - downSince`; a junk small/negative
-    value there rendered as "496859h" (i.e. counting from 1970). ~2001..~2286
-    is the accepted window; anything else becomes 0 (the UI then times the
-    outage from when it first saw it)."""
-    try:
-        v = int(float(ts))
-    except (TypeError, ValueError):
-        return 0
-    return v if 1_000_000_000 <= v <= 10_000_000_000 else 0
-
-
-def _outage_past_grace(down_since_ts, now=None):
-    """False while a target has been down for less than OUTAGE_GRACE_SECONDS.
-    down_since_ts is Prometheus's last-seen-up timestamp (item['downSince']).
-    Fail-open: a missing/zero start time (Prometheus has no last-up sample at
-    all) is treated as past grace so a real outage is never hidden."""
-    if not down_since_ts:
-        return True
-    return ((now or time.time()) - down_since_ts) >= OUTAGE_GRACE_SECONDS
 
 # ── Canonical Monitoring State Engine ───────────────────────────────────────
 def _derive_probe_readings(keys, probe_success_map, probe_duration_map, probe_status_code_map,
@@ -3338,22 +2718,6 @@ def get_instance_job_map(job_filter=None):
             job_map.setdefault(inst, a.get('job') or 'alertmanager')
 
     return job_map
-
-
-_PROM_DURATION_RE = re.compile(r'(\d+(?:\.\d+)?)(ms|s|m|h)')
-
-def _parse_prom_duration_sec(value):
-    """Parses a Prometheus model.Duration string ("60s", "1m0s", "500ms")
-    into seconds. Returns None if unparseable/empty."""
-    if not value:
-        return None
-    total = 0.0
-    matched = False
-    for num, unit in _PROM_DURATION_RE.findall(str(value)):
-        matched = True
-        n = float(num)
-        total += n / 1000.0 if unit == 'ms' else n * {'s': 1.0, 'm': 60.0, 'h': 3600.0}[unit]
-    return total if matched else None
 
 
 def get_instance_cadence_map(job_filter=None):

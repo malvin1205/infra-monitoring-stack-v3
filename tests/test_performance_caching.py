@@ -63,8 +63,8 @@ class PerformanceCachingTests(unittest.TestCase):
             call_count[0] += 1
             return json.dumps({"status": "success", "data": {"result": [{"count": call_count[0]}]}})
 
-        with patch('app.fetch_url', side_effect=fake_fetch_url), \
-             patch('app.load_endpoints', return_value={"active": "http://prom:9090", "endpoints": ["http://prom:9090"]}):
+        with patch('prometheus_client.fetch_url', side_effect=fake_fetch_url), \
+             patch('prometheus_client.load_endpoints', return_value={"active": "http://prom:9090", "endpoints": ["http://prom:9090"]}):
 
             # Call 1: Miss -> fetches
             data1, _ = fetch_prometheus_json('/api/v1/query?query=test', use_cache=True, cache_ttl=1.0)
@@ -93,8 +93,8 @@ class PerformanceCachingTests(unittest.TestCase):
             call_count[0] += 1
             return json.dumps({"status": "success", "data": {"result": [{"worker": call_count[0]}]}})
 
-        with patch('app.fetch_url', side_effect=fake_fetch_url), \
-             patch('app.load_endpoints', return_value={"active": "http://prom:9090", "endpoints": ["http://prom:9090"]}):
+        with patch('prometheus_client.fetch_url', side_effect=fake_fetch_url), \
+             patch('prometheus_client.load_endpoints', return_value={"active": "http://prom:9090", "endpoints": ["http://prom:9090"]}):
 
             def make_request(_):
                 data, _ = fetch_prometheus_json('/api/v1/query?query=probe_success', use_cache=True, cache_ttl=5.0)
@@ -118,8 +118,8 @@ class PerformanceCachingTests(unittest.TestCase):
                 return json.dumps({"status": "success", "data": {"activeTargets": []}})
             return None
 
-        with patch('app.fetch_url', side_effect=fake_fetch_url), \
-             patch('app.load_endpoints', return_value={
+        with patch('prometheus_client.fetch_url', side_effect=fake_fetch_url), \
+             patch('prometheus_client.load_endpoints', return_value={
                  "active": "http://dead-prom-1:9090",
                  "endpoints": ["http://dead-prom-1:9090", "http://backup-prom:9090"]
              }):
