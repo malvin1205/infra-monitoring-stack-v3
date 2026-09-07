@@ -4,7 +4,6 @@ import time
 import os
 import math
 import re
-import hashlib
 import threading
 import sys
 import shutil
@@ -13,7 +12,6 @@ import logging
 import contextlib
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
-from functools import wraps
 from urllib.parse import quote
 import yaml
 
@@ -77,6 +75,19 @@ except ImportError:
     )
 
 try:
+    from config import (
+        DEFAULT_JOB_FILTER, ALERTNAME_TARGET_DOWN, ALERTNAME_SLOW_RESPONSE,
+        DEFAULT_SLOW_RESPONSE_THRESHOLD_MS, SCRAPE_INTERVAL_SECONDS,
+        _AVAIL_FRESHNESS_TOLERANCE_SEC, _AVAIL_STALE_BUCKET_TOLERANCE_SEC,
+    )
+    import json_store
+    from json_store import load_json, save_json  # re-export for `from app import …`
+    from rate_limit import (
+        rate_limit, _client_identity, _RATE_BUCKETS, _RATE_BUCKETS_LOCK,
+        _RATE_LAST_PRUNE, _RATE_PRUNE_INTERVAL, _LOGIN_FAILS, _LOGIN_FAILS_LOCK,
+        _LOGIN_MAX_FAILS, _LOGIN_LOCK_SECONDS, _login_locked, _login_note_failure,
+        _login_clear,
+    )
     from web_middleware import register_web_middleware
     import ssrf
     from ssrf import _is_blocked_ip, is_safe_endpoint_url
@@ -101,6 +112,18 @@ try:
         fetch_url, fetch_prometheus_json,
     )
 except ImportError:
+    from alarm.config import (
+        DEFAULT_JOB_FILTER, ALERTNAME_TARGET_DOWN, ALERTNAME_SLOW_RESPONSE,
+        DEFAULT_SLOW_RESPONSE_THRESHOLD_MS, SCRAPE_INTERVAL_SECONDS,
+        _AVAIL_FRESHNESS_TOLERANCE_SEC, _AVAIL_STALE_BUCKET_TOLERANCE_SEC,
+    )
+    from alarm import json_store
+    from alarm.rate_limit import (
+        rate_limit, _client_identity, _RATE_BUCKETS, _RATE_BUCKETS_LOCK,
+        _RATE_LAST_PRUNE, _RATE_PRUNE_INTERVAL, _LOGIN_FAILS, _LOGIN_FAILS_LOCK,
+        _LOGIN_MAX_FAILS, _LOGIN_LOCK_SECONDS, _login_locked, _login_note_failure,
+        _login_clear,
+    )
     from alarm.web_middleware import register_web_middleware
     from alarm import ssrf
     from alarm.ssrf import _is_blocked_ip, is_safe_endpoint_url
@@ -127,39 +150,9 @@ except ImportError:
 
 init_db()
 
-# Matches prometheus/prometheus.yml `global.scrape_interval`. Used to turn a
-# Prometheus `count_over_time(...)` sample count back into a monitored-duration
-# estimate for weighted (fleet_aggregate) availability math. Override via
-# SCRAPE_INTERVAL_SECONDS if prometheus.yml's scrape_interval is ever changed.
-try:
-    SCRAPE_INTERVAL_SECONDS = float(os.environ.get("SCRAPE_INTERVAL_SECONDS", "2.0"))
-except (TypeError, ValueError):
-    SCRAPE_INTERVAL_SECONDS = 2.0
-
-# How stale the latest SQLite availability bucket may be, for a *live* window
-# (no ?end=), before /api/availability's "is this range fully materialized?"
-# check gives up on the fast path and falls back to a live Prometheus query.
-# The background aggregator (AVAIL_AGGREGATE_INTERVAL_SECONDS, defined lower
-# in this file) only refreshes the in-progress hour's bucket once every 60s,
-# and that cycle itself takes real time (Prometheus queries, up to 15s
-# timeout). The frontend polls this endpoint every 15s regardless of user
-# action — with zero slack between the two 60s numbers, a live range would
-# drift past a bare 60s tolerance partway through most aggregation cycles,
-# flip-flopping between the SQLite-materialized path and the live-hybrid
-# path (two different estimation methods) on its own, with the UI number
-# visibly changing every ~15s with no user action. 2.5x mirrors the same
-# slack multiplier already used for the aggregator's leader-election lease.
-_AVAIL_FRESHNESS_TOLERANCE_SEC = 150.0  # 60.0 * 2.5
-
-# Separately: how old the NEWEST matched bucket's `updated_at` may be before the
-# SQLite fast path is abandoned for a live window. The freshness tolerance above
-# is about the bucket's nominal time span (which always reads as current, since
-# an in-progress hour is stored with a future hour-end); this one catches a
-# silently dead aggregator — buckets whose span still looks current but that
-# stopped being rewritten. ~5 aggregator cycles (AVAIL_AGGREGATE_INTERVAL_SECONDS
-# = 60s); older => fall through to the live Prometheus hybrid path instead of
-# serving an ever-staler archive as "COMPLETE".
-_AVAIL_STALE_BUCKET_TOLERANCE_SEC = 300.0
+# SCRAPE_INTERVAL_SECONDS, _AVAIL_FRESHNESS_TOLERANCE_SEC,
+# _AVAIL_STALE_BUCKET_TOLERANCE_SEC and the job/alert-name constants live in
+# config.py (re-imported above).
 
 app = Flask(__name__)
 app.secret_key = get_session_secret()
@@ -195,19 +188,10 @@ app.config['MAX_CONTENT_LENGTH'] = int(os.environ.get("INFRAWATCH_MAX_BODY_BYTES
 # the JSON 404/405/500 handlers — see web_middleware.py.
 register_web_middleware(app)
 
-STATUS_FILE  = os.path.join(os.path.dirname(__file__), "status.json")
-HISTORY_FILE = os.path.join(os.path.dirname(__file__), "history.json")
-HISTORY_ARCHIVE_FILE = os.path.join(os.path.dirname(__file__), "history_archive.json")
-LOGS_FILE    = os.path.join(os.path.dirname(__file__), "logs.json")
-
-# Dependencies ("which host depends on which", see DependencyRepository /
-# load_dependencies below) live in SQLite, independent of target config —
-# most targets aren't even owned by this app (discovered live from
-# Prometheus's own scrape config), and the one target file this app does
-# own (targets/websites.yml) is a Prometheus file_sd YAML snippet, not a
-# place to hang relational metadata off of.
-MAX_HISTORY  = 1000
-MAX_LOGS     = 200
+# status.json / logs.json / history.json paths, MAX_HISTORY / MAX_LOGS and
+# load_json / save_json / save_with_retention live in json_store.py. Readers
+# reference them as json_store.<NAME> so a test can point the cache at a temp
+# dir by rebinding json_store.STATUS_FILE etc.
 
 
 def active_incident_list():
@@ -219,20 +203,9 @@ def active_incident_list():
         return IncidentRepository.get_active_incidents()
     except Exception:
         logger.exception("active_incident_list: SQLite read failed; using status.json cache")
-        status_data = load_json(STATUS_FILE, None)
+        status_data = json_store.load_json(json_store.STATUS_FILE, None)
         return status_data.get('alerts', []) if isinstance(status_data, dict) else []
 
-
-MAX_ARCHIVE_HISTORY = 5000
-
-def save_with_retention(main_path, archive_path, data, limit):
-    if len(data) > limit:
-        overflow = data[limit:]
-        archive = load_json(archive_path, [])
-        archive = (overflow + archive)[:MAX_ARCHIVE_HISTORY]
-        save_json(archive_path, archive)
-        data = data[:limit]
-    save_json(main_path, data)
 
 # Serializes the load-modify-save cycle for status.json/logs.json/history.json
 # in webhook() — without it, concurrent deliveries (Alertmanager routinely
@@ -249,60 +222,12 @@ def save_with_retention(main_path, archive_path, data, limit):
 # cross-process lock here (and poller leader election) before it is correct.
 _WEBHOOK_LOCK = threading.Lock()
 
-def load_json(path, default=None):
-    if default is None:
-        default = {}
-    if os.path.exists(path):
-        try:
-            with open(path, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except Exception:
-            return default
-    return default
-
-def save_json(path, data):
-    try:
-        tmp_path = path + f".tmp.{os.getpid()}.{threading.get_ident()}"
-        os.makedirs(os.path.dirname(os.path.abspath(tmp_path)), exist_ok=True)
-        with open(tmp_path, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2)
-        for attempt in range(5):
-            try:
-                os.replace(tmp_path, path)
-                break
-            except (OSError, PermissionError):
-                if attempt == 4:
-                    try:
-                        with open(path, 'w', encoding='utf-8') as f:
-                            json.dump(data, f, indent=2)
-                    except Exception:
-                        pass
-                    try:
-                        if os.path.exists(tmp_path):
-                            os.remove(tmp_path)
-                    except Exception:
-                        pass
-                else:
-                    time.sleep(0.01 * (attempt + 1))
-    except Exception as e:
-        logger.error(f"Error saving {path}: {e}")
-
 # The Prometheus HTTP access layer — _DEFAULT_PROM_URL, load_endpoints() and
 # its cache, is_safe_endpoint_url() (ssrf.py), the DNS-rebinding hot-path
 # re-check, the PromQL response cache + single-flight locks, and
 # fetch_url()/fetch_prometheus_json() with endpoint failover — lives in
 # prometheus_client.py. Every name is re-imported above so callers here and
 # the tests (alarm_app.PROMETHEUS_CACHE, etc.) are unchanged.
-
-DEFAULT_JOB_FILTER = os.environ.get("JOB_FILTER", "all")
-ALERTNAME_TARGET_DOWN = "TargetDown"
-ALERTNAME_SLOW_RESPONSE = "SlowResponse"
-
-# Global default latency (ms) above which an up target is "slow"/degraded.
-# Per-instance overrides live in SlowThresholdRepository. Used by BOTH the
-# SlowResponse alert (poller) and the live grid's severity/summary (audit F4).
-DEFAULT_SLOW_RESPONSE_THRESHOLD_MS = float(os.environ.get("SLOW_RESPONSE_THRESHOLD_MS", "500"))
-
 
 def get_targets_file():
     # websites.yml is InfraWatch's own curation list — the subset of
@@ -490,100 +415,10 @@ def save_website_targets(urls):
 # promclient.LAST_WORKING_PROMETHEUS_URL directly so the failover primary
 # tracks the operator's selection.
 
-# ── Rate limiting ─────────────────────────────────────────────────────────────
-# Lightweight in-process fixed-window limiter. No Redis/external store: this
-# app runs as a single gunicorn worker (Dockerfile), so a plain dict guarded
-# by a lock is sufficient — same pattern as the caches above. A production
-# deployment behind a reverse proxy can layer proxy-level rate limiting on
-# top of this; this is the floor, not the only line of defense.
-_RATE_BUCKETS = {}
-_RATE_BUCKETS_LOCK = threading.Lock()
-_RATE_LAST_PRUNE = [0.0]
-_RATE_PRUNE_INTERVAL = 60.0
-
-def _client_identity():
-    # Session user identity, M2M API key, or fallback to remote IP.
-    if session.get("user_id"):
-        return f"user:{session.get('user_id')}"
-    header = request.headers.get("X-API-Key") or request.headers.get("Authorization", "")
-    if header.startswith("Bearer "):
-        header = header[len("Bearer "):]
-    if header:
-        # Bucket by a short digest, not the raw secret — the limiter dict is
-        # process-global and gets logged/inspected during debugging.
-        return "key:" + hashlib.sha256(header.encode("utf-8", "ignore")).hexdigest()[:16]
-    return f"ip:{request.remote_addr or 'unknown'}"
-
-
-# ── Per-username login throttle ──────────────────────────────────────────────
-# The IP-based rate_limit() on /api/auth/login is the outer floor; this adds a
-# per-account lockout so a single target account can't be sprayed 20/min/IP
-# from a rotating IP pool. Disabled under TESTING so the suite's negative-path
-# login tests don't trip it.
-_LOGIN_FAILS = {}
-_LOGIN_FAILS_LOCK = threading.Lock()
-_LOGIN_MAX_FAILS = 10
-_LOGIN_LOCK_SECONDS = 300.0
-
-def _login_locked(username):
-    if app.config.get("TESTING"):
-        return False
-    now = time.time()
-    with _LOGIN_FAILS_LOCK:
-        rec = _LOGIN_FAILS.get(username)
-        if not rec:
-            return False
-        fails, first_ts = rec
-        if now - first_ts > _LOGIN_LOCK_SECONDS:
-            _LOGIN_FAILS.pop(username, None)
-            return False
-        return fails >= _LOGIN_MAX_FAILS
-
-def _login_note_failure(username):
-    now = time.time()
-    with _LOGIN_FAILS_LOCK:
-        fails, first_ts = _LOGIN_FAILS.get(username, (0, now))
-        if now - first_ts > _LOGIN_LOCK_SECONDS:
-            fails, first_ts = 0, now
-        _LOGIN_FAILS[username] = (fails + 1, first_ts)
-
-def _login_clear(username):
-    with _LOGIN_FAILS_LOCK:
-        _LOGIN_FAILS.pop(username, None)
-
-def rate_limit(max_calls, per_seconds):
-    """At most max_calls per per_seconds, per (route, client identity).
-    Fixed-window, not sliding — a request right at a window boundary can
-    momentarily allow close to 2x max_calls; an acceptable trade for a
-    NOC-internal tool over a real sliding-window implementation."""
-    def decorator(f):
-        @wraps(f)
-        def wrapped(*args, **kwargs):
-            now = time.time()
-            with _RATE_BUCKETS_LOCK:
-                if now - _RATE_LAST_PRUNE[0] > _RATE_PRUNE_INTERVAL:
-                    _RATE_LAST_PRUNE[0] = now
-                    # Each key carries its own route's per_seconds (k[3]), so
-                    # staleness is judged against that window's own end time —
-                    # not a window index recomputed from whichever route
-                    # happened to trigger this prune pass (that mixed windows
-                    # across routes with different per_seconds and could wipe
-                    # another route's bucket mid-window, resetting its quota
-                    # early).
-                    stale = [k for k in _RATE_BUCKETS if (k[2] + 1) * k[3] <= now]
-                    for k in stale:
-                        _RATE_BUCKETS.pop(k, None)
-
-                window = int(now // per_seconds)
-                key = (f.__name__, _client_identity(), window, per_seconds)
-                count = _RATE_BUCKETS.get(key, 0) + 1
-                _RATE_BUCKETS[key] = count
-
-            if count > max_calls:
-                return jsonify({"ok": False, "error": "Rate limit exceeded, try again shortly"}), 429
-            return f(*args, **kwargs)
-        return wrapped
-    return decorator
+# Rate limiting (`rate_limit` decorator) and the per-username login lockout
+# (`_login_locked` / `_login_note_failure` / `_login_clear`) live in
+# rate_limit.py — re-imported above so `alarm_app._RATE_BUCKETS` etc. are
+# unchanged.
 
 # ── Authorization model (deliberate, see audit F52) ──────────────────────────
 #   * Operational reads — /instances, /status, /history, /logs,
@@ -728,7 +563,7 @@ def record_alert_event(name, severity, instance, summary, job, event_time, is_no
         if is_now_firing and get_active_maintenance(instance, job, now=event_time):
             return False  # suppressed: instance/job is under an active maintenance window.
 
-        status_data = load_json(STATUS_FILE, {"status": "NORMAL", "alerts": [], "updated": event_time})
+        status_data = json_store.load_json(json_store.STATUS_FILE, {"status": "NORMAL", "alerts": [], "updated": event_time})
         active_alerts = {}
         for a in status_data.get('alerts', []):
             k = a.get('key') or f"{a.get('name')}|{a.get('instance')}"
@@ -777,7 +612,7 @@ def record_alert_event(name, severity, instance, summary, job, event_time, is_no
             if started:
                 duration_seconds = max(0, event_time - started.get('time', event_time))
 
-        logs = load_json(LOGS_FILE, [])
+        logs = json_store.load_json(json_store.LOGS_FILE, [])
         logs.insert(0, {
             "time":            event_time,
             "event":           "firing" if is_now_firing else "resolved",
@@ -792,7 +627,7 @@ def record_alert_event(name, severity, instance, summary, job, event_time, is_no
             "duration_seconds": duration_seconds,
         })
 
-        history = load_json(HISTORY_FILE, [])
+        history = json_store.load_json(json_store.HISTORY_FILE, [])
         if is_now_firing:
             # occurrences/first_seen mirror IncidentRepository's SQLite
             # semantics (see storage.py) — a re-fire of a key that already
@@ -835,9 +670,9 @@ def record_alert_event(name, severity, instance, summary, job, event_time, is_no
         else:
             status_state = "NORMAL"
 
-        save_json(STATUS_FILE, {"status": status_state, "alerts": firing_list, "updated": time.time()})
-        save_json(LOGS_FILE, logs[:MAX_LOGS])
-        save_with_retention(HISTORY_FILE, HISTORY_ARCHIVE_FILE, history, MAX_HISTORY)
+        json_store.save_json(json_store.STATUS_FILE, {"status": status_state, "alerts": firing_list, "updated": time.time()})
+        json_store.save_json(json_store.LOGS_FILE, logs[:json_store.MAX_LOGS])
+        json_store.save_with_retention(json_store.HISTORY_FILE, json_store.HISTORY_ARCHIVE_FILE, history, json_store.MAX_HISTORY)
 
         # Asynchronously dispatch Telegram notification on verified state
         # transition. min_severity (telegram_notifier.get_telegram_config,
@@ -1188,7 +1023,7 @@ def resolve_alert_api():
     # status, so a fallback read of that cache can't resurrect it.
     try:
         with _WEBHOOK_LOCK:
-            sd = load_json(STATUS_FILE, None)
+            sd = json_store.load_json(json_store.STATUS_FILE, None)
             if isinstance(sd, dict) and sd.get("alerts"):
                 kept = [a for a in sd["alerts"]
                         if (a.get("key") or f"{a.get('name')}|{a.get('instance')}") != key]
@@ -1201,7 +1036,7 @@ def resolve_alert_api():
                     else:
                         sd["status"] = "NORMAL"
                     sd["updated"] = now
-                    save_json(STATUS_FILE, sd)
+                    json_store.save_json(json_store.STATUS_FILE, sd)
     except Exception:
         logger.exception("resolve_alert_api: status.json cache cleanup failed for %s", key)
 
@@ -1331,12 +1166,12 @@ def history():
     try:
         # Return the SQLite result even when it is a legitimately empty list —
         # an empty history is not a read failure (audit F20).
-        return jsonify(IncidentRepository.get_history(limit=MAX_HISTORY))
+        return jsonify(IncidentRepository.get_history(limit=json_store.MAX_HISTORY))
     except Exception:
         logger.exception("history(): SQLite read failed, falling back to history.json")
     # Fallback also folds in history_archive.json so overflow rows past
     # MAX_HISTORY remain reachable in this degraded path (audit F11).
-    return jsonify((load_json(HISTORY_FILE, []) + load_json(HISTORY_ARCHIVE_FILE, []))[:MAX_HISTORY])
+    return jsonify((json_store.load_json(json_store.HISTORY_FILE, []) + json_store.load_json(json_store.HISTORY_ARCHIVE_FILE, []))[:json_store.MAX_HISTORY])
 
 @app.route('/logs')
 @app.route('/api/logs')
@@ -1345,7 +1180,7 @@ def logs():
         limit = int(request.args.get('limit', 50))
     except (TypeError, ValueError):
         limit = 50
-    limit = max(1, min(limit, MAX_LOGS))
+    limit = max(1, min(limit, json_store.MAX_LOGS))
     try:
         # A legitimately empty log list is not a read failure (audit F20).
         data = EventLogRepository.get_logs(limit=limit)
@@ -1353,7 +1188,7 @@ def logs():
         return jsonify(data)
     except Exception:
         logger.exception("logs(): SQLite read failed, falling back to logs.json")
-    data = load_json(LOGS_FILE, [])
+    data = json_store.load_json(json_store.LOGS_FILE, [])
     return jsonify(data[:limit])
 
 # SQLite (DeletedTargetRepository) is the sole source of truth — deleted_targets.json
@@ -3635,8 +3470,8 @@ def target_history_api():
 
     # Always merge all sources: Prometheus range states + logs.json + history.json
     raw_events = list(events)
-    logs = load_json(LOGS_FILE, [])
-    history_records = load_json(HISTORY_FILE, [])
+    logs = json_store.load_json(json_store.LOGS_FILE, [])
+    history_records = json_store.load_json(json_store.HISTORY_FILE, [])
     combined_sources = logs + history_records
 
     for item in combined_sources:
@@ -3731,7 +3566,7 @@ def target_history_api():
                 break
 
     if not latency_points:
-        logs = load_json(LOGS_FILE, [])
+        logs = json_store.load_json(json_store.LOGS_FILE, [])
         log_points = []
         for l in logs:
             inst = l.get('instance') or ''
@@ -3763,7 +3598,7 @@ def health_live():
 def health_ready():
     """Readiness probe: returns 200 if storage files are writable and application is ready."""
     storage_ok = all(
-        os.access(p, os.W_OK) for p in (STATUS_FILE, LOGS_FILE, HISTORY_FILE)
+        os.access(p, os.W_OK) for p in (json_store.STATUS_FILE, json_store.LOGS_FILE, json_store.HISTORY_FILE)
         if os.path.exists(p)
     )
     if not storage_ok:
@@ -3782,7 +3617,7 @@ def health():
     prometheus_ok = raw is not None and raw.get('status') == 'success'
 
     storage_ok = all(
-        os.access(p, os.W_OK) for p in (STATUS_FILE, LOGS_FILE, HISTORY_FILE)
+        os.access(p, os.W_OK) for p in (json_store.STATUS_FILE, json_store.LOGS_FILE, json_store.HISTORY_FILE)
         if os.path.exists(p)
     )
 
@@ -4517,7 +4352,7 @@ def _reconcile_status_json_into_sqlite():
     either artefact. No-op when status.json is absent/empty (the common case).
     """
     try:
-        status_data = load_json(STATUS_FILE, None)
+        status_data = json_store.load_json(json_store.STATUS_FILE, None)
         if not isinstance(status_data, dict):
             return
         alerts = status_data.get("alerts") or []

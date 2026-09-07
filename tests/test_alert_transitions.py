@@ -11,8 +11,10 @@ os.environ["DISABLE_ALERT_POLLER"] = "1"  # don't spin up the live network polle
 
 try:
     import app as alarm_app
+    import json_store
 except ImportError:
     from alarm import app as alarm_app
+    from alarm import json_store
 
 from conftest import TEST_API_KEY, TEST_WEBHOOK_SECRET
 
@@ -190,12 +192,12 @@ class RecordAlertEventTests(unittest.TestCase):
 
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
-        self._orig = (alarm_app.STATUS_FILE, alarm_app.HISTORY_FILE,
-                      alarm_app.HISTORY_ARCHIVE_FILE, alarm_app.LOGS_FILE)
-        alarm_app.STATUS_FILE = os.path.join(self.tmpdir, "status.json")
-        alarm_app.HISTORY_FILE = os.path.join(self.tmpdir, "history.json")
-        alarm_app.HISTORY_ARCHIVE_FILE = os.path.join(self.tmpdir, "history_archive.json")
-        alarm_app.LOGS_FILE = os.path.join(self.tmpdir, "logs.json")
+        self._orig = (json_store.STATUS_FILE, json_store.HISTORY_FILE,
+                      json_store.HISTORY_ARCHIVE_FILE, json_store.LOGS_FILE)
+        json_store.STATUS_FILE = os.path.join(self.tmpdir, "status.json")
+        json_store.HISTORY_FILE = os.path.join(self.tmpdir, "history.json")
+        json_store.HISTORY_ARCHIVE_FILE = os.path.join(self.tmpdir, "history_archive.json")
+        json_store.LOGS_FILE = os.path.join(self.tmpdir, "logs.json")
         # Isolate SQLite too — record_alert_event() also writes the incidents
         # table, and tests here (e.g. test_repeat_firing_notification_is_deduped)
         # intentionally leave an incident firing. Without this it leaked into
@@ -211,8 +213,8 @@ class RecordAlertEventTests(unittest.TestCase):
             os.environ["INFRAWATCH_DB_PATH"] = self._orig_db_env
         else:
             os.environ.pop("INFRAWATCH_DB_PATH", None)
-        (alarm_app.STATUS_FILE, alarm_app.HISTORY_FILE,
-         alarm_app.HISTORY_ARCHIVE_FILE, alarm_app.LOGS_FILE) = self._orig
+        (json_store.STATUS_FILE, json_store.HISTORY_FILE,
+         json_store.HISTORY_ARCHIVE_FILE, json_store.LOGS_FILE) = self._orig
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def test_firing_then_resolved_lifecycle(self):
@@ -221,11 +223,11 @@ class RecordAlertEventTests(unittest.TestCase):
             summary="down", job="blackbox", event_time=1000.0, is_now_firing=True)
         self.assertTrue(ok)
 
-        status = alarm_app.load_json(alarm_app.STATUS_FILE, {})
+        status = json_store.load_json(json_store.STATUS_FILE, {})
         self.assertEqual(status["status"], "CRITICAL")
         self.assertEqual(len(status["alerts"]), 1)
 
-        history = alarm_app.load_json(alarm_app.HISTORY_FILE, [])
+        history = json_store.load_json(json_store.HISTORY_FILE, [])
         self.assertEqual(len(history), 1)
         self.assertEqual(history[0]["status"], "firing")
 
@@ -234,15 +236,15 @@ class RecordAlertEventTests(unittest.TestCase):
             summary="recovered", job="blackbox", event_time=1090.0, is_now_firing=False)
         self.assertTrue(ok)
 
-        status = alarm_app.load_json(alarm_app.STATUS_FILE, {})
+        status = json_store.load_json(json_store.STATUS_FILE, {})
         self.assertEqual(status["status"], "NORMAL")
         self.assertEqual(status["alerts"], [])
 
-        history = alarm_app.load_json(alarm_app.HISTORY_FILE, [])
+        history = json_store.load_json(json_store.HISTORY_FILE, [])
         self.assertEqual(history[0]["status"], "resolved")
         self.assertEqual(history[0]["duration_seconds"], 90)
 
-        logs = alarm_app.load_json(alarm_app.LOGS_FILE, [])
+        logs = json_store.load_json(json_store.LOGS_FILE, [])
         self.assertEqual(len(logs), 2)
         self.assertEqual(logs[0]["event"], "resolved")   # newest first
         self.assertEqual(logs[0]["duration_seconds"], 90)
@@ -257,7 +259,7 @@ class RecordAlertEventTests(unittest.TestCase):
             summary="still down", job="blackbox", event_time=1010.0, is_now_firing=True)
         self.assertFalse(again)
 
-        logs = alarm_app.load_json(alarm_app.LOGS_FILE, [])
+        logs = json_store.load_json(json_store.LOGS_FILE, [])
         self.assertEqual(len(logs), 1)  # no duplicate row for the repeat notification
 
     def test_repeat_resolved_notification_is_deduped(self):
@@ -265,7 +267,7 @@ class RecordAlertEventTests(unittest.TestCase):
             name="TargetDown", severity="critical", instance="10.0.0.5",
             summary="down", job="blackbox", event_time=1000.0, is_now_firing=False)
         self.assertFalse(ok)  # was never firing — nothing to resolve
-        logs = alarm_app.load_json(alarm_app.LOGS_FILE, [])
+        logs = json_store.load_json(json_store.LOGS_FILE, [])
         self.assertEqual(logs, [])
 
 
@@ -278,12 +280,12 @@ class IncidentOccurrenceDedupTests(unittest.TestCase):
 
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
-        self._orig_files = (alarm_app.STATUS_FILE, alarm_app.HISTORY_FILE,
-                             alarm_app.HISTORY_ARCHIVE_FILE, alarm_app.LOGS_FILE)
-        alarm_app.STATUS_FILE = os.path.join(self.tmpdir, "status.json")
-        alarm_app.HISTORY_FILE = os.path.join(self.tmpdir, "history.json")
-        alarm_app.HISTORY_ARCHIVE_FILE = os.path.join(self.tmpdir, "history_archive.json")
-        alarm_app.LOGS_FILE = os.path.join(self.tmpdir, "logs.json")
+        self._orig_files = (json_store.STATUS_FILE, json_store.HISTORY_FILE,
+                             json_store.HISTORY_ARCHIVE_FILE, json_store.LOGS_FILE)
+        json_store.STATUS_FILE = os.path.join(self.tmpdir, "status.json")
+        json_store.HISTORY_FILE = os.path.join(self.tmpdir, "history.json")
+        json_store.HISTORY_ARCHIVE_FILE = os.path.join(self.tmpdir, "history_archive.json")
+        json_store.LOGS_FILE = os.path.join(self.tmpdir, "logs.json")
 
         self.db_path = os.path.join(self.tmpdir, "test.db")
         from storage import init_db
@@ -292,8 +294,8 @@ class IncidentOccurrenceDedupTests(unittest.TestCase):
         os.environ["INFRAWATCH_DB_PATH"] = self.db_path
 
     def tearDown(self):
-        (alarm_app.STATUS_FILE, alarm_app.HISTORY_FILE,
-         alarm_app.HISTORY_ARCHIVE_FILE, alarm_app.LOGS_FILE) = self._orig_files
+        (json_store.STATUS_FILE, json_store.HISTORY_FILE,
+         json_store.HISTORY_ARCHIVE_FILE, json_store.LOGS_FILE) = self._orig_files
         if self._orig_db_env is not None:
             os.environ["INFRAWATCH_DB_PATH"] = self._orig_db_env
         else:
@@ -392,12 +394,12 @@ class AcknowledgmentPersistenceTests(unittest.TestCase):
 
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
-        self._orig_files = (alarm_app.STATUS_FILE, alarm_app.HISTORY_FILE,
-                             alarm_app.HISTORY_ARCHIVE_FILE, alarm_app.LOGS_FILE)
-        alarm_app.STATUS_FILE = os.path.join(self.tmpdir, "status.json")
-        alarm_app.HISTORY_FILE = os.path.join(self.tmpdir, "history.json")
-        alarm_app.HISTORY_ARCHIVE_FILE = os.path.join(self.tmpdir, "history_archive.json")
-        alarm_app.LOGS_FILE = os.path.join(self.tmpdir, "logs.json")
+        self._orig_files = (json_store.STATUS_FILE, json_store.HISTORY_FILE,
+                             json_store.HISTORY_ARCHIVE_FILE, json_store.LOGS_FILE)
+        json_store.STATUS_FILE = os.path.join(self.tmpdir, "status.json")
+        json_store.HISTORY_FILE = os.path.join(self.tmpdir, "history.json")
+        json_store.HISTORY_ARCHIVE_FILE = os.path.join(self.tmpdir, "history_archive.json")
+        json_store.LOGS_FILE = os.path.join(self.tmpdir, "logs.json")
 
         self.db_path = os.path.join(self.tmpdir, "test.db")
         from storage import init_db
@@ -406,8 +408,8 @@ class AcknowledgmentPersistenceTests(unittest.TestCase):
         os.environ["INFRAWATCH_DB_PATH"] = self.db_path
 
     def tearDown(self):
-        (alarm_app.STATUS_FILE, alarm_app.HISTORY_FILE,
-         alarm_app.HISTORY_ARCHIVE_FILE, alarm_app.LOGS_FILE) = self._orig_files
+        (json_store.STATUS_FILE, json_store.HISTORY_FILE,
+         json_store.HISTORY_ARCHIVE_FILE, json_store.LOGS_FILE) = self._orig_files
         if self._orig_db_env is not None:
             os.environ["INFRAWATCH_DB_PATH"] = self._orig_db_env
         else:
@@ -606,12 +608,12 @@ class MaintenanceRecoveryReconciliationTests(unittest.TestCase):
 
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
-        self._orig_files = (alarm_app.STATUS_FILE, alarm_app.HISTORY_FILE,
-                             alarm_app.HISTORY_ARCHIVE_FILE, alarm_app.LOGS_FILE)
-        alarm_app.STATUS_FILE = os.path.join(self.tmpdir, "status.json")
-        alarm_app.HISTORY_FILE = os.path.join(self.tmpdir, "history.json")
-        alarm_app.HISTORY_ARCHIVE_FILE = os.path.join(self.tmpdir, "history_archive.json")
-        alarm_app.LOGS_FILE = os.path.join(self.tmpdir, "logs.json")
+        self._orig_files = (json_store.STATUS_FILE, json_store.HISTORY_FILE,
+                             json_store.HISTORY_ARCHIVE_FILE, json_store.LOGS_FILE)
+        json_store.STATUS_FILE = os.path.join(self.tmpdir, "status.json")
+        json_store.HISTORY_FILE = os.path.join(self.tmpdir, "history.json")
+        json_store.HISTORY_ARCHIVE_FILE = os.path.join(self.tmpdir, "history_archive.json")
+        json_store.LOGS_FILE = os.path.join(self.tmpdir, "logs.json")
 
         self.db_path = os.path.join(self.tmpdir, "test.db")
         from storage import init_db
@@ -631,8 +633,8 @@ class MaintenanceRecoveryReconciliationTests(unittest.TestCase):
         alarm_app._maintenance_active_prev.clear()
 
     def tearDown(self):
-        (alarm_app.STATUS_FILE, alarm_app.HISTORY_FILE,
-         alarm_app.HISTORY_ARCHIVE_FILE, alarm_app.LOGS_FILE) = self._orig_files
+        (json_store.STATUS_FILE, json_store.HISTORY_FILE,
+         json_store.HISTORY_ARCHIVE_FILE, json_store.LOGS_FILE) = self._orig_files
         if self._orig_db_env is not None:
             os.environ["INFRAWATCH_DB_PATH"] = self._orig_db_env
         else:
@@ -732,12 +734,12 @@ class TelegramSeverityGateTests(unittest.TestCase):
 
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
-        self._orig_files = (alarm_app.STATUS_FILE, alarm_app.HISTORY_FILE,
-                             alarm_app.HISTORY_ARCHIVE_FILE, alarm_app.LOGS_FILE)
-        alarm_app.STATUS_FILE = os.path.join(self.tmpdir, "status.json")
-        alarm_app.HISTORY_FILE = os.path.join(self.tmpdir, "history.json")
-        alarm_app.HISTORY_ARCHIVE_FILE = os.path.join(self.tmpdir, "history_archive.json")
-        alarm_app.LOGS_FILE = os.path.join(self.tmpdir, "logs.json")
+        self._orig_files = (json_store.STATUS_FILE, json_store.HISTORY_FILE,
+                             json_store.HISTORY_ARCHIVE_FILE, json_store.LOGS_FILE)
+        json_store.STATUS_FILE = os.path.join(self.tmpdir, "status.json")
+        json_store.HISTORY_FILE = os.path.join(self.tmpdir, "history.json")
+        json_store.HISTORY_ARCHIVE_FILE = os.path.join(self.tmpdir, "history_archive.json")
+        json_store.LOGS_FILE = os.path.join(self.tmpdir, "logs.json")
 
         self.db_path = os.path.join(self.tmpdir, "test.db")
         from storage import init_db
@@ -746,8 +748,8 @@ class TelegramSeverityGateTests(unittest.TestCase):
         os.environ["INFRAWATCH_DB_PATH"] = self.db_path
 
     def tearDown(self):
-        (alarm_app.STATUS_FILE, alarm_app.HISTORY_FILE,
-         alarm_app.HISTORY_ARCHIVE_FILE, alarm_app.LOGS_FILE) = self._orig_files
+        (json_store.STATUS_FILE, json_store.HISTORY_FILE,
+         json_store.HISTORY_ARCHIVE_FILE, json_store.LOGS_FILE) = self._orig_files
         if self._orig_db_env is not None:
             os.environ["INFRAWATCH_DB_PATH"] = self._orig_db_env
         else:
@@ -787,12 +789,12 @@ class MaintenanceModeTests(unittest.TestCase):
 
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
-        self._orig = (alarm_app.STATUS_FILE, alarm_app.HISTORY_FILE,
-                      alarm_app.HISTORY_ARCHIVE_FILE, alarm_app.LOGS_FILE)
-        alarm_app.STATUS_FILE = os.path.join(self.tmpdir, "status.json")
-        alarm_app.HISTORY_FILE = os.path.join(self.tmpdir, "history.json")
-        alarm_app.HISTORY_ARCHIVE_FILE = os.path.join(self.tmpdir, "history_archive.json")
-        alarm_app.LOGS_FILE = os.path.join(self.tmpdir, "logs.json")
+        self._orig = (json_store.STATUS_FILE, json_store.HISTORY_FILE,
+                      json_store.HISTORY_ARCHIVE_FILE, json_store.LOGS_FILE)
+        json_store.STATUS_FILE = os.path.join(self.tmpdir, "status.json")
+        json_store.HISTORY_FILE = os.path.join(self.tmpdir, "history.json")
+        json_store.HISTORY_ARCHIVE_FILE = os.path.join(self.tmpdir, "history_archive.json")
+        json_store.LOGS_FILE = os.path.join(self.tmpdir, "logs.json")
         # get_active_maintenance()/record_alert_event() read maintenance
         # windows from SQLite (MaintenanceRepository) — isolate it too.
         self.db_path = os.path.join(self.tmpdir, "test.db")
@@ -802,8 +804,8 @@ class MaintenanceModeTests(unittest.TestCase):
         os.environ["INFRAWATCH_DB_PATH"] = self.db_path
 
     def tearDown(self):
-        (alarm_app.STATUS_FILE, alarm_app.HISTORY_FILE,
-         alarm_app.HISTORY_ARCHIVE_FILE, alarm_app.LOGS_FILE) = self._orig
+        (json_store.STATUS_FILE, json_store.HISTORY_FILE,
+         json_store.HISTORY_ARCHIVE_FILE, json_store.LOGS_FILE) = self._orig
         if self._orig_db_env is not None:
             os.environ["INFRAWATCH_DB_PATH"] = self._orig_db_env
         else:
@@ -835,9 +837,9 @@ class MaintenanceModeTests(unittest.TestCase):
             name="TargetDown", severity="critical", instance="10.0.0.5",
             summary="down for maintenance", job="blackbox", event_time=now, is_now_firing=True)
         self.assertFalse(ok)
-        self.assertEqual(alarm_app.load_json(alarm_app.LOGS_FILE, []), [])
-        self.assertEqual(alarm_app.load_json(alarm_app.HISTORY_FILE, []), [])
-        status = alarm_app.load_json(alarm_app.STATUS_FILE, {"status": "NORMAL"})
+        self.assertEqual(json_store.load_json(json_store.LOGS_FILE, []), [])
+        self.assertEqual(json_store.load_json(json_store.HISTORY_FILE, []), [])
+        status = json_store.load_json(json_store.STATUS_FILE, {"status": "NORMAL"})
         self.assertEqual(status.get("status", "NORMAL"), "NORMAL")
 
     def test_firing_resumes_normally_once_window_ends(self):
@@ -848,7 +850,7 @@ class MaintenanceModeTests(unittest.TestCase):
             name="TargetDown", severity="critical", instance="10.0.0.5",
             summary="down", job="blackbox", event_time=time.time(), is_now_firing=True)
         self.assertTrue(ok)
-        self.assertEqual(len(alarm_app.load_json(alarm_app.LOGS_FILE, [])), 1)
+        self.assertEqual(len(json_store.load_json(json_store.LOGS_FILE, [])), 1)
 
 
 class HealthEndpointTests(unittest.TestCase):

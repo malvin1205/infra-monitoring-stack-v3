@@ -8,6 +8,7 @@ from unittest.mock import patch
 from concurrent.futures import ThreadPoolExecutor
 
 import app as alarm_app
+import json_store
 from app import app, record_alert_event, is_safe_endpoint_url
 from storage import (
     init_db, get_db, IncidentRepository, EventLogRepository,
@@ -30,12 +31,12 @@ class SingleSourcePersistenceTests(unittest.TestCase):
         os.environ["INFRAWATCH_DB_PATH"] = self.db_path
 
         self._orig_files = (
-            alarm_app.STATUS_FILE, alarm_app.HISTORY_FILE,
-            alarm_app.LOGS_FILE
+            json_store.STATUS_FILE, json_store.HISTORY_FILE,
+            json_store.LOGS_FILE
         )
-        alarm_app.STATUS_FILE = os.path.join(self.tmpdir, "status.json")
-        alarm_app.HISTORY_FILE = os.path.join(self.tmpdir, "history.json")
-        alarm_app.LOGS_FILE = os.path.join(self.tmpdir, "logs.json")
+        json_store.STATUS_FILE = os.path.join(self.tmpdir, "status.json")
+        json_store.HISTORY_FILE = os.path.join(self.tmpdir, "history.json")
+        json_store.LOGS_FILE = os.path.join(self.tmpdir, "logs.json")
         alarm_app._ENDPOINTS_CACHE["data"] = None
 
     def tearDown(self):
@@ -44,8 +45,8 @@ class SingleSourcePersistenceTests(unittest.TestCase):
         else:
             os.environ.pop("INFRAWATCH_DB_PATH", None)
         (
-            alarm_app.STATUS_FILE, alarm_app.HISTORY_FILE,
-            alarm_app.LOGS_FILE
+            json_store.STATUS_FILE, json_store.HISTORY_FILE,
+            json_store.LOGS_FILE
         ) = self._orig_files
         alarm_app._ENDPOINTS_CACHE["data"] = None
         shutil.rmtree(self.tmpdir, ignore_errors=True)

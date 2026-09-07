@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import patch
 
 import app as alarm_app
+import json_store
 from app import app, record_alert_event, load_json, save_json
 from conftest import TEST_API_KEY, TEST_WEBHOOK_SECRET
 
@@ -18,15 +19,15 @@ class CanonicalMonitoringStateTests(unittest.TestCase):
         self.client.environ_base = {"HTTP_X_API_KEY": TEST_API_KEY, "HTTP_X_WEBHOOK_SECRET": TEST_WEBHOOK_SECRET}
         self.tmpdir = tempfile.mkdtemp()
         self._orig = (
-            alarm_app.STATUS_FILE,
-            alarm_app.HISTORY_FILE,
-            alarm_app.HISTORY_ARCHIVE_FILE,
-            alarm_app.LOGS_FILE
+            json_store.STATUS_FILE,
+            json_store.HISTORY_FILE,
+            json_store.HISTORY_ARCHIVE_FILE,
+            json_store.LOGS_FILE
         )
-        alarm_app.STATUS_FILE = os.path.join(self.tmpdir, "status.json")
-        alarm_app.HISTORY_FILE = os.path.join(self.tmpdir, "history.json")
-        alarm_app.HISTORY_ARCHIVE_FILE = os.path.join(self.tmpdir, "history_archive.json")
-        alarm_app.LOGS_FILE = os.path.join(self.tmpdir, "logs.json")
+        json_store.STATUS_FILE = os.path.join(self.tmpdir, "status.json")
+        json_store.HISTORY_FILE = os.path.join(self.tmpdir, "history.json")
+        json_store.HISTORY_ARCHIVE_FILE = os.path.join(self.tmpdir, "history_archive.json")
+        json_store.LOGS_FILE = os.path.join(self.tmpdir, "logs.json")
         self.db_path = os.path.join(self.tmpdir, "test_infrawatch.db")
         from storage import init_db
         init_db(self.db_path)
@@ -39,10 +40,10 @@ class CanonicalMonitoringStateTests(unittest.TestCase):
         else:
             os.environ.pop("INFRAWATCH_DB_PATH", None)
         (
-            alarm_app.STATUS_FILE,
-            alarm_app.HISTORY_FILE,
-            alarm_app.HISTORY_ARCHIVE_FILE,
-            alarm_app.LOGS_FILE
+            json_store.STATUS_FILE,
+            json_store.HISTORY_FILE,
+            json_store.HISTORY_ARCHIVE_FILE,
+            json_store.LOGS_FILE
         ) = self._orig
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
@@ -259,7 +260,7 @@ class CanonicalMonitoringStateTests(unittest.TestCase):
         # Write the status.json cache too — the assertions below must pass
         # regardless of whether it is present, proving canonical state no
         # longer depends on it.
-        save_json(alarm_app.STATUS_FILE, {
+        save_json(json_store.STATUS_FILE, {
             "status": "CRITICAL",
             "alerts": [
                 {

@@ -14,6 +14,7 @@ import unittest
 from unittest.mock import patch
 
 import app as alarm_app
+import json_store
 from app import app, _extract_host, find_node_exporter_status
 from conftest import TEST_API_KEY, TEST_WEBHOOK_SECRET
 
@@ -131,12 +132,12 @@ class NodeExporterCorrelationIntegrationTests(unittest.TestCase):
         import shutil
         from storage import init_db
         self.tmpdir = tempfile.mkdtemp()
-        self._orig_files = (alarm_app.STATUS_FILE, alarm_app.HISTORY_FILE,
-                            alarm_app.HISTORY_ARCHIVE_FILE, alarm_app.LOGS_FILE)
-        alarm_app.STATUS_FILE = os.path.join(self.tmpdir, "status.json")
-        alarm_app.HISTORY_FILE = os.path.join(self.tmpdir, "history.json")
-        alarm_app.HISTORY_ARCHIVE_FILE = os.path.join(self.tmpdir, "history_archive.json")
-        alarm_app.LOGS_FILE = os.path.join(self.tmpdir, "logs.json")
+        self._orig_files = (json_store.STATUS_FILE, json_store.HISTORY_FILE,
+                            json_store.HISTORY_ARCHIVE_FILE, json_store.LOGS_FILE)
+        json_store.STATUS_FILE = os.path.join(self.tmpdir, "status.json")
+        json_store.HISTORY_FILE = os.path.join(self.tmpdir, "history.json")
+        json_store.HISTORY_ARCHIVE_FILE = os.path.join(self.tmpdir, "history_archive.json")
+        json_store.LOGS_FILE = os.path.join(self.tmpdir, "logs.json")
         self.db_path = os.path.join(self.tmpdir, "test.db")
         init_db(self.db_path)
         self._orig_db_env = os.environ.get("INFRAWATCH_DB_PATH")
@@ -148,8 +149,8 @@ class NodeExporterCorrelationIntegrationTests(unittest.TestCase):
             os.environ["INFRAWATCH_DB_PATH"] = self._orig_db_env
         else:
             os.environ.pop("INFRAWATCH_DB_PATH", None)
-        (alarm_app.STATUS_FILE, alarm_app.HISTORY_FILE,
-         alarm_app.HISTORY_ARCHIVE_FILE, alarm_app.LOGS_FILE) = self._orig_files
+        (json_store.STATUS_FILE, json_store.HISTORY_FILE,
+         json_store.HISTORY_ARCHIVE_FILE, json_store.LOGS_FILE) = self._orig_files
         self._shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def _down_target_response(self, use_node_exporter, node_exporter_map):

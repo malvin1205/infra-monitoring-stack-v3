@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import patch
 
 import app as alarm_app
+import json_store
 from app import app, _WEBHOOK_LOCK
 from conftest import TEST_API_KEY, TEST_WEBHOOK_SECRET
 
@@ -17,9 +18,9 @@ class ApiContractsTests(unittest.TestCase):
         self.client = app.test_client()
         self.client.environ_base = {"HTTP_X_API_KEY": TEST_API_KEY, "HTTP_X_WEBHOOK_SECRET": TEST_WEBHOOK_SECRET}
         self.tmpdir = tempfile.mkdtemp()
-        self._orig = (alarm_app.STATUS_FILE,)
+        self._orig = (json_store.STATUS_FILE,)
         self._orig_targets_env = os.environ.get("TARGETS_FILE")
-        alarm_app.STATUS_FILE = os.path.join(self.tmpdir, "status.json")
+        json_store.STATUS_FILE = os.path.join(self.tmpdir, "status.json")
         os.environ["TARGETS_FILE"] = os.path.join(self.tmpdir, "websites.yml")
 
         # SQLite (maintenance/dependencies/endpoints/deleted-targets/incidents)
@@ -38,7 +39,7 @@ class ApiContractsTests(unittest.TestCase):
     def tearDown(self):
         alarm_app._ENDPOINTS_CACHE["data"] = None
         alarm_app._EP_STATUS_CACHE["data"] = None
-        (alarm_app.STATUS_FILE,) = self._orig
+        (json_store.STATUS_FILE,) = self._orig
         if self._orig_targets_env is not None:
             os.environ["TARGETS_FILE"] = self._orig_targets_env
         else:

@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import patch
 
 import app as app_module
+import json_store
 from app import app, save_json
 
 
@@ -15,12 +16,12 @@ class TargetHistoryTests(unittest.TestCase):
         app.config['TESTING'] = True
         self.client = app.test_client()
         self.tmpdir = tempfile.mkdtemp()
-        self._orig_logs = app_module.LOGS_FILE
+        self._orig_logs = json_store.LOGS_FILE
         self.test_logs_file = os.path.join(self.tmpdir, "logs.json")
-        app_module.LOGS_FILE = self.test_logs_file
+        json_store.LOGS_FILE = self.test_logs_file
 
     def tearDown(self):
-        app_module.LOGS_FILE = self._orig_logs
+        json_store.LOGS_FILE = self._orig_logs
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def test_target_history_missing_target(self):

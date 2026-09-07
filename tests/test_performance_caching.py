@@ -8,6 +8,7 @@ from unittest.mock import patch, MagicMock
 from concurrent.futures import ThreadPoolExecutor
 
 import app as alarm_app
+import json_store
 from app import (
     app, fetch_prometheus_json, PROMETHEUS_CACHE, PROMETHEUS_CACHE_LOCK,
     _FETCH_LOCKS, _FAILED_CANDIDATES, _FAILED_CANDIDATES_LOCK,
@@ -22,8 +23,8 @@ class PerformanceCachingTests(unittest.TestCase):
         self.client = app.test_client()
         self.client.environ_base = {"HTTP_X_API_KEY": TEST_API_KEY, "HTTP_X_WEBHOOK_SECRET": TEST_WEBHOOK_SECRET}
         self.tmpdir = tempfile.mkdtemp()
-        self._orig = (alarm_app.STATUS_FILE,)
-        alarm_app.STATUS_FILE = os.path.join(self.tmpdir, "status.json")
+        self._orig = (json_store.STATUS_FILE,)
+        json_store.STATUS_FILE = os.path.join(self.tmpdir, "status.json")
         self.db_path = os.path.join(self.tmpdir, "test_infrawatch.db")
         self._orig_db_env = os.environ.get("INFRAWATCH_DB_PATH")
         os.environ["INFRAWATCH_DB_PATH"] = self.db_path
@@ -47,7 +48,7 @@ class PerformanceCachingTests(unittest.TestCase):
             os.environ["INFRAWATCH_DB_PATH"] = self._orig_db_env
         else:
             os.environ.pop("INFRAWATCH_DB_PATH", None)
-        (alarm_app.STATUS_FILE,) = self._orig
+        (json_store.STATUS_FILE,) = self._orig
         shutil.rmtree(self.tmpdir, ignore_errors=True)
         with PROMETHEUS_CACHE_LOCK:
             PROMETHEUS_CACHE.clear()
@@ -205,7 +206,7 @@ class PerformanceCachingTests(unittest.TestCase):
         # disagree, which isn't what this test means to exercise (a genuine
         # cache *hit*). Freeze time so both calls fall in the same bucket.
         with patch.object(alarm_app, 'get_monitored_instances', return_value=['srv-cache-1']), \
-             patch.object(alarm_app, 'load_json', return_value=[]), \
+             patch.object(json_store, 'load_json', return_value=[]), \
              patch.object(alarm_app, 'fetch_prom_query_map', side_effect=fake_query_map), \
              patch('app.time.time', return_value=time.time()):
 
@@ -238,7 +239,7 @@ class PerformanceCachingTests(unittest.TestCase):
             return {'srv-sf-1': '100.0', 'srv-sf-2': '90.0'}
 
         with patch.object(alarm_app, 'get_monitored_instances', return_value=['srv-sf-1', 'srv-sf-2']), \
-             patch.object(alarm_app, 'load_json', return_value=[]), \
+             patch.object(json_store, 'load_json', return_value=[]), \
              patch.object(alarm_app, 'fetch_prom_query_map', side_effect=fake_query_map):
 
             def make_avail_call(_):
@@ -273,7 +274,7 @@ class PerformanceCachingTests(unittest.TestCase):
             return {'srv-warm': '99.0'}
 
         with patch.object(alarm_app, 'get_monitored_instances', return_value=['srv-warm']), \
-             patch.object(alarm_app, 'load_json', return_value=[]), \
+             patch.object(json_store, 'load_json', return_value=[]), \
              patch.object(alarm_app, 'fetch_prom_query_map', side_effect=fake_query_map):
 
             # 1. 24h initial load (cold start -> Prometheus queries -> materialized to SQLite)
@@ -339,7 +340,7 @@ class PerformanceCachingTests(unittest.TestCase):
             return {}
 
         with patch.object(alarm_app, 'get_monitored_instances', return_value=['srv-perfect', 'srv-partial', 'srv-down']), \
-             patch.object(alarm_app, 'load_json', return_value=[]), \
+             patch.object(json_store, 'load_json', return_value=[]), \
              patch.object(alarm_app, 'fetch_prom_query_map', side_effect=fake_query_map):
 
             res = self.client.get('/api/availability?minutes=60')
