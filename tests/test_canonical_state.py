@@ -57,7 +57,7 @@ class CanonicalMonitoringStateTests(unittest.TestCase):
                 ]
             }
         }
-        with patch.object(alarm_app, 'fetch_prometheus_json', return_value=(raw_targets, 'http://prom:9090')), \
+        with patch('prometheus_client.fetch_prometheus_json', return_value=(raw_targets, 'http://prom:9090')), \
              patch.object(alarm_app, 'fetch_all_probe_metrics', return_value=({"host-1": "0"}, {"host-1": "0.05"}, {"host-1": "500"})), \
              patch.object(alarm_app, 'fetch_down_since_prom_map', return_value={"host-1": time.time() - 120}), \
              patch.object(alarm_app, 'load_website_targets', return_value=[]):
@@ -106,7 +106,7 @@ class CanonicalMonitoringStateTests(unittest.TestCase):
         res_hook = self.client.post('/webhook', json=payload)
         self.assertEqual(res_hook.status_code, 200)
 
-        with patch.object(alarm_app, 'fetch_prometheus_json', return_value=(raw_targets, 'http://prom:9090')), \
+        with patch('prometheus_client.fetch_prometheus_json', return_value=(raw_targets, 'http://prom:9090')), \
              patch.object(alarm_app, 'fetch_all_probe_metrics', return_value=({"node-db-01": "1"}, {"node-db-01": "0.01"}, {})), \
              patch.object(alarm_app, 'fetch_down_since_prom_map', return_value={}), \
              patch.object(alarm_app, 'load_website_targets', return_value=[]):
@@ -160,7 +160,7 @@ class CanonicalMonitoringStateTests(unittest.TestCase):
             }]
         })
 
-        with patch.object(alarm_app, 'fetch_prometheus_json', return_value=(raw_targets, 'http://prom:9090')), \
+        with patch('prometheus_client.fetch_prometheus_json', return_value=(raw_targets, 'http://prom:9090')), \
              patch.object(alarm_app, 'fetch_all_probe_metrics', return_value=({"node-db-01": "1"}, {}, {})), \
              patch.object(alarm_app, 'fetch_down_since_prom_map', return_value={}), \
              patch.object(alarm_app, 'load_website_targets', return_value=[]):
@@ -190,7 +190,7 @@ class CanonicalMonitoringStateTests(unittest.TestCase):
             start=now - 3600, end=now + 3600
         )
 
-        with patch.object(alarm_app, 'fetch_prometheus_json', return_value=(raw_targets, 'http://prom:9090')), \
+        with patch('prometheus_client.fetch_prometheus_json', return_value=(raw_targets, 'http://prom:9090')), \
              patch.object(alarm_app, 'fetch_all_probe_metrics', return_value=({"maint-host": "0"}, {}, {})), \
              patch.object(alarm_app, 'fetch_down_since_prom_map', return_value={"maint-host": now - 600}), \
              patch.object(alarm_app, 'load_website_targets', return_value=[]):
@@ -221,7 +221,7 @@ class CanonicalMonitoringStateTests(unittest.TestCase):
         from storage import DependencyRepository
         DependencyRepository.create_dependency(parent="router-core", child="switch-leaf")
 
-        with patch.object(alarm_app, 'fetch_prometheus_json', return_value=(raw_targets, 'http://prom:9090')), \
+        with patch('prometheus_client.fetch_prometheus_json', return_value=(raw_targets, 'http://prom:9090')), \
              patch.object(alarm_app, 'fetch_all_probe_metrics', return_value=({"router-core": "0", "switch-leaf": "0"}, {}, {})), \
              patch.object(alarm_app, 'fetch_down_since_prom_map', return_value={}), \
              patch.object(alarm_app, 'load_website_targets', return_value=[]):
@@ -284,7 +284,7 @@ class CanonicalMonitoringStateTests(unittest.TestCase):
             }
         }
 
-        with patch.object(alarm_app, 'fetch_prometheus_json', return_value=(raw_targets, 'http://prom:9090')), \
+        with patch('prometheus_client.fetch_prometheus_json', return_value=(raw_targets, 'http://prom:9090')), \
              patch.object(alarm_app, 'fetch_all_probe_metrics', return_value=({"server-prod-01": "0"}, {}, {})), \
              patch.object(alarm_app, 'fetch_down_since_prom_map', return_value={"server-prod-01": now - 300}), \
              patch.object(alarm_app, 'load_website_targets', return_value=[]):
@@ -315,7 +315,7 @@ class CanonicalMonitoringStateTests(unittest.TestCase):
                 ]
             }
         }
-        with patch.object(alarm_app, 'fetch_prometheus_json', return_value=(raw_targets, 'http://prom:9090')), \
+        with patch('prometheus_client.fetch_prometheus_json', return_value=(raw_targets, 'http://prom:9090')), \
              patch.object(alarm_app, 'fetch_all_probe_metrics', return_value=({"server-hybrid": "0"}, {}, {})), \
              patch.object(alarm_app, 'fetch_down_since_prom_map', return_value={}), \
              patch.object(alarm_app, 'load_website_targets', return_value=[]):
@@ -344,7 +344,7 @@ class CanonicalMonitoringStateTests(unittest.TestCase):
             res = self.client.post('/webhook', json=payload)
             self.assertEqual(res.status_code, 200)
 
-        with patch.object(alarm_app, 'fetch_prometheus_json', return_value=({"status": "success", "data": {"activeTargets": []}}, 'http://prom:9090')), \
+        with patch('prometheus_client.fetch_prometheus_json', return_value=({"status": "success", "data": {"activeTargets": []}}, 'http://prom:9090')), \
              patch.object(alarm_app, 'fetch_all_probe_metrics', return_value=({}, {}, {})), \
              patch.object(alarm_app, 'fetch_down_since_prom_map', return_value={}), \
              patch.object(alarm_app, 'load_website_targets', return_value=[]):
@@ -367,7 +367,7 @@ class CanonicalMonitoringStateTests(unittest.TestCase):
                 ]
             }
         }
-        with patch.object(alarm_app, 'fetch_prometheus_json', return_value=(raw_targets, 'http://prom:9090')), \
+        with patch('prometheus_client.fetch_prometheus_json', return_value=(raw_targets, 'http://prom:9090')), \
              patch.object(alarm_app, 'fetch_all_probe_metrics', return_value=({"host-recovered": "1"}, {"host-recovered": "0.012"}, {"host-recovered": "200"})), \
              patch.object(alarm_app, 'fetch_down_since_prom_map', return_value={}), \
              patch.object(alarm_app, 'load_website_targets', return_value=[]):
@@ -394,7 +394,7 @@ class CanonicalMonitoringStateTests(unittest.TestCase):
             ]},
         }
         common = [
-            patch.object(alarm_app, 'fetch_prometheus_json', return_value=(raw_targets, 'http://prom:9090')),
+            patch('prometheus_client.fetch_prometheus_json', return_value=(raw_targets, 'http://prom:9090')),
             patch.object(alarm_app, 'fetch_all_probe_metrics', return_value=({"blip-1": "0"}, {"blip-1": "0.05"}, {"blip-1": "0"})),
             patch.object(alarm_app, 'load_website_targets', return_value=[]),
         ]
@@ -441,7 +441,7 @@ class CanonicalMonitoringStateTests(unittest.TestCase):
         self.assertIn("host-a", storage.AcknowledgmentRepository.get_active_acknowledgments())
         self.assertIn("host-b", storage.AcknowledgmentRepository.get_active_acknowledgments())
 
-        with patch.object(alarm_app, 'fetch_prometheus_json', return_value=(raw_targets, 'http://prom:9090')), \
+        with patch('prometheus_client.fetch_prometheus_json', return_value=(raw_targets, 'http://prom:9090')), \
              patch.object(alarm_app, 'fetch_all_probe_metrics', return_value=({"host-a": "0", "host-b": "0"}, {}, {})), \
              patch.object(alarm_app, 'fetch_down_since_prom_map', return_value={}), \
              patch.object(alarm_app, 'load_website_targets', return_value=[]):
@@ -461,7 +461,7 @@ class CanonicalMonitoringStateTests(unittest.TestCase):
         'Down' + Critical on every startup was this being treated as an
         outage with a fail-open (downSince=0) grace check."""
         empty_prom = {"status": "success", "data": {"activeTargets": []}}
-        with patch.object(alarm_app, 'fetch_prometheus_json', return_value=(empty_prom, 'http://prom:9090')), \
+        with patch('prometheus_client.fetch_prometheus_json', return_value=(empty_prom, 'http://prom:9090')), \
              patch.object(alarm_app, 'fetch_all_probe_metrics', return_value=({}, {}, {})), \
              patch.object(alarm_app, 'fetch_down_since_prom_map', return_value={}), \
              patch.object(alarm_app, 'load_website_targets', return_value=["10.0.0.88:9100"]):

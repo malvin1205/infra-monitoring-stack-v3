@@ -114,6 +114,11 @@ try:
         _cached_is_safe_endpoint_url, _filter_safe_candidates,
         fetch_url, fetch_prometheus_json,
     )
+    import prom_queries
+    from prom_queries import (
+        fetch_prom_query_map, fetch_prom_range_map,
+        fetch_down_since_prom_map, fetch_all_probe_metrics,
+    )
 except ImportError:
     from alarm.config import (
         DEFAULT_JOB_FILTER, ALERTNAME_TARGET_DOWN, ALERTNAME_SLOW_RESPONSE,
@@ -157,6 +162,11 @@ except ImportError:
         _maybe_prune_cache, _SAFE_CANDIDATE_CACHE,
         _cached_is_safe_endpoint_url, _filter_safe_candidates,
         fetch_url, fetch_prometheus_json,
+    )
+    from alarm import prom_queries
+    from alarm.prom_queries import (
+        fetch_prom_query_map, fetch_prom_range_map,
+        fetch_down_since_prom_map, fetch_all_probe_metrics,
     )
 
 init_db()
@@ -1044,7 +1054,7 @@ def get_endpoints_api():
         return jsonify(_EP_STATUS_CACHE["data"])
 
     def check_ep(ep):
-        raw = fetch_url(f"{ep.rstrip('/')}/api/v1/status/flags", timeout=0.25)
+        raw = promclient.fetch_url(f"{ep.rstrip('/')}/api/v1/status/flags", timeout=0.25)
         return {
             "url": ep,
             "active": ep == active,
@@ -1195,7 +1205,7 @@ def delete_endpoint_api():
 # derive available_jobs inline); kept as a manual debugging endpoint.
 @app.route('/api/jobs', methods=['GET'])
 def get_jobs_api():
-    raw_targets, _ = fetch_prometheus_json('/api/v1/targets')
+    raw_targets, _ = promclient.fetch_prometheus_json('/api/v1/targets')
     jobs = set()
     if raw_targets and raw_targets.get('status') == 'success':
         for t in raw_targets.get('data', {}).get('activeTargets', []):
@@ -1208,7 +1218,7 @@ def get_jobs_api():
 @app.route('/api/prometheus-targets', methods=['GET'])
 def get_prometheus_available_targets():
     job_param = request.args.get('job', DEFAULT_JOB_FILTER)
-    raw_targets, _ = fetch_prometheus_json('/api/v1/targets')
+    raw_targets, _ = promclient.fetch_prometheus_json('/api/v1/targets')
     config_web_targets = load_website_targets()
     deleted_targets = set(load_deleted_targets())
     
@@ -1251,7 +1261,7 @@ def _prometheus_discovered_instances():
     # (the dashboard polls /api/v1/targets continuously); when it isn't, a
     # missing warning is no worse than the pre-existing behavior, so don't
     # make the operator wait on a slow/dead Prometheus.
-    raw, _ = fetch_prometheus_json('/api/v1/targets', use_cache=True, cache_ttl=10.0, timeout=0.8)
+    raw, _ = promclient.fetch_prometheus_json('/api/v1/targets', use_cache=True, cache_ttl=10.0, timeout=0.8)
     if not raw or raw.get('status') != 'success':
         return set()
     out = set()
@@ -1755,116 +1765,10 @@ def save_availability_settings_api():
         return jsonify({"ok": True, "message": "Availability settings saved"})
     return jsonify({"ok": False, "error": "Failed to save settings"}), 500
 
-def fetch_prom_query_map(query_expr, cache_ttl=5.0, timeout=None):
-    raw, base = fetch_prometheus_json(f"/api/v1/query?query={quote(query_expr)}", use_cache=True, cache_ttl=cache_ttl, timeout=timeout)
-    val_map = {}
-    if raw and raw.get('status') == 'success':
-        results = raw.get('data', {}).get('result', [])
-        for r in results:
-            labels = r.get('metric', {})
-            inst = labels.get('instance') or labels.get('target') or labels.get('url')
-            val = r.get('value', [None, None])[1]
-            if inst and val is not None:
-                val_map[inst] = val
-    return val_map
-
-
-def fetch_prom_range_map(query_expr, start_ts, end_ts, step_sec, cache_ttl=5.0, timeout=None):
-    """Range query -> {instance: [(ts_float, 0|1), ...]} sorted by ts.
-
-    Used by the availability aggregator to feed raw probe samples straight
-    into reconstruct_time_series_intervals() (the exact engine) instead of
-    approximating from avg_over_time(). Values are coerced to 0/1 the same
-    way reconstruct_time_series_intervals does. Returns {} on any failure so
-    callers can fall back to the scalar path per-instance.
-    """
-    step = max(1, int(round(step_sec)))
-    path = (
-        f"/api/v1/query_range?query={quote(query_expr)}"
-        f"&start={int(start_ts)}&end={int(end_ts)}&step={step}"
-    )
-    raw, _ = fetch_prometheus_json(path, use_cache=True, cache_ttl=cache_ttl, timeout=timeout)
-    series = {}
-    if not raw or raw.get('status') != 'success':
-        return series
-    for r in raw.get('data', {}).get('result', []):
-        labels = r.get('metric', {})
-        inst = labels.get('instance') or labels.get('target') or labels.get('url')
-        if not inst:
-            continue
-        pts = []
-        for pair in r.get('values', []):
-            try:
-                ts = float(pair[0])
-                v = 1 if str(pair[1]) in ('1', '1.0', 'up', 'true', 'True') else 0
-                pts.append((ts, v))
-            except (ValueError, TypeError, IndexError):
-                continue
-        if pts:
-            pts.sort(key=lambda p: p[0])
-            series[inst] = pts
-    return series
-
-def fetch_down_since_prom_map(cache_ttl=10.0):
-    last_up_map = {}
-
-    # 1. PromQL query for exact last UP timestamp for targets that were previously UP
-    query_up = 'max_over_time(timestamp(probe_success == 1)[1d:15s])'
-    raw_up, _ = fetch_prometheus_json(f"/api/v1/query?query={quote(query_up)}", use_cache=True, cache_ttl=cache_ttl)
-    if not raw_up or not raw_up.get('data', {}).get('result'):
-        query_up = 'max_over_time(timestamp(up == 1)[1d:15s])'
-        raw_up, _ = fetch_prometheus_json(f"/api/v1/query?query={quote(query_up)}", use_cache=True, cache_ttl=cache_ttl)
-
-    if raw_up and raw_up.get('status') == 'success':
-        for r in raw_up.get('data', {}).get('result', []):
-            metric = r.get('metric', {})
-            inst = metric.get('instance') or metric.get('target') or metric.get('url')
-            val = r.get('value', [None, None])[1]
-            if inst and val is not None:
-                try:
-                    last_up_map[inst] = float(val)
-                except ValueError:
-                    pass
-
-    # 2. Initial DOWN timestamp for targets continuously DOWN (no `== 1` sample
-    #    in the query-1 window). Range widened to 32d so an outage older than a
-    #    day is no longer clamped to "~24h ago" — it now reads its real age up
-    #    to a month back. 15m step keeps the point count bounded (~3k); the
-    #    outage-start estimate is then accurate to ±15m, which is immaterial for
-    #    a multi-day outage. Falls back to `up == 0` the same way query 1 does.
-    query_down = 'min_over_time(timestamp(probe_success == 0)[32d:15m])'
-    raw_down, _ = fetch_prometheus_json(f"/api/v1/query?query={quote(query_down)}", use_cache=True, cache_ttl=cache_ttl)
-    if not raw_down or not raw_down.get('data', {}).get('result'):
-        query_down = 'min_over_time(timestamp(up == 0)[32d:15m])'
-        raw_down, _ = fetch_prometheus_json(f"/api/v1/query?query={quote(query_down)}", use_cache=True, cache_ttl=cache_ttl)
-    if raw_down and raw_down.get('status') == 'success':
-        for r in raw_down.get('data', {}).get('result', []):
-            metric = r.get('metric', {})
-            inst = metric.get('instance') or metric.get('target') or metric.get('url')
-            val = r.get('value', [None, None])[1]
-            if inst and val is not None and inst not in last_up_map:
-                try:
-                    last_up_map[inst] = float(val)
-                except ValueError:
-                    pass
-
-    return last_up_map
-
-
-def fetch_all_probe_metrics(cache_ttl=3.0, timeout=None):
-    f_succ = _SHARED_EXECUTOR.submit(fetch_prom_query_map, "probe_success", cache_ttl, timeout)
-    f_dur = _SHARED_EXECUTOR.submit(fetch_prom_query_map, "probe_duration_seconds", cache_ttl, timeout)
-    f_code = _SHARED_EXECUTOR.submit(fetch_prom_query_map, "probe_http_status_code", cache_ttl, timeout)
-
-    success_map = f_succ.result()
-    duration_map = f_dur.result()
-    status_code_map = f_code.result()
-
-    if not success_map:
-        success_map = fetch_prom_query_map("up", cache_ttl=cache_ttl, timeout=timeout)
-
-    return success_map, duration_map, status_code_map
-
+# fetch_prom_query_map / fetch_prom_range_map / fetch_down_since_prom_map /
+# fetch_all_probe_metrics — Prometheus response adapters — live in
+# prom_queries.py (re-imported above; callers use bare names so
+# patch.object(alarm_app, 'fetch_all_probe_metrics', ...) still works).
 
 # ── Canonical Monitoring State Engine ───────────────────────────────────────
 def _derive_probe_readings(keys, probe_success_map, probe_duration_map, probe_status_code_map,
@@ -1955,7 +1859,7 @@ def build_canonical_monitoring_state(job_param=None):
     if job_param is None:
         job_param = DEFAULT_JOB_FILTER
 
-    f_targets = _SHARED_EXECUTOR.submit(fetch_prometheus_json, '/api/v1/targets', True, 3.0)
+    f_targets = _SHARED_EXECUTOR.submit(promclient.fetch_prometheus_json, '/api/v1/targets', True, 3.0)
     f_metrics = _SHARED_EXECUTOR.submit(fetch_all_probe_metrics, 3.0)
 
     raw_targets, active_base = f_targets.result()
@@ -2340,7 +2244,7 @@ def get_instance_job_map(job_filter=None):
     instead of a hardcoded guess."""
     if job_filter is None:
         job_filter = DEFAULT_JOB_FILTER
-    raw_targets, _ = fetch_prometheus_json('/api/v1/targets', use_cache=True, cache_ttl=3.0)
+    raw_targets, _ = promclient.fetch_prometheus_json('/api/v1/targets', use_cache=True, cache_ttl=3.0)
     config_web_targets = load_website_targets()
     deleted_targets = set(load_deleted_targets())
 
@@ -2384,7 +2288,7 @@ def get_instance_cadence_map(job_filter=None):
     """
     if job_filter is None:
         job_filter = DEFAULT_JOB_FILTER
-    raw_targets, _ = fetch_prometheus_json('/api/v1/targets', use_cache=True, cache_ttl=3.0)
+    raw_targets, _ = promclient.fetch_prometheus_json('/api/v1/targets', use_cache=True, cache_ttl=3.0)
     deleted_targets = set(load_deleted_targets())
 
     cadence_map = {}
@@ -3178,7 +3082,7 @@ def target_history_api():
     values = []
     for q in candidate_queries:
         path = f"/api/v1/query_range?query={quote(q)}&start={start_ts}&end={end_ts}&step={step}"
-        raw, base = fetch_prometheus_json(path)
+        raw, base = promclient.fetch_prometheus_json(path)
         if raw and raw.get('status') == 'success':
             results = raw.get('data', {}).get('result', [])
             for r in results:
@@ -3363,7 +3267,7 @@ def target_history_api():
     ]
     for dq in dur_queries:
         dur_path = f"/api/v1/query_range?query={quote(dq)}&start={start_ts}&end={end_ts}&step={dur_step}"
-        raw_dur, _ = fetch_prometheus_json(dur_path)
+        raw_dur, _ = promclient.fetch_prometheus_json(dur_path)
         if raw_dur and raw_dur.get('status') == 'success':
             for r in raw_dur.get('data', {}).get('result', []):
                 metric = r.get('metric', {})
@@ -3427,7 +3331,7 @@ def health():
     Returns HTTP 503 only if local storage is unwritable."""
     now = time.time()
 
-    raw, prom_base = fetch_prometheus_json('/api/v1/targets', use_cache=True)
+    raw, prom_base = promclient.fetch_prometheus_json('/api/v1/targets', use_cache=True)
     prometheus_ok = raw is not None and raw.get('status') == 'success'
 
     storage_ok = all(

@@ -97,7 +97,7 @@ class ApiContractsTests(unittest.TestCase):
         EndpointRepository.create_endpoint("prom-2", "http://prom-2:9090", is_active=False, db_path=self.db_path)
 
         # GET endpoints
-        with patch('app.fetch_url', return_value='{}'):
+        with patch('prometheus_client.fetch_url', return_value='{}'):
             res = self.client.get('/api/endpoints')
             self.assertEqual(res.status_code, 200)
             data = json.loads(res.data)
@@ -219,7 +219,7 @@ class ApiContractsTests(unittest.TestCase):
         self.assertFalse(json.loads(res.data)['ok'])
 
         # Valid target parameter with mocked empty Prometheus
-        with patch('app.fetch_prometheus_json', return_value=({"status": "success", "data": {"result": []}}, "http://prom:9090")):
+        with patch('prometheus_client.fetch_prometheus_json', return_value=({"status": "success", "data": {"result": []}}, "http://prom:9090")):
             res = self.client.get('/api/target-history?target=srv-node-1&minutes=60')
             self.assertEqual(res.status_code, 200)
             data = json.loads(res.data)
@@ -241,7 +241,7 @@ class ApiContractsTests(unittest.TestCase):
         self.assertEqual(json.loads(res.data)['status'], 'ready')
 
         # /health
-        with patch('app.fetch_prometheus_json', return_value=({"status": "success"}, "http://prom:9090")):
+        with patch('prometheus_client.fetch_prometheus_json', return_value=({"status": "success"}, "http://prom:9090")):
             res = self.client.get('/health')
             self.assertEqual(res.status_code, 200)
             data = json.loads(res.data)
@@ -254,7 +254,7 @@ class ApiContractsTests(unittest.TestCase):
     # ── 7. Jobs & Discovered Targets Diagnostics ─────────────────────────────
     def test_jobs_and_discovered_targets_contracts(self):
         # /api/jobs
-        with patch('app.fetch_prometheus_json', return_value=({
+        with patch('prometheus_client.fetch_prometheus_json', return_value=({
             "status": "success",
             "data": {"activeTargets": [{"labels": {"job": "node_exporter"}}]}
         }, "http://prom:9090")):
@@ -265,7 +265,7 @@ class ApiContractsTests(unittest.TestCase):
             self.assertIn("node_exporter", data['jobs'])
 
         # /api/prometheus-targets
-        with patch('app.fetch_prometheus_json', return_value=({
+        with patch('prometheus_client.fetch_prometheus_json', return_value=({
             "status": "success",
             "data": {"activeTargets": [{"labels": {"instance": "10.0.0.1:9100", "job": "node"}}]}
         }, "http://prom:9090")):

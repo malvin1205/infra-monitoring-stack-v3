@@ -162,7 +162,7 @@ class NodeExporterCorrelationIntegrationTests(unittest.TestCase):
                 ]
             }
         }
-        with patch.object(alarm_app, 'fetch_prometheus_json', return_value=(raw_targets, 'http://prom:9090')), \
+        with patch('prometheus_client.fetch_prometheus_json', return_value=(raw_targets, 'http://prom:9090')), \
              patch.object(alarm_app, 'fetch_all_probe_metrics', return_value=({"91.239.100.100": "0"}, {"91.239.100.100": "0.05"}, {"91.239.100.100": "500"})), \
              patch.object(alarm_app, 'fetch_down_since_prom_map', return_value={"91.239.100.100": time.time() - 120}), \
              patch.object(alarm_app, 'fetch_prom_query_map', return_value=node_exporter_map), \
@@ -224,7 +224,7 @@ class NodeExporterCorrelationIntegrationTests(unittest.TestCase):
                 ]
             }
         }
-        with patch.object(alarm_app, 'fetch_prometheus_json', return_value=(raw_targets, 'http://prom:9090')), \
+        with patch('prometheus_client.fetch_prometheus_json', return_value=(raw_targets, 'http://prom:9090')), \
              patch.object(alarm_app, 'fetch_all_probe_metrics', return_value=({"91.239.100.100": "1"}, {"91.239.100.100": "0.02"}, {"91.239.100.100": "200"})), \
              patch.object(alarm_app, 'get_availability_settings', return_value={"use_node_exporter_correlation": True}), \
              patch.object(alarm_app, 'load_website_targets', return_value=[]):

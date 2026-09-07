@@ -99,7 +99,7 @@ class AddTargetApiTests(unittest.TestCase):
         with alarm_app._WEBSITE_TARGETS_CACHE_LOCK:
             alarm_app._WEBSITE_TARGETS_CACHE["key"] = None
             alarm_app._WEBSITE_TARGETS_CACHE["data"] = None
-        self._p = patch.object(alarm_app, "fetch_prometheus_json", return_value=(None, None))
+        self._p = patch('prometheus_client.fetch_prometheus_json', return_value=(None, None))
         self._p.start()
 
     def tearDown(self):

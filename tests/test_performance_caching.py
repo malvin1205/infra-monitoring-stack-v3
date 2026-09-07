@@ -166,7 +166,7 @@ class PerformanceCachingTests(unittest.TestCase):
                 return {"status": "success", "data": {"result": []}}, "http://prom:9090"
             return None, None
 
-        with patch('app.fetch_prometheus_json', side_effect=fake_fetch), \
+        with patch('prometheus_client.fetch_prometheus_json', side_effect=fake_fetch), \
              patch('app.load_website_targets', return_value=[]):
 
             state = build_canonical_monitoring_state("all")
@@ -178,7 +178,7 @@ class PerformanceCachingTests(unittest.TestCase):
 
     def test_prometheus_unavailable_graceful_degradation(self):
         """When Prometheus is completely unreachable, /instances returns 503 with structured CRITICAL payload."""
-        with patch('app.fetch_prometheus_json', return_value=(None, None)), \
+        with patch('prometheus_client.fetch_prometheus_json', return_value=(None, None)), \
              patch('app.load_website_targets', return_value=[]):
 
             res = self.client.get('/instances')
