@@ -12,9 +12,11 @@ os.environ["DISABLE_ALERT_POLLER"] = "1"  # don't spin up the live network polle
 try:
     import app as alarm_app
     import json_store
+    import alerts
 except ImportError:
     from alarm import app as alarm_app
     from alarm import json_store
+    from alarm import alerts
 
 from conftest import TEST_API_KEY, TEST_WEBHOOK_SECRET
 
@@ -663,7 +665,7 @@ class MaintenanceRecoveryReconciliationTests(unittest.TestCase):
 
         with patch.object(alarm_app, 'get_monitored_instances', return_value=["10.0.0.5"]), \
              patch.object(alarm_app, 'fetch_all_probe_metrics', return_value=({"10.0.0.5": "1"}, {}, {})), \
-             patch.object(alarm_app, 'load_maintenance_windows', return_value=[]):
+             patch('alerts.load_maintenance_windows', return_value=[]):
             alarm_app._poll_targets_once()  # maintenance window has now ended
 
         active = IncidentRepository.get_active_incidents(db_path=self.db_path)
@@ -683,7 +685,7 @@ class MaintenanceRecoveryReconciliationTests(unittest.TestCase):
 
         with patch.object(alarm_app, 'get_monitored_instances', return_value=["10.0.0.6"]), \
              patch.object(alarm_app, 'fetch_all_probe_metrics', return_value=({"10.0.0.6": "0"}, {}, {})), \
-             patch.object(alarm_app, 'load_maintenance_windows', return_value=[]), \
+             patch('alerts.load_maintenance_windows', return_value=[]), \
              patch.object(alarm_app, 'fetch_down_since_prom_map', return_value={"10.0.0.6": 0.0}):
             alarm_app._poll_targets_once()
 
@@ -708,7 +710,7 @@ class MaintenanceRecoveryReconciliationTests(unittest.TestCase):
         # 50ms — comfortably under the 500ms default threshold ("fast").
         with patch.object(alarm_app, 'get_monitored_instances', return_value=["10.0.0.7"]), \
              patch.object(alarm_app, 'fetch_all_probe_metrics', return_value=({"10.0.0.7": "1"}, {"10.0.0.7": 0.05}, {})), \
-             patch.object(alarm_app, 'load_maintenance_windows', return_value=[]):
+             patch('alerts.load_maintenance_windows', return_value=[]):
             alarm_app._poll_targets_once()  # maintenance ends; tick #1 fast
             self.assertEqual(len(IncidentRepository.get_active_incidents(db_path=self.db_path)), 1,
                               "must not resolve on the very first fast sample")
@@ -759,14 +761,14 @@ class TelegramSeverityGateTests(unittest.TestCase):
     def test_warning_severity_still_reaches_dispatch_alert_async(self):
         # Whether it actually SENDS is telegram_notifier's call (min_severity),
         # not record_alert_event's — it must not be filtered out this early.
-        with patch.object(alarm_app, 'dispatch_alert_async') as mock_dispatch:
+        with patch('alerts.dispatch_alert_async') as mock_dispatch:
             alarm_app.record_alert_event(
                 name="SlowResponse", severity="warning", instance="10.0.0.8",
                 summary="degraded", job="blackbox", event_time=1000.0, is_now_firing=True)
             mock_dispatch.assert_called_once()
 
     def test_critical_severity_still_dispatches_telegram(self):
-        with patch.object(alarm_app, 'dispatch_alert_async') as mock_dispatch:
+        with patch('alerts.dispatch_alert_async') as mock_dispatch:
             alarm_app.record_alert_event(
                 name="TargetDown", severity="critical", instance="10.0.0.9",
                 summary="down", job="blackbox", event_time=1000.0, is_now_firing=True)
