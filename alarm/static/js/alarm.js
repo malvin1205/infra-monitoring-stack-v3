@@ -13,6 +13,28 @@
 
 const JOB_DEFAULT_LS_KEY = 'infrawatch.defaultJob';
 
+// Default Job is per Prometheus endpoint — switching endpoints must land on
+// the NEW endpoint's own saved default (or "All Jobs"), never carry the old
+// one over. Stored as { "<endpoint-url>": "<job>" }. A legacy bare-string
+// value (the single global default from before this was per-endpoint) is not
+// valid JSON, so it reads back as {} and the user re-sets once per endpoint.
+function _loadJobDefaults() {
+  try {
+    const val = JSON.parse(localStorage.getItem(JOB_DEFAULT_LS_KEY) || '{}');
+    return (val && typeof val === 'object') ? val : {};
+  } catch (e) { return {}; }
+}
+function getDefaultJob(endpointUrl) {
+  return endpointUrl ? (_loadJobDefaults()[endpointUrl] || null) : null;
+}
+function setDefaultJob(endpointUrl, job) {
+  if (!endpointUrl) return;
+  const map = _loadJobDefaults();
+  if (job && job !== 'all') map[endpointUrl] = job;
+  else delete map[endpointUrl];
+  try { localStorage.setItem(JOB_DEFAULT_LS_KEY, JSON.stringify(map)); } catch (e) { }
+}
+
 function escapeHtml(str) {
   return String(str ?? '').replace(/[&<>"']/g, c => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
@@ -309,11 +331,13 @@ class InstancesPage {
     this.activeStatus = 'all';   // 'all' | 'up' | 'down' | 'slow'
     this.activeSort = 'default';  // 'default' | 'name_asc' | 'name_desc' | 'job_asc' | 'job_desc' | 'latency_desc' | 'latency_asc'
     this.selectedJob = 'all';     // 'all' or specific job string
-    this._defaultJobRestored = false; // guards one-time startup restore of infrawatch.defaultJob
+    this._activeEndpoint = null;  // current Prometheus URL — set by initEndpointManager; keys the per-endpoint Default Job
+    this._defaultJobRestored = false; // guards the restore of this endpoint's Default Job; re-armed on every endpoint switch
     this.searchQ = '';
     this.selectedTarget = null;
     this.isAcknowledged = false;
     this.acknowledgedDownInstances = new Set();
+    this._spotlightedInstances = new Set();
 
     this.table = document.getElementById('instancesBody');
     this.countBadge = document.getElementById('instanceCount');
@@ -2749,7 +2773,7 @@ class InstancesPage {
     if (setCheckbox) {
       setCheckbox.addEventListener('change', () => {
         if (!setCheckbox.checked) return; // clearing the default only happens via Reset
-        try { localStorage.setItem(JOB_DEFAULT_LS_KEY, this.selectedJob); } catch (e) { }
+        setDefaultJob(this._activeEndpoint, this.selectedJob);
         this._triggerEventToast('Default Job saved.');
         this._updateJobDefaultUI();
         this._closeJobDefaultPopover();
@@ -2758,7 +2782,7 @@ class InstancesPage {
 
     if (resetBtn) {
       resetBtn.addEventListener('click', () => {
-        try { localStorage.removeItem(JOB_DEFAULT_LS_KEY); } catch (e) { }
+        setDefaultJob(this._activeEndpoint, null);
         if (jobSelect.value !== 'all') {
           jobSelect.value = 'all';
           jobSelect.dispatchEvent(new Event('change')); // reuses the one filter code path
@@ -2927,8 +2951,7 @@ class InstancesPage {
     if (!els) return;
     this._syncJobDropdownSelection();
 
-    let stored = null;
-    try { stored = localStorage.getItem(JOB_DEFAULT_LS_KEY); } catch (e) { }
+    const stored = getDefaultJob(this._activeEndpoint);
     const isDefault = !!stored && stored === this.selectedJob;
 
     if (els.badge) els.badge.classList.toggle('hidden', !isDefault);
@@ -2942,17 +2965,18 @@ class InstancesPage {
   // instead of duplicating the load()/loadAvailability() filter logic.
   _restoreDefaultJob(jobSelect) {
     if (this._defaultJobRestored) return;
+    // Endpoint list not loaded yet (first paint race) — leave the guard
+    // un-armed so a later load() retries once _activeEndpoint is known.
+    if (!this._activeEndpoint) return;
     this._defaultJobRestored = true;
 
-    let stored = null;
-    try { stored = localStorage.getItem(JOB_DEFAULT_LS_KEY); } catch (e) { }
+    const stored = getDefaultJob(this._activeEndpoint);
     if (!stored) return;
 
+    // This endpoint's saved default names a job it doesn't currently expose —
+    // stay on "All Jobs"; the saved default is kept for when it reappears.
     const exists = Array.from(jobSelect.options).some(o => o.value === stored);
-    if (!exists) {
-      try { localStorage.setItem(JOB_DEFAULT_LS_KEY, 'all'); } catch (e) { }
-      return;
-    }
+    if (!exists) return;
 
     if (jobSelect.value !== stored) {
       jobSelect.value = stored;
@@ -2960,6 +2984,29 @@ class InstancesPage {
     } else {
       this._updateJobDefaultUI();
     }
+  }
+
+  // Endpoint switch: the previous endpoint's job list and any active job
+  // filter mean nothing against a different Prometheus (filtering on a job
+  // the new endpoint has never scraped yields an empty grid that looks
+  // stuck). Drop to "All Jobs", prune the stale <option>s / <li>s, and
+  // re-arm the restore so the next load() applies the NEW endpoint's own
+  // Default Job (getDefaultJob(this._activeEndpoint)) if it has one.
+  _resetJobFilter() {
+    this.selectedJob = 'all';
+    this._defaultJobRestored = false;
+    this._lastDataSignature = null;
+
+    const jobSelect = document.getElementById('jobSelect');
+    if (jobSelect) {
+      Array.from(jobSelect.options).forEach(o => { if (o.value !== 'all') o.remove(); });
+      jobSelect.value = 'all';
+    }
+    const els = this._jobFilterEls;
+    if (els && els.ddMenu) {
+      Array.from(els.ddMenu.children).forEach(li => { if (li.dataset.value !== 'all') li.remove(); });
+    }
+    this._updateJobDefaultUI();
   }
 
   _checkStateTransitions(newTargets) {
@@ -6000,6 +6047,11 @@ class ServerMonitor {
         const data = await res.json();
         if (!data.ok) return;
 
+        // Keep InstancesPage's notion of the active endpoint current — it
+        // keys the per-endpoint Default Job (restore + save + badge).
+        const active = data.endpoints.find(ep => ep.active);
+        if (this.instancesPage) this.instancesPage._activeEndpoint = active ? active.url : null;
+
         // Populate topbar select dropdown
         if (endpointSelect) {
           endpointSelect.innerHTML = '';
@@ -6080,6 +6132,7 @@ class ServerMonitor {
         const data = await res.json();
         if (data.ok) {
           await fetchEndpoints();
+          this.instancesPage._resetJobFilter();
           this.instancesPage.load();
           this.instancesPage.loadAvailability();
         }
@@ -6160,8 +6213,10 @@ class ServerMonitor {
       });
     }
 
-    // Initial load
-    fetchEndpoints();
+    // Initial load — then one more load() so this endpoint's Default Job is
+    // restored on first paint (the load() from onActivate races ahead of
+    // _activeEndpoint being known).
+    fetchEndpoints().then(() => { if (this.instancesPage) this.instancesPage.load(); });
   }
 
 
