@@ -18,11 +18,24 @@ import threading
 import yaml
 
 try:
-    from core.monitoring.primitives import normalize_target
     from .db import DeletedTargetRepository
 except (ImportError, ValueError):
-    from alarm.core.monitoring.primitives import normalize_target
-    from alarm.storage import DeletedTargetRepository
+    try:
+        from storage.db import DeletedTargetRepository
+    except ImportError:
+        from alarm.storage.db import DeletedTargetRepository
+
+def normalize_target(url):
+    """Canonical form for dedup: lowercase host, drop scheme/default port/trailing slash."""
+    s = (url or "").strip()
+    s = re.sub(r'^https?://', '', s, flags=re.I).rstrip('/')
+    m = re.match(r'^([^/]+?)(?::(\d+))?(/.*)?$', s)
+    if not m:
+        return s.lower()
+    host, port, path = m.group(1).lower(), m.group(2), m.group(3) or ""
+    if (port == '80' or port == '443') and not path:
+        return host
+    return f"{host}:{port}{path}" if port else f"{host}{path}"
 
 logger = logging.getLogger("infrawatch")
 
