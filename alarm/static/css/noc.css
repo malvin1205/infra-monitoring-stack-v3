@@ -601,8 +601,9 @@ html, body {
   width: 100%;
   max-width: 100%;
   margin: 0;
-  height: calc(100vh - var(--topnav-h));
-  padding: calc(var(--topnav-h) + 8px) 12px 8px;
+  height: 100vh;
+  height: 100dvh;
+  padding: calc(var(--topnav-h) + 8px) 12px 16px;
   box-sizing: border-box;
   display: flex;
   flex-direction: column;

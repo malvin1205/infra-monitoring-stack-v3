@@ -69,7 +69,7 @@ def _ctx():
     fetch_down_since_prom_map, fetch_prom_query_map, fetch_prom_range_map.
     (Class method patches like AggregationLeaseRepository.acquire_or_renew hit
     the shared storage class object, so those stay imported normally.)"""
-    return sys.modules.get("app") or sys.modules["alarm.app"]
+    return sys.modules.get("app") or sys.modules.get("alarm.app") or sys.modules.get("__main__")
 
 
 ALERT_POLL_INTERVAL_SECONDS = float(os.environ.get("ALERT_POLL_INTERVAL", "15"))
