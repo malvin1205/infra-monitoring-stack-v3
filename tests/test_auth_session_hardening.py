@@ -33,6 +33,11 @@ class TestAuthSessionHardening(unittest.TestCase):
         storage.init_db(self.db_path)
         with alarm_app._LOGIN_FAILS_LOCK:
             alarm_app._LOGIN_FAILS.clear()
+        # Fixed-window IP rate-limit buckets are process-global and never
+        # expire inside a fast test run — a prior test file's /api/auth/setup
+        # calls otherwise trip rate_limit(10, 60) here and the un-asserted
+        # setup/login silently 429s.
+        alarm_app._RATE_BUCKETS.clear()
 
     def tearDown(self):
         with alarm_app._LOGIN_FAILS_LOCK:

@@ -34,6 +34,11 @@ DEFAULT_WEBHOOK_SECRET_FILE = os.path.join(os.path.dirname(__file__), ".webhook_
 DEFAULT_SESSION_SECRET_FILE = os.path.join(os.path.dirname(__file__), ".session_secret")
 
 # ── Role & Permission Definitions ─────────────────────────────────────────────
+# 'owner' is the founding account created by first-boot /api/auth/setup. It
+# has every permission 'admin' has; what sets it apart is enforced in the user
+# -management routes, not here: an admin cannot assign the owner role or modify
+# the owner account, only the owner can. The role is permanent and there is
+# exactly one (see storage.init_db's backfill for pre-existing deployments).
 ROLE_PERMISSIONS: Dict[str, Set[str]] = {
     "admin": {
         "dashboard.read",
@@ -62,6 +67,10 @@ ROLE_PERMISSIONS: Dict[str, Set[str]] = {
         "availability.read",
     }
 }
+ROLE_PERMISSIONS["owner"] = set(ROLE_PERMISSIONS["admin"])
+
+# Roles with full administrative access (permission checks short-circuit).
+PRIVILEGED_ROLES = ("owner", "admin")
 
 
 def _load_env_file():
@@ -293,7 +302,7 @@ def has_permission(user: Optional[Dict[str, Any]], permission: Optional[str] = N
         return False
     if not permission:
         return True
-    if user.get("role") == "admin":
+    if user.get("role") in PRIVILEGED_ROLES:
         return True
     role = user.get("role", "viewer")
     perms = ROLE_PERMISSIONS.get(role, set())
@@ -343,8 +352,8 @@ def require_api_key(f):
         if not user:
             return jsonify({"ok": False, "error": "Unauthorized"}), 401
 
-        # Check if caller has write permissions for mutations (or is admin)
-        if user.get("role") != "admin":
+        # Check if caller has write permissions for mutations (or is admin/owner)
+        if user.get("role") not in PRIVILEGED_ROLES:
             return jsonify({"ok": False, "error": "Forbidden: Admin permission required"}), 403
 
         g.current_user = user

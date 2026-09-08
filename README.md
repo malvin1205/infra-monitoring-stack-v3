@@ -28,9 +28,10 @@ Dashboard monitoring ketersediaan server, website, dan jaringan secara real-time
 - **Maintenance Mode**: Penjadwalan jendela perawatan per target/job untuk mencegah alarm palsu.
 - **Dependency / Alert Correlation**: Hubungan parent-child antar host untuk meredam alert turunan saat gateway/parent down.
 - **SLA & Availability Engine**: Menghitung persentase uptime (1 jam - 90 hari), sparkline riwayat latensi, dan statistik downtime.
-- **Role-Based Access Control (RBAC)**: Pemisahan role Administrator dan Read-Only Viewer.
-- **Failover Prometheus Endpoint**: Dukungan multiple endpoint Prometheus dengan auto-failover jika server utama tidak dapat diakses.
+- **Role-Based Access Control (RBAC)**: Pemisahan hak akses berjenjang antara Owner (akun pendiri yang diproteksi permanen), Administrator, dan Read-Only Viewer.
+- **Failover Prometheus Endpoint & Per-Endpoint Job Filter**: Dukungan multiple endpoint Prometheus dengan auto-failover, sinkronisasi antar klien, dan preferensi Default Job tersimpan per endpoint.
 - **Synthetic Alert Poller**: Poller background bawaan yang langsung mendeteksi status probe tanpa wajib memasang Alertmanager.
+- **Liveness & Readiness Probes**: Endpoint `/health/live` dan `/health/ready` terstandar untuk healthcheck container dan orkestrasi Kubernetes.
 
 ---
 
@@ -70,21 +71,22 @@ Cek status container:
 docker compose ps
 ```
 
-### 3. Setup Akun Admin Pertama Kali (First-Run)
+### 3. Setup Akun Owner Pertama Kali (First-Run)
 
 1. Buka browser dan akses `http://<IP-SERVER>:5000`.
-2. Saat pertama kali dijalankan, sistem otomatis memunculkan pop-up **"Create Administrator Account"**.
-3. Masukkan **Nama Tampilan**, **Username Admin** (min. 3 karakter), dan **Password** (minimal 12 karakter).
-4. Klik **"Initialize & Log In"**. Anda akan langsung login sebagai Administrator.
+2. Saat pertama kali dijalankan, sistem otomatis memunculkan modal inisialisasi akun.
+3. Masukkan **Nama Tampilan**, **Username** (min. 3 karakter), dan **Password** (minimal 12 karakter).
+4. Klik **"Initialize & Log In"**. Akun pertama ini secara otomatis dibuat dengan role **Owner** (pemilik/pendiri).
 5. Klik **"Masuk & Aktifkan Audio Alarm"** pada splash screen untuk mengizinkan pemutaran audio sirine di browser TV NOC.
 
 ---
 
 ## Autentikasi & Hak Akses
 
-- **First-Run Admin Setup**: Akun administrator utama dibuat langsung melalui web UI saat instalasi pertama.
-- **Role Administrator**: Memiliki hak penuh untuk menambah/menghapus target, membuat jadwal maintenance, mengubah endpoint Prometheus, mengatur bot Telegram, dan mengelola user lain (`/api/auth/users`).
-- **Role Viewer (Read-only)**: Hanya dapat melihat dashboard monitoring tanpa akses mengubah konfigurasi. Cocok untuk browser yang dipasang di layar TV NOC wallboard.
+- **First-Run Owner Setup**: Akun pendiri sistem dibuat langsung saat pertama kali aplikasi diakses via web UI. Akun ini memegang role permanen `owner`.
+- **Role Owner (Founding Account)**: Memiliki hak administratif penuh. Akun ini dilindungi secara khusus: tidak dapat dinonaktifkan, role tidak dapat diubah, dan akun ini tidak dapat dimodifikasi oleh admin lain (hanya owner sendiri yang dapat mengubah kredensial profilnya). Instalasi lama yang di-upgrade otomatis mempromosikan akun pertama menjadi `owner`.
+- **Role Administrator**: Memiliki hak penuh untuk konfigurasi operasional: menambah/menghapus target, membuat jadwal maintenance, mengubah endpoint Prometheus, mengatur bot Telegram, dan mengelola akun operator lain (`/api/auth/users`). Admin tidak dapat membuat atau memodifikasi akun Owner, serta dilindungi aturan anti-lockout (admin aktif terakhir tidak dapat dinonaktifkan).
+- **Role Viewer (Read-only)**: Hanya dapat melihat dashboard monitoring tanpa akses mengubah konfigurasi. Sangat cocok untuk browser yang dipasang di layar TV NOC wallboard.
 - **Machine API Key**: Digunakan untuk automasi skrip atau CI/CD.
   - Key otomatis dibuat di `alarm/.api_key` dan `alarm/.webhook_secret`.
   - Lihat key: `cat alarm/.api_key`
@@ -102,12 +104,12 @@ docker compose ps
 | `/api/availability` | `GET` | Metrik kalkulasi SLA uptime & analisis stabilitas |
 | `/api/target-history` | `GET` | Timeline sparkline latensi dan riwayat status target |
 | `/api/auth/status` | `GET` | Cek status inisialisasi user dan sesi login saat ini |
-| `/api/auth/setup` | `POST` | Setup akun administrator pertama kali |
+| `/api/auth/setup` | `POST` | Setup akun founding owner pertama kali |
 | `/api/auth/login` | `POST` | Login user (session-based) |
 | `/api/auth/logout` | `POST` | Logout user |
 | `/api/auth/me` | `GET` 🔒 | Profil user yang sedang login |
-| `/api/auth/users` | `GET` 🔒 / `POST` 🔒 | Manajemen daftar user (khusus Admin) |
-| `/api/auth/users/<id>` | `PATCH` 🔒 | Ubah role / status aktif / password user |
+| `/api/auth/users` | `GET` 🔒 / `POST` 🔒 | Manajemen daftar user (khusus Owner & Admin) |
+| `/api/auth/users/<id>` | `PATCH` 🔒 | Ubah role / status aktif / password user (Owner diproteksi) |
 | `/api/prometheus-targets` | `GET` | Daftar target hasil discovery Prometheus (untuk dropdown Add Target) |
 | `/api/targets` | `GET` / `POST` 🔒 / `DELETE` 🔒 | Kelola daftar kurasi target (`targets/websites.yml`) |
 | `/api/jobs` | `GET` | Daftar nama job Prometheus (diagnostik curl) |
@@ -131,7 +133,8 @@ docker compose ps
 | `/history` | `GET` | Riwayat insiden lengkap |
 | `/webhook`, `/api/webhook` | `POST` | Webhook receiver dari Alertmanager (opsional, butuh header `X-Webhook-Secret`) |
 | `/health` | `GET` | Healthcheck: konektivitas Prometheus, storage, poller, & availability aggregator |
-| `/health/live`, `/health/ready` | `GET` | Liveness / readiness probe ringan |
+| `/health/live` | `GET` | Liveness probe ringan (200 jika proses web aktif) |
+| `/health/ready` | `GET` | Readiness probe (200 jika storage database dapat ditulis) |
 
 > 🔒 = Membutuhkan login sesi Administrator atau header `X-API-Key: <key>` / `Authorization: Bearer <key>`.
 

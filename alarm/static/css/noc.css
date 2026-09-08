@@ -1159,6 +1159,39 @@ html, body {
   font-weight: 700;
 }
 
+/* Generic custom-select skin — every native <select> (except #jobSelect,
+   which has its own controller) is wrapped by _enhanceSelect() and reuses
+   the .job-dd-* trigger/menu/option rules above. Two size variants:
+   compact (toolbar) and block (.form-select in modals/drawers). */
+.dd {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  vertical-align: middle;
+}
+.dd.dd-block {
+  display: flex;
+  width: 100%;
+}
+.dd-native {
+  display: none !important;
+}
+.dd .job-dd-trigger {
+  max-width: 240px;
+}
+.dd.dd-block .job-dd-trigger {
+  width: 100%;
+  max-width: none;
+  height: auto;
+  min-height: 42px;
+  padding: 11px 14px;
+  font-size: 13px;
+  border-radius: var(--r-md);
+}
+.dd.dd-block .job-dd-menu {
+  min-width: 100%;
+}
+
 .job-default-badge {
   font-size: 9px;
   font-weight: 700;
@@ -4811,6 +4844,12 @@ html, body {
   border-radius: 4px;
   background: rgba(148, 163, 184, 0.15);
   color: var(--text-secondary);
+}
+
+.user-role-pill.role-owner {
+  background: rgba(245, 158, 11, 0.18);
+  color: #fbbf24;
+  border: 1px solid rgba(245, 158, 11, 0.45);
 }
 
 .user-role-pill.role-admin {

@@ -93,11 +93,17 @@ function closeLoginModal() {
   if (modal) modal.classList.add('hidden');
 }
 
+// 'owner' (the founding account) and 'admin' share the same UI privileges;
+// what only the owner can do is enforced server-side in the user-mgmt routes.
+function isAdminLike(u) {
+  return !!u && (u.role === 'admin' || u.role === 'owner');
+}
+
 function showUsersModal() {
-  // Manage Users needs an admin session. The header button is already hidden
-  // for non-admins, but a stale click (session expired since page load) or a
-  // direct call should route to login, not open a modal that only 401s.
-  if (!window.currentUser || window.currentUser.role !== 'admin') {
+  // Manage Users needs an admin/owner session. The header button is already
+  // hidden for non-admins, but a stale click (session expired since page load)
+  // or a direct call should route to login, not open a modal that only 401s.
+  if (!isAdminLike(window.currentUser)) {
     showLoginModal();
     return;
   }
@@ -146,6 +152,7 @@ function initUsersListActions() {
   container.addEventListener('click', async (e) => {
     const toggleBtn = e.target.closest('.user-status-toggle');
     if (toggleBtn) {
+      if (toggleBtn.disabled) return;
       const wasActive = toggleBtn.dataset.active === '1';
       toggleBtn.disabled = true;
       const ok = await patchUser(toggleBtn.dataset.userId, { is_active: !wasActive });
@@ -155,6 +162,7 @@ function initUsersListActions() {
     }
     const resetBtn = e.target.closest('.user-reset-pw-btn');
     if (resetBtn) {
+      if (resetBtn.disabled) return;
       const newPassword = prompt('New password (min 12 chars):');
       if (newPassword === null) return;
       if (newPassword.length < 12) { alert('Password must be at least 12 characters'); return; }
@@ -192,6 +200,7 @@ async function fetchUsersList() {
         return;
       }
       const selfId = window.currentUser ? window.currentUser.id : null;
+      const viewerIsOwner = window.currentUser && window.currentUser.role === 'owner';
       container.innerHTML = `
         <table style="width: 100%; border-collapse: collapse; font-size: 12px; text-align: left;">
           <thead>
@@ -204,26 +213,34 @@ async function fetchUsersList() {
             </tr>
           </thead>
           <tbody>
-            ${data.users.map(u => `
+            ${data.users.map(u => {
+              // The owner row is read-only to everyone but the owner: no role
+              // change (role is permanent), and status/password locked for a
+              // non-owner viewer. Mirrors the server-side guards.
+              const isOwnerRow = u.role === 'owner';
+              const rowLocked = isOwnerRow && !viewerIsOwner;
+              const roleCell = isOwnerRow
+                ? `<span class="user-role-pill role-owner">OWNER</span>`
+                : `<select class="search-input user-role-select" data-user-id="${u.id}" style="font-size: 11px; padding: 3px 6px; border-radius: var(--r-sm);">
+                    <option value="admin" ${u.role === 'admin' ? 'selected' : ''}>ADMIN</option>
+                    <option value="viewer" ${u.role === 'viewer' ? 'selected' : ''}>VIEWER</option>
+                  </select>`;
+              return `
               <tr style="border-bottom: 1px solid var(--border-subtle);" data-user-row="${u.id}">
                 <td style="padding: 8px 12px; font-weight: 600; color: var(--text-primary);">${escapeHtml(u.username)}${u.id === selfId ? ' <span style="color: var(--text-muted); font-weight: 400;">(you)</span>' : ''}</td>
                 <td style="padding: 8px 12px; color: var(--text-secondary);">${escapeHtml(u.display_name) || '—'}</td>
+                <td style="padding: 8px 12px;">${roleCell}</td>
                 <td style="padding: 8px 12px;">
-                  <select class="search-input user-role-select" data-user-id="${u.id}" style="font-size: 11px; padding: 3px 6px; border-radius: var(--r-sm);">
-                    <option value="admin" ${u.role === 'admin' ? 'selected' : ''}>ADMIN</option>
-                    <option value="viewer" ${u.role === 'viewer' ? 'selected' : ''}>VIEWER</option>
-                  </select>
-                </td>
-                <td style="padding: 8px 12px;">
-                  <button type="button" class="user-status-toggle" data-user-id="${u.id}" data-active="${u.is_active ? '1' : '0'}" style="background: none; border: none; cursor: pointer; padding: 0; color: ${u.is_active ? 'var(--success)' : 'var(--critical)'}; font-weight: 500; font-size: 12px;">
+                  <button type="button" class="user-status-toggle" data-user-id="${u.id}" data-active="${u.is_active ? '1' : '0'}" ${rowLocked ? 'disabled' : ''} style="background: none; border: none; cursor: ${rowLocked ? 'not-allowed' : 'pointer'}; padding: 0; color: ${u.is_active ? 'var(--success)' : 'var(--critical)'}; font-weight: 500; font-size: 12px; opacity: ${rowLocked ? '0.5' : '1'};">
                     ${u.is_active ? '● Active' : '○ Inactive'}
                   </button>
                 </td>
                 <td style="padding: 8px 12px; text-align: right;">
-                  <button type="button" class="btn btn-secondary user-reset-pw-btn" data-user-id="${u.id}" style="padding: 3px 8px; font-size: 11px;">Reset Password</button>
+                  <button type="button" class="btn btn-secondary user-reset-pw-btn" data-user-id="${u.id}" ${rowLocked ? 'disabled' : ''} style="padding: 3px 8px; font-size: 11px; ${rowLocked ? 'opacity: 0.5; cursor: not-allowed;' : ''}">Reset Password</button>
                 </td>
               </tr>
-            `).join('')}
+            `;
+            }).join('')}
           </tbody>
         </table>
       `;
@@ -255,11 +272,11 @@ function updateUserUI(user) {
       rolePill.className = `user-role-pill role-${user.role || 'viewer'}`;
     }
     if (dropdownName) dropdownName.textContent = name;
-    if (dropdownRole) dropdownRole.textContent = user.role === 'admin' ? 'Administrator' : 'Read-Only Viewer';
+    if (dropdownRole) dropdownRole.textContent = user.role === 'owner' ? 'Owner' : user.role === 'admin' ? 'Administrator' : 'Read-Only Viewer';
     if (loginBtn) loginBtn.classList.add('hidden');
     if (logoutBtn) logoutBtn.classList.remove('hidden');
     if (manageUsersBtn) {
-      if (user.role === 'admin') manageUsersBtn.classList.remove('hidden');
+      if (isAdminLike(user)) manageUsersBtn.classList.remove('hidden');
       else manageUsersBtn.classList.add('hidden');
     }
   } else {
@@ -640,6 +657,9 @@ class InstancesPage {
     // the jobSelect 'change' listener above for any actual filter change,
     // no separate filter logic).
     this._initJobFilterUI();
+
+    // Skin every other native <select> in the app with the same dropdown.
+    this._enhanceAllSelects();
 
     // Period / time-range chips (24h / 7d / 30d / Custom Range)
     if (this.rangeChipsGroup) {
@@ -2680,6 +2700,28 @@ class InstancesPage {
       this._instanceFailCount = 0;
       this._clearRetry('instances');
 
+      // Another client (another device/tab) may have repointed the server's
+      // GLOBAL active Prometheus endpoint out from under us — the job filter
+      // and topbar picker here are now stale, and a job absent on the new
+      // endpoint renders an empty "no hosts match" grid. The poll response
+      // names the URL actually served; if that isn't the one we think is
+      // active, re-check the registry — then, only if the *registered*
+      // active really moved (a transient fetch fallback to a secondary
+      // endpoint also lands here and must NOT count), do locally what a
+      // manual endpoint switch does and re-fetch against the new endpoint.
+      if (data.prometheus_url && this._activeEndpoint && data.prometheus_url !== this._activeEndpoint) {
+        const known = this._activeEndpoint;
+        if (this.monitor && typeof this.monitor._syncEndpointsUI === 'function') {
+          await this.monitor._syncEndpointsUI(); // refreshes this._activeEndpoint from /api/endpoints
+        }
+        if (this._activeEndpoint && this._activeEndpoint !== known) {
+          this._resetJobFilter();
+          this._triggerEventToast('Active Prometheus endpoint changed elsewhere — job filter reset.');
+          this.loadAvailability(); // 24h % / trend are per endpoint+job too
+          return this.load();
+        }
+      }
+
       // Update available jobs in dropdown if present
       if (Array.isArray(data.available_jobs) && document.getElementById('jobSelect')) {
         const jobSelect = document.getElementById('jobSelect');
@@ -2922,6 +2964,133 @@ class InstancesPage {
     Array.from(els.ddMenu.children).forEach(li => {
       li.setAttribute('aria-selected', String(li.dataset.value === els.jobSelect.value));
     });
+  }
+
+  // Skins a native <select> with the same custom dropdown as the Job filter
+  // (.job-dd-* : pill trigger, chevron, panel with blue hover). The <select>
+  // stays in the DOM as the single source of truth — every existing reader/
+  // writer of .value and every 'change' listener keeps working; picking here
+  // sets .value and dispatches 'change' exactly as the native control would.
+  // UI only, no business logic.
+  _enhanceSelect(sel) {
+    if (!sel || sel.dataset.ddEnhanced || !sel.parentNode) return;
+    sel.dataset.ddEnhanced = '1';
+
+    // A hidden required control blocks native form submission ("not
+    // focusable") — these forms all validate in JS anyway (see
+    // _submitAddTarget), so drop it.
+    sel.removeAttribute('required');
+
+    const block = sel.classList.contains('form-select');
+    const wrap = document.createElement('span');
+    wrap.className = 'dd' + (block ? ' dd-block' : '');
+    sel.parentNode.insertBefore(wrap, sel.nextSibling);
+    sel.classList.add('dd-native');
+    wrap.appendChild(sel);
+
+    const trigger = document.createElement('button');
+    trigger.type = 'button';
+    trigger.className = 'job-dd-trigger';
+    trigger.setAttribute('aria-haspopup', 'listbox');
+    trigger.setAttribute('aria-expanded', 'false');
+    const al = sel.getAttribute('aria-label') || sel.getAttribute('title');
+    if (al) trigger.setAttribute('aria-label', al);
+    const label = document.createElement('span');
+    label.className = 'job-dd-label';
+    trigger.appendChild(label);
+    trigger.insertAdjacentHTML('beforeend',
+      '<svg aria-hidden="true" focusable="false" class="job-dd-caret" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>');
+    const menu = document.createElement('ul');
+    menu.className = 'job-dd-menu hidden';
+    menu.setAttribute('role', 'listbox');
+    menu.tabIndex = -1;
+    wrap.appendChild(trigger);
+    wrap.appendChild(menu);
+
+    const enabled = () => Array.from(menu.children).filter(li => li.dataset.disabled !== '1');
+    const setActive = li => {
+      if (!li) return;
+      menu.querySelectorAll('.job-dd-option-active').forEach(el => el.classList.remove('job-dd-option-active'));
+      li.classList.add('job-dd-option-active');
+      li.scrollIntoView({ block: 'nearest' });
+    };
+    const rebuild = () => {
+      menu.innerHTML = '';
+      Array.from(sel.options).forEach(o => {
+        if (o.hidden) return;
+        const li = document.createElement('li');
+        li.className = 'job-dd-option';
+        li.setAttribute('role', 'option');
+        li.dataset.value = o.value;
+        li.textContent = o.textContent;
+        if (o.disabled) { li.dataset.disabled = '1'; li.setAttribute('aria-disabled', 'true'); }
+        li.setAttribute('aria-selected', String(o.value === sel.value));
+        menu.appendChild(li);
+      });
+      const cur = sel.options[sel.selectedIndex];
+      label.textContent = cur ? cur.textContent : '';
+      trigger.disabled = sel.disabled;
+    };
+    const open = () => {
+      if (sel.disabled) return;
+      rebuild();
+      menu.classList.remove('hidden');
+      trigger.setAttribute('aria-expanded', 'true');
+      setActive(menu.querySelector('[aria-selected="true"]:not([aria-disabled])') || enabled()[0]);
+      menu.focus();
+    };
+    const close = () => {
+      if (menu.classList.contains('hidden')) return;
+      menu.classList.add('hidden');
+      trigger.setAttribute('aria-expanded', 'false');
+    };
+    const pick = li => {
+      if (!li || li.dataset.disabled === '1') return;
+      if (sel.value !== li.dataset.value) {
+        sel.value = li.dataset.value;
+        sel.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+      rebuild();
+      close();
+      trigger.focus();
+    };
+
+    trigger.addEventListener('click', e => { e.stopPropagation(); if (menu.classList.contains('hidden')) open(); else close(); });
+    trigger.addEventListener('keydown', e => {
+      if (e.key === 'ArrowDown' || e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); }
+    });
+    menu.addEventListener('click', e => { const li = e.target.closest('.job-dd-option'); if (li) pick(li); });
+    menu.addEventListener('keydown', e => {
+      const list = enabled();
+      if (!list.length) return;
+      const i = Math.max(0, list.findIndex(li => li.classList.contains('job-dd-option-active')));
+      switch (e.key) {
+        case 'ArrowDown': e.preventDefault(); setActive(list[Math.min(list.length - 1, i + 1)]); break;
+        case 'ArrowUp': e.preventDefault(); setActive(list[Math.max(0, i - 1)]); break;
+        case 'Home': e.preventDefault(); setActive(list[0]); break;
+        case 'End': e.preventDefault(); setActive(list[list.length - 1]); break;
+        case 'Enter': case ' ': e.preventDefault(); pick(list[i]); break;
+        case 'Escape': e.preventDefault(); close(); trigger.focus(); break;
+        case 'Tab': close(); break;
+      }
+    });
+    document.addEventListener('click', e => { if (!wrap.contains(e.target)) close(); });
+    document.addEventListener('keydown', e => { if (e.key === 'Escape' && !menu.classList.contains('hidden')) { close(); trigger.focus(); } });
+
+    // Runtime-injected <option>s (endpoint list, target-URL list, dependency
+    // parents) + programmatic disabled toggles → rebuild trigger + menu.
+    new MutationObserver(() => rebuild()).observe(sel, { childList: true, subtree: true, attributes: true, attributeFilter: ['disabled'] });
+    // ponytail: a bare `sel.value = x` with no dispatched 'change' leaves the
+    // trigger label stale until the next open(); the value stays correct and
+    // open() re-reads it, so not worth patching the value setter.
+    sel.addEventListener('change', () => rebuild());
+
+    rebuild();
+  }
+
+  _enhanceAllSelects() {
+    // #jobSelect keeps its bespoke controller (gear / Default badge / popover).
+    document.querySelectorAll('select:not(#jobSelect)').forEach(sel => this._enhanceSelect(sel));
   }
 
   /* ── Default Job gear popover ── */
@@ -5659,7 +5828,7 @@ class HistoryPage {
     // -Ongoing incident. Backstop for a stuck incident that no automatic path
     // can clear (host removed from Prometheus, so the poller never sees it
     // recover). Lives inside the Host cell so it needs no grid-column change.
-    const canResolve = ongoing && window.currentUser && window.currentUser.role === 'admin' && inc.key;
+    const canResolve = ongoing && isAdminLike(window.currentUser) && inc.key;
     const resolveLine = canResolve
       ? `<button type="button" class="history-resolve-btn" data-resolve-key="${this._esc(inc.key)}" title="Force-resolve this stuck incident">Force-resolve</button>`
       : '';
@@ -6121,6 +6290,10 @@ class ServerMonitor {
         console.warn('[EndpointManager] Failed to load endpoints:', e);
       }
     };
+    // Reachable from InstancesPage (this.monitor._syncEndpointsUI) so a poll
+    // that detects another client repointed the server endpoint can re-sync
+    // the topbar picker + _activeEndpoint.
+    this._syncEndpointsUI = fetchEndpoints;
 
     const selectEndpoint = async (url) => {
       try {

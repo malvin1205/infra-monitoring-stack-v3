@@ -377,10 +377,10 @@ def auth_setup_api():
         UserRepository.update_last_login(user["id"])
         AuditLogRepository.record_action(
             actor_username=username,
-            actor_role="admin",
+            actor_role="owner",
             action="SYSTEM_SETUP",
-            resource="user:admin",
-            details="Initial administrator account created"
+            resource=f"user:{username}",
+            details="Founding owner account created"
         )
     except Exception:
         # The account exists and the session is set — a failure writing the
@@ -486,6 +486,8 @@ def create_user_api():
         return jsonify({"ok": False, "error": "Username contains invalid characters"}), 400
     if not password or len(password) < 12:
         return jsonify({"ok": False, "error": "Password must be at least 12 characters"}), 400
+    if role == "owner":
+        return jsonify({"ok": False, "error": "The owner role cannot be assigned — there is exactly one owner, set at first-boot setup"}), 403
     if role not in ("admin", "viewer"):
         return jsonify({"ok": False, "error": "Role must be admin or viewer"}), 400
 
@@ -516,10 +518,25 @@ def update_user_api(user_id):
     display_name = data.get("display_name")
     password = data.get("password") or None
 
+    actor_role = g.current_user.get("role", "viewer")
+    target_is_owner = target["role"] == "owner"
+
+    # The owner account is protected: only the owner may touch it at all, its
+    # role is permanent, and it can never be deactivated (no orphaning the
+    # founder). An admin managing everyone else is unaffected.
+    if target_is_owner and actor_role != "owner":
+        return jsonify({"ok": False, "error": "Only the owner can modify the owner account"}), 403
+
     if role is not None:
         role = str(role).strip().lower()
+        if role == "owner":
+            return jsonify({"ok": False, "error": "The owner role cannot be assigned"}), 403
         if role not in ("admin", "viewer"):
             return jsonify({"ok": False, "error": "Role must be admin or viewer"}), 400
+        if target_is_owner:
+            return jsonify({"ok": False, "error": "The owner's role cannot be changed"}), 400
+    if is_active is not None and not is_active and target_is_owner:
+        return jsonify({"ok": False, "error": "The owner account cannot be deactivated"}), 400
     if password is not None and len(password) < 12:
         return jsonify({"ok": False, "error": "Password must be at least 12 characters"}), 400
 

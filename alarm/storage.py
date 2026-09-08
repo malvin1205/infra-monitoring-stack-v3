@@ -203,7 +203,7 @@ def init_db(db_path: Optional[str] = None):
                 username TEXT UNIQUE NOT NULL,
                 password_hash TEXT NOT NULL,
                 display_name TEXT,
-                role TEXT NOT NULL DEFAULT 'viewer', -- 'admin' or 'viewer'
+                role TEXT NOT NULL DEFAULT 'viewer', -- 'owner', 'admin' or 'viewer'
                 is_active INTEGER NOT NULL DEFAULT 1,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL,
@@ -295,6 +295,19 @@ def init_db(db_path: Optional[str] = None):
         user_cols = {r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
         if "session_epoch" not in user_cols:
             conn.execute("ALTER TABLE users ADD COLUMN session_epoch INTEGER NOT NULL DEFAULT 0")
+
+        # 'owner' role: the founding account (first-boot setup) is now created
+        # as 'owner', not 'admin'. Deployments that set up before this role
+        # existed have an all-'admin' users table and no owner — promote the
+        # lowest-id account (the one first-run setup created) so every install
+        # has exactly one owner. Runs only while no owner exists.
+        if conn.execute("SELECT COUNT(*) FROM users WHERE role = 'owner'").fetchone()[0] == 0:
+            first = conn.execute("SELECT id FROM users ORDER BY id ASC LIMIT 1").fetchone()
+            if first:
+                conn.execute(
+                    "UPDATE users SET role = 'owner', updated_at = ? WHERE id = ?",
+                    (time.time(), first[0]),
+                )
         conn.commit()
 
         # Seed from JSON files only if using the default production DB and table is empty
@@ -1148,16 +1161,18 @@ class UserRepository:
         display_name: str = "",
         db_path: Optional[str] = None
     ) -> Optional[Dict[str, Any]]:
+        """Create the founding account. It gets the permanent 'owner' role —
+        full access, and the only account an admin cannot touch or recreate."""
         now = time.time()
         username = username.strip()
         display_name = display_name.strip() if display_name else username
         with db_transaction(db_path) as conn:
             count = conn.execute("SELECT COUNT(*) as c FROM users").fetchone()["c"]
             if count > 0:
-                return None  # Race condition protection: admin already created
+                return None  # Race condition protection: owner already created
             conn.execute("""
                 INSERT INTO users (username, password_hash, display_name, role, is_active, created_at, updated_at)
-                VALUES (?, ?, ?, 'admin', 1, ?, ?)
+                VALUES (?, ?, ?, 'owner', 1, ?, ?)
             """, (username, password_hash, display_name, now, now))
             row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
             return UserRepository._sanitize(row, include_password_hash=False) if row else None

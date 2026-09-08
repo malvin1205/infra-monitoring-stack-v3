@@ -43,6 +43,10 @@ class TestAuthRBAC(unittest.TestCase):
         os.environ.pop("INFRAWATCH_SESSION_SECRET", None)
 
         storage.init_db(self.db_path)
+        # Process-global fixed-window rate-limit buckets don't expire within a
+        # fast run; clear them so /api/auth/setup's rate_limit(10, 60) can't
+        # be exhausted by an earlier test (or exhaust a later one).
+        alarm_app._RATE_BUCKETS.clear()
         self.client = alarm_app.app.test_client()
 
     def tearDown(self):
@@ -66,7 +70,7 @@ class TestAuthRBAC(unittest.TestCase):
         res = self.client.post("/api/auth/setup", json={"username": "admin", "password": "password123", "confirm_password": "different"})
         self.assertEqual(res.status_code, 400)
 
-        # 3. Successful first admin setup
+        # 3. Successful first setup — the founding account is the 'owner'
         res = self.client.post("/api/auth/setup", json={
             "username": "superadmin",
             "password": "CorrectPassword123!",
@@ -77,7 +81,7 @@ class TestAuthRBAC(unittest.TestCase):
         setup_data = res.get_json()
         self.assertTrue(setup_data["ok"])
         self.assertEqual(setup_data["user"]["username"], "superadmin")
-        self.assertEqual(setup_data["user"]["role"], "admin")
+        self.assertEqual(setup_data["user"]["role"], "owner")
         self.assertNotIn("password_hash", setup_data["user"])
 
         # 4. Status now indicates initialized and authenticated via session
@@ -265,17 +269,21 @@ class TestAuthRBAC(unittest.TestCase):
 
         ack_log = next(l for l in logs if l["action"] == "ACK_ALERT")
         self.assertEqual(ack_log["actor_username"], "auditor_admin")
-        self.assertEqual(ack_log["actor_role"], "admin")
+        self.assertEqual(ack_log["actor_role"], "owner")
 
     # ── 7. User Management: Edit Role / Deactivate / Last-Admin Lockout ──────
     def test_update_user_api(self):
-        admin_client = alarm_app.app.test_client()
-        admin_client.post("/api/auth/setup", json={"username": "root_admin", "password": "AdminPassword123"})
-        res = admin_client.post("/api/auth/users", json={
-            "username": "second_admin", "password": "Password1234", "role": "admin"
+        owner_client = alarm_app.app.test_client()
+        owner_client.post("/api/auth/setup", json={"username": "root_owner", "password": "AdminPassword123"})
+        res = owner_client.post("/api/auth/users", json={
+            "username": "admin_a", "password": "Password1234", "role": "admin"
         })
-        second_admin_id = res.get_json()["user"]["id"]
-        res = admin_client.post("/api/auth/users", json={
+        admin_a_id = res.get_json()["user"]["id"]
+        res = owner_client.post("/api/auth/users", json={
+            "username": "admin_b", "password": "Password1234", "role": "admin"
+        })
+        admin_b_id = res.get_json()["user"]["id"]
+        res = owner_client.post("/api/auth/users", json={
             "username": "some_viewer", "password": "Password1234", "role": "viewer"
         })
         viewer_id = res.get_json()["user"]["id"]
@@ -286,30 +294,96 @@ class TestAuthRBAC(unittest.TestCase):
         res = viewer_client.patch(f"/api/auth/users/{viewer_id}", json={"role": "admin"})
         self.assertEqual(res.status_code, 403)
 
-        # Admin promotes viewer to admin
-        res = admin_client.patch(f"/api/auth/users/{viewer_id}", json={"role": "admin"})
+        # Owner promotes viewer to admin
+        res = owner_client.patch(f"/api/auth/users/{viewer_id}", json={"role": "admin"})
         self.assertEqual(res.status_code, 200)
         self.assertEqual(res.get_json()["user"]["role"], "admin")
 
-        # Admin deactivates second_admin (root_admin + viewer-now-admin still active -> allowed)
-        res = admin_client.patch(f"/api/auth/users/{second_admin_id}", json={"is_active": False})
+        # Owner deactivates admin_b (admin_a + viewer-now-admin still active -> allowed)
+        res = owner_client.patch(f"/api/auth/users/{admin_b_id}", json={"is_active": False})
         self.assertEqual(res.status_code, 200)
         self.assertFalse(res.get_json()["user"]["is_active"])
 
-        # Demote/deactivate every other admin until root_admin is the last one, then guard kicks in
-        admin_id = admin_app_get_user_id_by_username(self, "root_admin")
-        promoted_id = viewer_id
-        res = admin_client.patch(f"/api/auth/users/{promoted_id}", json={"role": "viewer"})
+        # Demote viewer-now-admin back to viewer
+        res = owner_client.patch(f"/api/auth/users/{viewer_id}", json={"role": "viewer"})
         self.assertEqual(res.status_code, 200)
 
-        # Now root_admin is the only active admin — deactivating it must be rejected
-        res = admin_client.patch(f"/api/auth/users/{admin_id}", json={"is_active": False})
+        # admin_a is now the only active admin — deactivating it must be rejected
+        res = owner_client.patch(f"/api/auth/users/{admin_a_id}", json={"is_active": False})
         self.assertEqual(res.status_code, 400)
         self.assertIn("last active admin", res.get_json()["error"])
 
         # Unknown user id
-        res = admin_client.patch("/api/auth/users/999999", json={"role": "viewer"})
+        res = owner_client.patch("/api/auth/users/999999", json={"role": "viewer"})
         self.assertEqual(res.status_code, 404)
+
+    # ── 8. Owner role: protected account, unassignable, permanent ────────────
+    def test_owner_role_protections(self):
+        owner_client = alarm_app.app.test_client()
+        r = owner_client.post("/api/auth/setup", json={"username": "founder", "password": "FounderPass123"})
+        owner_id = r.get_json()["user"]["id"]
+        self.assertEqual(r.get_json()["user"]["role"], "owner")
+
+        res = owner_client.post("/api/auth/users", json={
+            "username": "adm", "password": "Password1234", "role": "admin"
+        })
+        adm_id = res.get_json()["user"]["id"]
+        res = owner_client.post("/api/auth/users", json={
+            "username": "vwr", "password": "Password1234", "role": "viewer"
+        })
+        vwr_id = res.get_json()["user"]["id"]
+
+        adm_client = alarm_app.app.test_client()
+        adm_client.post("/api/auth/login", json={"username": "adm", "password": "Password1234"})
+
+        # Admin cannot create an owner
+        res = adm_client.post("/api/auth/users", json={
+            "username": "usurper", "password": "Password1234", "role": "owner"
+        })
+        self.assertEqual(res.status_code, 403)
+
+        # Admin cannot assign the owner role to anyone
+        res = adm_client.patch(f"/api/auth/users/{vwr_id}", json={"role": "owner"})
+        self.assertEqual(res.status_code, 403)
+
+        # Admin cannot touch the owner account at all
+        res = adm_client.patch(f"/api/auth/users/{owner_id}", json={"display_name": "hax"})
+        self.assertEqual(res.status_code, 403)
+        self.assertIn("owner", res.get_json()["error"].lower())
+
+        # Admin CAN manage everyone else
+        res = adm_client.patch(f"/api/auth/users/{vwr_id}", json={"is_active": False})
+        self.assertEqual(res.status_code, 200)
+
+        # The owner's own role is permanent and the account can't be deactivated
+        res = owner_client.patch(f"/api/auth/users/{owner_id}", json={"role": "admin"})
+        self.assertEqual(res.status_code, 400)
+        res = owner_client.patch(f"/api/auth/users/{owner_id}", json={"is_active": False})
+        self.assertEqual(res.status_code, 400)
+
+        # ...but the owner can still edit its own profile
+        res = owner_client.patch(f"/api/auth/users/{owner_id}", json={"display_name": "The Founder"})
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.get_json()["user"]["display_name"], "The Founder")
+
+    def test_owner_backfill_for_legacy_all_admin_db(self):
+        # A deployment created before the 'owner' role: users table exists with
+        # an all-'admin' population and no owner. init_db must promote the
+        # lowest-id account.
+        import time as _t
+        with storage.db_transaction(self.db_path) as conn:
+            now = _t.time()
+            conn.execute(
+                "INSERT INTO users (username, password_hash, display_name, role, is_active, created_at, updated_at) "
+                "VALUES ('legacy_admin', 'x', 'Legacy', 'admin', 1, ?, ?)", (now, now))
+            conn.execute(
+                "INSERT INTO users (username, password_hash, display_name, role, is_active, created_at, updated_at) "
+                "VALUES ('later_admin', 'x', 'Later', 'admin', 1, ?, ?)", (now, now))
+        storage._INITIALIZED_DBS.discard(self.db_path)
+        storage.init_db(self.db_path)
+        promoted = storage.UserRepository.get_by_username("legacy_admin")
+        self.assertEqual(promoted["role"], "owner")
+        self.assertEqual(storage.UserRepository.get_by_username("later_admin")["role"], "admin")
 
 
 def admin_app_get_user_id_by_username(test, username):
