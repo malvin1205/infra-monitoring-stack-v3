@@ -3,8 +3,10 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# Pytest / Test cache
+# Pytest / Test cache & test files
 .pytest_cache/
+tests/
+pytest.ini
 
 # Agent / IDE / OS config
 .agent/
