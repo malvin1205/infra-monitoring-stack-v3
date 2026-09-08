@@ -13,7 +13,19 @@ from typing import Dict, Any, Optional, Tuple
 
 logger = logging.getLogger("infrawatch.telegram")
 
-CONFIG_FILE = os.path.join(os.path.dirname(__file__), "telegram_config.json")
+try:
+    from config import DATA_DIR, ALARM_DIR
+except ImportError:
+    from alarm.config import DATA_DIR, ALARM_DIR
+
+CONFIG_FILE = os.path.join(DATA_DIR, "telegram_config.json")
+try:
+    _legacy_tg = os.path.join(ALARM_DIR, "telegram_config.json")
+    if os.path.exists(_legacy_tg) and not os.path.exists(CONFIG_FILE):
+        import shutil
+        shutil.copy2(_legacy_tg, CONFIG_FILE)
+except Exception:
+    pass
 
 # Asynchronous worker pool for non-blocking notifications
 _EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="tg-alert")

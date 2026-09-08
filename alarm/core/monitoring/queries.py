@@ -11,9 +11,12 @@ The single mock seam for these and for prometheus_client is
 from urllib.parse import quote
 
 try:
-    import prometheus_client as _pc
-except ImportError:  # pragma: no cover
-    from alarm import prometheus_client as _pc
+    from . import client as _pc
+except (ImportError, ValueError):
+    try:
+        from core.monitoring import client as _pc
+    except ImportError:
+        from alarm.core.monitoring import client as _pc
 
 _SHARED_EXECUTOR = _pc._SHARED_EXECUTOR
 

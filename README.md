@@ -88,8 +88,8 @@ docker compose ps
 - **Role Administrator**: Memiliki hak penuh untuk konfigurasi operasional: menambah/menghapus target, membuat jadwal maintenance, mengubah endpoint Prometheus, mengatur bot Telegram, dan mengelola akun operator lain (`/api/auth/users`). Admin tidak dapat membuat atau memodifikasi akun Owner, serta dilindungi aturan anti-lockout (admin aktif terakhir tidak dapat dinonaktifkan).
 - **Role Viewer (Read-only)**: Hanya dapat melihat dashboard monitoring tanpa akses mengubah konfigurasi. Sangat cocok untuk browser yang dipasang di layar TV NOC wallboard.
 - **Machine API Key**: Digunakan untuk automasi skrip atau CI/CD.
-  - Key otomatis dibuat di `alarm/.api_key` dan `alarm/.webhook_secret`.
-  - Lihat key: `cat alarm/.api_key`
+  - Key otomatis dibuat di `alarm/data/.api_key` dan `alarm/data/.webhook_secret`.
+  - Lihat key: `cat alarm/data/.api_key`
   - Atau tentukan key manual melalui variabel `INFRAWATCH_API_KEY` di file `.env`.
   - Gunakan header `X-API-Key: <key>` atau `Authorization: Bearer <key>` saat memanggil REST API.
 

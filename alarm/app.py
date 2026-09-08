@@ -17,91 +17,76 @@ logging.basicConfig(
 logger = logging.getLogger("infrawatch")
 
 sys.path.insert(0, os.path.dirname(__file__))
-try:
-    from fleet_availability import (
-        summarize_entries, reconstruct_time_series_intervals, calculate_percentile,
-        clip_hourly_bucket, merge_hybrid_target_availability, merge_hybrid_fleet_availability,
-        derive_bucket_inputs, estimate_instance_cadence, sla_budget, get_sla_target_pct,
-        get_availability_settings, save_availability_settings, classify_probe_failure
-    )
-except ImportError:
-    from alarm.fleet_availability import (
-        summarize_entries, reconstruct_time_series_intervals, calculate_percentile,
-        clip_hourly_bucket, merge_hybrid_target_availability, merge_hybrid_fleet_availability,
-        derive_bucket_inputs, estimate_instance_cadence, sla_budget, get_sla_target_pct,
-        get_availability_settings, save_availability_settings, classify_probe_failure
-    )
 
-try:
-    from storage import (
-        init_db, IncidentRepository, EventLogRepository,
-        MaintenanceRepository, DependencyRepository, EndpointRepository, DeletedTargetRepository,
-        AvailabilityBucketRepository, AggregationLeaseRepository, SlaTargetRepository, SlowThresholdRepository,
-        UserRepository, AcknowledgmentRepository, AuditLogRepository
-    )
-except ImportError:
-    from alarm.storage import (
-        init_db, IncidentRepository, EventLogRepository,
-        MaintenanceRepository, DependencyRepository, EndpointRepository, DeletedTargetRepository,
-        AvailabilityBucketRepository, AggregationLeaseRepository, SlaTargetRepository, SlowThresholdRepository,
-        UserRepository, AcknowledgmentRepository, AuditLogRepository
-    )
-
-try:
-    from telegram_notifier import (
-        get_telegram_config, save_telegram_config, test_telegram_connection
-    )
-except ImportError:
-    from alarm.telegram_notifier import (
-        get_telegram_config, save_telegram_config, test_telegram_connection
-    )
-
-try:
-    from auth import (
-        API_KEY, require_api_key, require_webhook_secret, get_api_key, get_webhook_secret,
-        get_session_secret, hash_password, verify_password, get_current_authenticated_user,
-        has_permission, require_permission, require_auth, require_admin, ROLE_PERMISSIONS
-    )
-except ImportError:
-    from alarm.auth import (
-        API_KEY, require_api_key, require_webhook_secret, get_api_key, get_webhook_secret,
-        get_session_secret, hash_password, verify_password, get_current_authenticated_user,
-        has_permission, require_permission, require_auth, require_admin, ROLE_PERMISSIONS
-    )
-
+# ── Structured Domain Imports (Modular Architecture) ──────────────────────────
 try:
     from config import (
+        DATA_DIR, ALARM_DIR,
         DEFAULT_JOB_FILTER, ALERTNAME_TARGET_DOWN, ALERTNAME_SLOW_RESPONSE,
         DEFAULT_SLOW_RESPONSE_THRESHOLD_MS, SCRAPE_INTERVAL_SECONDS,
         _AVAIL_FRESHNESS_TOLERANCE_SEC, _AVAIL_STALE_BUCKET_TOLERANCE_SEC,
     )
-    import json_store
-    from json_store import load_json, save_json  # re-export for `from app import …`
-    import website_targets
-    from website_targets import (
+    import storage
+    from storage import (
+        init_db, IncidentRepository, EventLogRepository,
+        MaintenanceRepository, DependencyRepository, EndpointRepository, DeletedTargetRepository,
+        AvailabilityBucketRepository, AggregationLeaseRepository, SlaTargetRepository, SlowThresholdRepository,
+        UserRepository, AcknowledgmentRepository, AuditLogRepository,
+        load_json, save_json,
         get_targets_file, _targets_write_lock, WEBSITES_JOB_LABEL,
         _WEBSITE_TARGETS_CACHE, _WEBSITE_TARGETS_CACHE_LOCK,
         load_website_targets, save_website_targets,
         load_deleted_targets, save_deleted_targets,
     )
-    from rate_limit import (
+    from storage import json_store, targets_store as website_targets
+    import web
+    from web import (
         rate_limit, _client_identity, _RATE_BUCKETS, _RATE_BUCKETS_LOCK,
         _RATE_LAST_PRUNE, _RATE_PRUNE_INTERVAL, _LOGIN_FAILS, _LOGIN_FAILS_LOCK,
         _LOGIN_MAX_FAILS, _LOGIN_LOCK_SECONDS, _login_locked, _login_note_failure,
-        _login_clear,
+        _login_clear, register_web_middleware, _is_blocked_ip, is_safe_endpoint_url,
     )
-    from web_middleware import register_web_middleware
-    import ssrf
-    from ssrf import _is_blocked_ip, is_safe_endpoint_url
-    from monitoring_primitives import (
+    from web import ssrf
+    import core.auth as auth
+    from core.auth import (
+        API_KEY, require_api_key, require_webhook_secret, get_api_key, get_webhook_secret,
+        get_session_secret, hash_password, verify_password, get_current_authenticated_user,
+        has_permission, require_permission, require_auth, require_admin, ROLE_PERMISSIONS
+    )
+    import core.alerts.telegram as telegram_notifier
+    from core.alerts.telegram import (
+        get_telegram_config, save_telegram_config, test_telegram_connection
+    )
+    import core.alerts.engine as alerts
+    from core.alerts.engine import (
+        _WEBHOOK_LOCK, _LAST_WEBHOOK_AT, active_incident_list,
+        _request_memo, _invalidate_maint_cache, _invalidate_dep_cache,
+        load_maintenance_windows, maintenance_windows_by_instance,
+        get_active_maintenance, record_alert_event,
+        load_dependencies, apply_correlation_suppression,
+    )
+    import core.availability.fleet as fleet_availability
+    from core.availability.fleet import (
+        summarize_entries, reconstruct_time_series_intervals, calculate_percentile,
+        clip_hourly_bucket, merge_hybrid_target_availability, merge_hybrid_fleet_availability,
+        derive_bucket_inputs, estimate_instance_cadence, sla_budget, get_sla_target_pct,
+        get_availability_settings, save_availability_settings, classify_probe_failure
+    )
+    import core.availability.helpers as availability
+    from core.availability.helpers import (
+        _attach_sla_budgets, _availability_status_counts, _build_fleet_trend,
+        _FLEET_TREND_CACHE, _FLEET_TREND_CACHE_TTL,
+    )
+    import core.monitoring.primitives as monitoring_primitives
+    from core.monitoring.primitives import (
         parse_alert_timestamp, alert_key, TARGET_HOST_RE, _BLOCKED_TARGET_HOSTS,
         is_valid_target, matches_job_filter, normalize_target, _parse_epoch_ts,
         _sane_epoch, _earliest_outage_start, classify_scrape_failure,
         _extract_host, find_node_exporter_status, OUTAGE_GRACE_SECONDS,
         _outage_past_grace, _PROM_DURATION_RE, _parse_prom_duration_sec,
     )
-    import prometheus_client as promclient
-    from prometheus_client import (
+    import core.monitoring.client as promclient
+    from core.monitoring.client import (
         _DEFAULT_PROM_URL, load_endpoints, _ENDPOINTS_CACHE,
         LAST_WORKING_PROMETHEUS_URL, PROMETHEUS_CACHE, PROMETHEUS_CACHE_LOCK,
         PROMETHEUS_CACHE_TTL_DEFAULT, _SHARED_EXECUTOR,
@@ -113,31 +98,18 @@ try:
         _cached_is_safe_endpoint_url, _filter_safe_candidates,
         fetch_url, fetch_prometheus_json,
     )
-    import prom_queries
-    from prom_queries import (
+    import core.monitoring.queries as prom_queries
+    from core.monitoring.queries import (
         fetch_prom_query_map, fetch_prom_range_map,
         fetch_down_since_prom_map, fetch_all_probe_metrics,
     )
-    import alerts
-    from alerts import (
-        _WEBHOOK_LOCK, _LAST_WEBHOOK_AT, active_incident_list,
-        _request_memo, _invalidate_maint_cache, _invalidate_dep_cache,
-        load_maintenance_windows, maintenance_windows_by_instance,
-        get_active_maintenance, record_alert_event,
-        load_dependencies, apply_correlation_suppression,
-    )
-    import monitoring_state
-    from monitoring_state import (
+    import core.monitoring.state as monitoring_state
+    from core.monitoring.state import (
         _derive_probe_readings, build_canonical_monitoring_state,
         get_instance_job_map, get_instance_cadence_map, get_monitored_instances,
     )
-    import availability
-    from availability import (
-        _attach_sla_budgets, _availability_status_counts, _build_fleet_trend,
-        _FLEET_TREND_CACHE, _FLEET_TREND_CACHE_TTL,
-    )
-    import background_workers
-    from background_workers import (
+    import core.workers.poller as background_workers
+    from core.workers.poller import (
         ALERT_POLL_INTERVAL_SECONDS, WEBHOOK_ACTIVE_WINDOW_SECONDS, SLOW_RESPONSE_DEBOUNCE_N,
         AVAIL_AGGREGATE_INTERVAL_SECONDS, AVAIL_BUCKET_RETENTION_SECONDS,
         _AVAIL_AGGREGATOR_WORKER_ID, _LAST_POLLER_TICK, _LAST_AGGREGATOR_TICK,
@@ -149,37 +121,72 @@ try:
     )
 except ImportError:
     from alarm.config import (
+        DATA_DIR, ALARM_DIR,
         DEFAULT_JOB_FILTER, ALERTNAME_TARGET_DOWN, ALERTNAME_SLOW_RESPONSE,
         DEFAULT_SLOW_RESPONSE_THRESHOLD_MS, SCRAPE_INTERVAL_SECONDS,
         _AVAIL_FRESHNESS_TOLERANCE_SEC, _AVAIL_STALE_BUCKET_TOLERANCE_SEC,
     )
-    from alarm import json_store
-    from alarm.json_store import load_json, save_json
-    from alarm import website_targets
-    from alarm.website_targets import (
+    import alarm.storage as storage
+    from alarm.storage import (
+        init_db, IncidentRepository, EventLogRepository,
+        MaintenanceRepository, DependencyRepository, EndpointRepository, DeletedTargetRepository,
+        AvailabilityBucketRepository, AggregationLeaseRepository, SlaTargetRepository, SlowThresholdRepository,
+        UserRepository, AcknowledgmentRepository, AuditLogRepository,
+        load_json, save_json,
         get_targets_file, _targets_write_lock, WEBSITES_JOB_LABEL,
         _WEBSITE_TARGETS_CACHE, _WEBSITE_TARGETS_CACHE_LOCK,
         load_website_targets, save_website_targets,
         load_deleted_targets, save_deleted_targets,
     )
-    from alarm.rate_limit import (
+    from alarm.storage import json_store, targets_store as website_targets
+    import alarm.web as web
+    from alarm.web import (
         rate_limit, _client_identity, _RATE_BUCKETS, _RATE_BUCKETS_LOCK,
         _RATE_LAST_PRUNE, _RATE_PRUNE_INTERVAL, _LOGIN_FAILS, _LOGIN_FAILS_LOCK,
         _LOGIN_MAX_FAILS, _LOGIN_LOCK_SECONDS, _login_locked, _login_note_failure,
-        _login_clear,
+        _login_clear, register_web_middleware, _is_blocked_ip, is_safe_endpoint_url,
     )
-    from alarm.web_middleware import register_web_middleware
-    from alarm import ssrf
-    from alarm.ssrf import _is_blocked_ip, is_safe_endpoint_url
-    from alarm.monitoring_primitives import (
+    from alarm.web import ssrf
+    import alarm.core.auth as auth
+    from alarm.core.auth import (
+        API_KEY, require_api_key, require_webhook_secret, get_api_key, get_webhook_secret,
+        get_session_secret, hash_password, verify_password, get_current_authenticated_user,
+        has_permission, require_permission, require_auth, require_admin, ROLE_PERMISSIONS
+    )
+    import alarm.core.alerts.telegram as telegram_notifier
+    from alarm.core.alerts.telegram import (
+        get_telegram_config, save_telegram_config, test_telegram_connection
+    )
+    import alarm.core.alerts.engine as alerts
+    from alarm.core.alerts.engine import (
+        _WEBHOOK_LOCK, _LAST_WEBHOOK_AT, active_incident_list,
+        _request_memo, _invalidate_maint_cache, _invalidate_dep_cache,
+        load_maintenance_windows, maintenance_windows_by_instance,
+        get_active_maintenance, record_alert_event,
+        load_dependencies, apply_correlation_suppression,
+    )
+    import alarm.core.availability.fleet as fleet_availability
+    from alarm.core.availability.fleet import (
+        summarize_entries, reconstruct_time_series_intervals, calculate_percentile,
+        clip_hourly_bucket, merge_hybrid_target_availability, merge_hybrid_fleet_availability,
+        derive_bucket_inputs, estimate_instance_cadence, sla_budget, get_sla_target_pct,
+        get_availability_settings, save_availability_settings, classify_probe_failure
+    )
+    import alarm.core.availability.helpers as availability
+    from alarm.core.availability.helpers import (
+        _attach_sla_budgets, _availability_status_counts, _build_fleet_trend,
+        _FLEET_TREND_CACHE, _FLEET_TREND_CACHE_TTL,
+    )
+    import alarm.core.monitoring.primitives as monitoring_primitives
+    from alarm.core.monitoring.primitives import (
         parse_alert_timestamp, alert_key, TARGET_HOST_RE, _BLOCKED_TARGET_HOSTS,
         is_valid_target, matches_job_filter, normalize_target, _parse_epoch_ts,
         _sane_epoch, _earliest_outage_start, classify_scrape_failure,
         _extract_host, find_node_exporter_status, OUTAGE_GRACE_SECONDS,
         _outage_past_grace, _PROM_DURATION_RE, _parse_prom_duration_sec,
     )
-    from alarm import prometheus_client as promclient
-    from alarm.prometheus_client import (
+    import alarm.core.monitoring.client as promclient
+    from alarm.core.monitoring.client import (
         _DEFAULT_PROM_URL, load_endpoints, _ENDPOINTS_CACHE,
         LAST_WORKING_PROMETHEUS_URL, PROMETHEUS_CACHE, PROMETHEUS_CACHE_LOCK,
         PROMETHEUS_CACHE_TTL_DEFAULT, _SHARED_EXECUTOR,
@@ -191,31 +198,18 @@ except ImportError:
         _cached_is_safe_endpoint_url, _filter_safe_candidates,
         fetch_url, fetch_prometheus_json,
     )
-    from alarm import prom_queries
-    from alarm.prom_queries import (
+    import alarm.core.monitoring.queries as prom_queries
+    from alarm.core.monitoring.queries import (
         fetch_prom_query_map, fetch_prom_range_map,
         fetch_down_since_prom_map, fetch_all_probe_metrics,
     )
-    from alarm import alerts
-    from alarm.alerts import (
-        _WEBHOOK_LOCK, _LAST_WEBHOOK_AT, active_incident_list,
-        _request_memo, _invalidate_maint_cache, _invalidate_dep_cache,
-        load_maintenance_windows, maintenance_windows_by_instance,
-        get_active_maintenance, record_alert_event,
-        load_dependencies, apply_correlation_suppression,
-    )
-    from alarm import monitoring_state
-    from alarm.monitoring_state import (
+    import alarm.core.monitoring.state as monitoring_state
+    from alarm.core.monitoring.state import (
         _derive_probe_readings, build_canonical_monitoring_state,
         get_instance_job_map, get_instance_cadence_map, get_monitored_instances,
     )
-    from alarm import availability
-    from alarm.availability import (
-        _attach_sla_budgets, _availability_status_counts, _build_fleet_trend,
-        _FLEET_TREND_CACHE, _FLEET_TREND_CACHE_TTL,
-    )
-    from alarm import background_workers
-    from alarm.background_workers import (
+    import alarm.core.workers.poller as background_workers
+    from alarm.core.workers.poller import (
         ALERT_POLL_INTERVAL_SECONDS, WEBHOOK_ACTIVE_WINDOW_SECONDS, SLOW_RESPONSE_DEBOUNCE_N,
         AVAIL_AGGREGATE_INTERVAL_SECONDS, AVAIL_BUCKET_RETENTION_SECONDS,
         _AVAIL_AGGREGATOR_WORKER_ID, _LAST_POLLER_TICK, _LAST_AGGREGATOR_TICK,

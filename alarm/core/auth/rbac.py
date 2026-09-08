@@ -29,9 +29,25 @@ from werkzeug.security import generate_password_hash, check_password_hash
 
 logger = logging.getLogger("infrawatch.auth")
 
-DEFAULT_API_KEY_FILE = os.path.join(os.path.dirname(__file__), ".api_key")
-DEFAULT_WEBHOOK_SECRET_FILE = os.path.join(os.path.dirname(__file__), ".webhook_secret")
-DEFAULT_SESSION_SECRET_FILE = os.path.join(os.path.dirname(__file__), ".session_secret")
+try:
+    from config import DATA_DIR, ALARM_DIR
+except ImportError:
+    from alarm.config import DATA_DIR, ALARM_DIR
+
+DEFAULT_API_KEY_FILE = os.path.join(DATA_DIR, ".api_key")
+DEFAULT_WEBHOOK_SECRET_FILE = os.path.join(DATA_DIR, ".webhook_secret")
+DEFAULT_SESSION_SECRET_FILE = os.path.join(DATA_DIR, ".session_secret")
+
+# Safe migration: if secrets exist in legacy ALARM_DIR and not in DATA_DIR, copy them over.
+try:
+    for _fn in (".api_key", ".webhook_secret", ".session_secret"):
+        _legacy = os.path.join(ALARM_DIR, _fn)
+        _target = os.path.join(DATA_DIR, _fn)
+        if os.path.exists(_legacy) and not os.path.exists(_target):
+            import shutil
+            shutil.copy2(_legacy, _target)
+except Exception:
+    pass
 
 # ── Role & Permission Definitions ─────────────────────────────────────────────
 # 'owner' is the founding account created by first-boot /api/auth/setup. It

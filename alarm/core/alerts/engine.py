@@ -18,15 +18,13 @@ import time
 from flask import g, has_request_context
 
 try:
-    import json_store
-    from monitoring_primitives import _parse_epoch_ts
-    from storage import IncidentRepository, MaintenanceRepository, DependencyRepository
-    from telegram_notifier import dispatch_alert_async
-except ImportError:  # pragma: no cover
-    from alarm import json_store
-    from alarm.monitoring_primitives import _parse_epoch_ts
-    from alarm.storage import IncidentRepository, MaintenanceRepository, DependencyRepository
-    from alarm.telegram_notifier import dispatch_alert_async
+    from storage import json_store, IncidentRepository, MaintenanceRepository, DependencyRepository
+    from core.monitoring.primitives import _parse_epoch_ts
+    from .telegram import dispatch_alert_async
+except (ImportError, ValueError):
+    from alarm.storage import json_store, IncidentRepository, MaintenanceRepository, DependencyRepository
+    from alarm.core.monitoring.primitives import _parse_epoch_ts
+    from alarm.core.alerts.telegram import dispatch_alert_async
 
 logger = logging.getLogger("infrawatch")
 

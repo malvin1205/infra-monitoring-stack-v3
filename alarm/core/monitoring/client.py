@@ -23,10 +23,10 @@ from urllib.request import urlopen, Request
 from urllib.error import URLError
 
 try:
-    import ssrf
+    from web import ssrf
     from storage import EndpointRepository, AvailabilityBucketRepository
-except ImportError:  # pragma: no cover - import style shim, mirrors app.py
-    from alarm import ssrf
+except ImportError:  # pragma: no cover
+    from alarm.web import ssrf
     from alarm.storage import EndpointRepository, AvailabilityBucketRepository
 
 logger = logging.getLogger("infrawatch")

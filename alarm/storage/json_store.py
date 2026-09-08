@@ -18,11 +18,27 @@ import time
 
 logger = logging.getLogger("infrawatch")
 
-_DIR = os.path.dirname(__file__)
+try:
+    from config import DATA_DIR, ALARM_DIR
+except ImportError:
+    from alarm.config import DATA_DIR, ALARM_DIR
+
+_DIR = DATA_DIR
 STATUS_FILE = os.path.join(_DIR, "status.json")
 HISTORY_FILE = os.path.join(_DIR, "history.json")
 HISTORY_ARCHIVE_FILE = os.path.join(_DIR, "history_archive.json")
 LOGS_FILE = os.path.join(_DIR, "logs.json")
+
+# Safe migration: if JSON caches exist in legacy ALARM_DIR and not in DATA_DIR, copy them over.
+try:
+    for _fn in ("status.json", "history.json", "history_archive.json", "logs.json"):
+        _legacy = os.path.join(ALARM_DIR, _fn)
+        _target = os.path.join(DATA_DIR, _fn)
+        if os.path.exists(_legacy) and not os.path.exists(_target):
+            import shutil
+            shutil.copy2(_legacy, _target)
+except Exception:
+    pass
 
 MAX_HISTORY = 1000
 MAX_LOGS = 200

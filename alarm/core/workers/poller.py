@@ -26,35 +26,31 @@ import logging
 try:
     from config import DEFAULT_SLOW_RESPONSE_THRESHOLD_MS, SCRAPE_INTERVAL_SECONDS
     from config import ALERTNAME_TARGET_DOWN, ALERTNAME_SLOW_RESPONSE
-    import json_store
     from storage import (
-        IncidentRepository, AvailabilityBucketRepository,
+        json_store, IncidentRepository, AvailabilityBucketRepository,
         AggregationLeaseRepository, SlowThresholdRepository,
     )
-    from monitoring_primitives import classify_scrape_failure, _outage_past_grace
-    from prometheus_client import _SHARED_EXECUTOR
-    from alerts import (
+    from core.monitoring import classify_scrape_failure, _outage_past_grace, _SHARED_EXECUTOR
+    from core.alerts import (
         _LAST_WEBHOOK_AT, active_incident_list, record_alert_event,
         load_maintenance_windows, get_active_maintenance,
     )
-    from fleet_availability import (
+    from core.availability import (
         reconstruct_time_series_intervals, derive_bucket_inputs, estimate_instance_cadence,
     )
-except ImportError:
+except (ImportError, ValueError):
     from alarm.config import DEFAULT_SLOW_RESPONSE_THRESHOLD_MS, SCRAPE_INTERVAL_SECONDS
     from alarm.config import ALERTNAME_TARGET_DOWN, ALERTNAME_SLOW_RESPONSE
-    from alarm import json_store
     from alarm.storage import (
-        IncidentRepository, AvailabilityBucketRepository,
+        json_store, IncidentRepository, AvailabilityBucketRepository,
         AggregationLeaseRepository, SlowThresholdRepository,
     )
-    from alarm.monitoring_primitives import classify_scrape_failure, _outage_past_grace
-    from alarm.prometheus_client import _SHARED_EXECUTOR
-    from alarm.alerts import (
+    from alarm.core.monitoring import classify_scrape_failure, _outage_past_grace, _SHARED_EXECUTOR
+    from alarm.core.alerts import (
         _LAST_WEBHOOK_AT, active_incident_list, record_alert_event,
         load_maintenance_windows, get_active_maintenance,
     )
-    from alarm.fleet_availability import (
+    from alarm.core.availability import (
         reconstruct_time_series_intervals, derive_bucket_inputs, estimate_instance_cadence,
     )
 

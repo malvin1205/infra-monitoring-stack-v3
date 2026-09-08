@@ -16,11 +16,11 @@ import logging
 from urllib.parse import quote
 
 try:
-    import prometheus_client as promclient
-    from fleet_availability import sla_budget
-except ImportError:
-    from alarm import prometheus_client as promclient
-    from alarm.fleet_availability import sla_budget
+    from .fleet import sla_budget
+    from core.monitoring import client as promclient
+except (ImportError, ValueError):
+    from alarm.core.availability.fleet import sla_budget
+    from alarm.core.monitoring import client as promclient
 
 logger = logging.getLogger("infrawatch")
 

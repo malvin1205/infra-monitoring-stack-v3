@@ -101,7 +101,19 @@ def get_sla_target_pct() -> float:
 # Same JSON-file + get/save pattern as telegram_notifier.get_telegram_config /
 # save_telegram_config -- the app's one existing "settings" mechanism, reused
 # here rather than inventing a second one.
-AVAILABILITY_SETTINGS_FILE = os.path.join(os.path.dirname(__file__), "availability_settings.json")
+try:
+    from config import DATA_DIR, ALARM_DIR
+except ImportError:
+    from alarm.config import DATA_DIR, ALARM_DIR
+
+AVAILABILITY_SETTINGS_FILE = os.path.join(DATA_DIR, "availability_settings.json")
+try:
+    _legacy_avail = os.path.join(ALARM_DIR, "availability_settings.json")
+    if os.path.exists(_legacy_avail) and not os.path.exists(AVAILABILITY_SETTINGS_FILE):
+        import shutil
+        shutil.copy2(_legacy_avail, AVAILABILITY_SETTINGS_FILE)
+except Exception:
+    pass
 
 
 def get_availability_settings() -> Dict[str, Any]:

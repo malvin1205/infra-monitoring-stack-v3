@@ -7,8 +7,22 @@ from typing import List, Dict, Any, Optional
 
 from contextlib import contextmanager
 
-DB_DIR = os.path.dirname(__file__)
-DEFAULT_DB_PATH = os.path.join(DB_DIR, "infrawatch.db")
+try:
+    from config import DATA_DIR, ALARM_DIR
+except ImportError:
+    from alarm.config import DATA_DIR, ALARM_DIR
+
+DB_DIR = DATA_DIR
+DEFAULT_DB_PATH = os.environ.get("INFRAWATCH_DB_PATH", os.path.join(DB_DIR, "infrawatch.db"))
+
+# Safe migration: if DB doesn't exist in DATA_DIR but exists in legacy ALARM_DIR, copy it over.
+try:
+    _legacy_db = os.path.join(ALARM_DIR, "infrawatch.db")
+    if not os.path.exists(DEFAULT_DB_PATH) and os.path.exists(_legacy_db):
+        import shutil
+        shutil.copy2(_legacy_db, DEFAULT_DB_PATH)
+except Exception:
+    pass
 
 
 _INITIALIZED_DBS = set()

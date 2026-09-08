@@ -18,10 +18,10 @@ import threading
 import yaml
 
 try:
-    from monitoring_primitives import normalize_target
-    from storage import DeletedTargetRepository
-except ImportError:  # pragma: no cover
-    from alarm.monitoring_primitives import normalize_target
+    from core.monitoring.primitives import normalize_target
+    from .db import DeletedTargetRepository
+except (ImportError, ValueError):
+    from alarm.core.monitoring.primitives import normalize_target
     from alarm.storage import DeletedTargetRepository
 
 logger = logging.getLogger("infrawatch")
@@ -57,7 +57,20 @@ def get_targets_file():
     if env_target:
         return env_target
 
-    local_target = os.path.abspath(os.path.join(os.path.dirname(__file__), "targets", "websites.yml"))
+    try:
+        from config import ALARM_DIR
+    except ImportError:
+        try:
+            from alarm.config import ALARM_DIR
+        except ImportError:
+            ALARM_DIR = os.path.dirname(os.path.abspath(__file__))
+
+    local_target = os.path.abspath(os.path.join(ALARM_DIR, "targets", "websites.yml"))
+    if not os.path.isfile(local_target):
+        # Fallback if called from a subpackage where ALARM_DIR was not resolved
+        alt_target = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "targets", "websites.yml"))
+        if os.path.isfile(alt_target):
+            local_target = alt_target
     if os.path.isfile(local_target):
         return local_target
 

@@ -16,43 +16,49 @@ workers.
 import time
 
 try:
-    import prometheus_client as promclient
-    import prom_queries
+    from . import client as promclient
+    from . import queries as prom_queries
+    from . import primitives as monitoring_primitives
+    from .primitives import (
+        matches_job_filter, classify_scrape_failure, _earliest_outage_start,
+        _sane_epoch, _outage_past_grace, _extract_host, find_node_exporter_status,
+        _parse_prom_duration_sec,
+    )
     from config import (
         DEFAULT_JOB_FILTER, ALERTNAME_TARGET_DOWN,
         DEFAULT_SLOW_RESPONSE_THRESHOLD_MS, SCRAPE_INTERVAL_SECONDS,
     )
-    from monitoring_primitives import (
+    from storage import (
+        load_website_targets, load_deleted_targets,
+        SlowThresholdRepository, AcknowledgmentRepository,
+    )
+    from core.alerts import (
+        active_incident_list, load_maintenance_windows, get_active_maintenance,
+        load_dependencies, apply_correlation_suppression,
+    )
+    from core.availability import classify_probe_failure, get_availability_settings
+except (ImportError, ValueError):
+    from alarm.core.monitoring import client as promclient
+    from alarm.core.monitoring import queries as prom_queries
+    from alarm.core.monitoring import primitives as monitoring_primitives
+    from alarm.core.monitoring.primitives import (
         matches_job_filter, classify_scrape_failure, _earliest_outage_start,
         _sane_epoch, _outage_past_grace, _extract_host, find_node_exporter_status,
         _parse_prom_duration_sec,
     )
-    from website_targets import load_website_targets, load_deleted_targets
-    from alerts import (
-        active_incident_list, load_maintenance_windows, get_active_maintenance,
-        load_dependencies, apply_correlation_suppression,
-    )
-    from fleet_availability import classify_probe_failure, get_availability_settings
-    from storage import SlowThresholdRepository, AcknowledgmentRepository
-except ImportError:  # pragma: no cover
-    from alarm import prometheus_client as promclient
-    from alarm import prom_queries
     from alarm.config import (
         DEFAULT_JOB_FILTER, ALERTNAME_TARGET_DOWN,
         DEFAULT_SLOW_RESPONSE_THRESHOLD_MS, SCRAPE_INTERVAL_SECONDS,
     )
-    from alarm.monitoring_primitives import (
-        matches_job_filter, classify_scrape_failure, _earliest_outage_start,
-        _sane_epoch, _outage_past_grace, _extract_host, find_node_exporter_status,
-        _parse_prom_duration_sec,
+    from alarm.storage import (
+        load_website_targets, load_deleted_targets,
+        SlowThresholdRepository, AcknowledgmentRepository,
     )
-    from alarm.website_targets import load_website_targets, load_deleted_targets
-    from alarm.alerts import (
+    from alarm.core.alerts import (
         active_incident_list, load_maintenance_windows, get_active_maintenance,
         load_dependencies, apply_correlation_suppression,
     )
-    from alarm.fleet_availability import classify_probe_failure, get_availability_settings
-    from alarm.storage import SlowThresholdRepository, AcknowledgmentRepository
+    from alarm.core.availability import classify_probe_failure, get_availability_settings
 
 
 # ── Canonical Monitoring State Engine ───────────────────────────────────────

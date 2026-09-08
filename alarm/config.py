@@ -10,6 +10,16 @@ is unchanged.
 """
 import os
 
+# Root application directory and runtime data directory.
+# Keeping mutable state (SQLite, JSON caches, secrets) inside DATA_DIR ensures
+# clean separation from Python source code.
+ALARM_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.environ.get("INFRAWATCH_DATA_DIR") or os.path.join(ALARM_DIR, "data")
+try:
+    os.makedirs(DATA_DIR, exist_ok=True)
+except Exception:
+    pass
+
 # Default Prometheus job filter for /instances, /api/availability, the poller
 # and the aggregator. "all" (or "*") means "every job except prometheus".
 DEFAULT_JOB_FILTER = os.environ.get("JOB_FILTER", "all")
