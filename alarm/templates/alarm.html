@@ -317,7 +317,6 @@
               <button class="chip chip-active" data-range="24h" id="rangePreset24h">24h</button>
               <button class="chip" data-range="7d" id="rangePreset7d">7d</button>
               <button class="chip" data-range="30d" id="rangePreset30d">30d</button>
-              <button class="chip" data-range="since" id="rangePresetSince" title="As far back as the archive still reaches (up to ~35 days) → now">Max history</button>
               <button class="chip" data-range="mtd" id="rangePresetMtd" title="From 00:00 UTC on the 1st of this month → now (calendar SLA period)">Month to date</button>
               <button class="chip" data-range="custom" id="rangePresetCustom">Custom Range</button>
             </div>
@@ -893,7 +892,6 @@
               <option value="1440" selected>Last 24 Hours</option>
               <option value="10080">Last 7 Days</option>
               <option value="43200">Last 30 Days</option>
-              <option value="since">Max history</option>
               <option value="mtd">Month to date</option>
             </select>
           </div>
@@ -1006,9 +1004,9 @@
           <span id="metricCoverageRatio">—</span>
         </div>
 
-        <!-- Section: Availability Trend (24h) -->
+        <!-- Section: Availability Trend — window follows the selected range -->
         <section class="avb-trend-section" aria-label="Availability trend">
-          <h4 class="avb-sec-title">Availability Trend <span class="modal-title-sub">· last 24h</span></h4>
+          <h4 class="avb-sec-title">Availability Trend <span class="modal-title-sub">· selected range</span></h4>
           <div class="avb-trend-card">
             <div class="avb-trend-plot" id="avbTrendPlot">
               <div class="avb-trend-grid" aria-hidden="true">
@@ -1020,8 +1018,8 @@
                 <svg viewBox="0 0 48 24" width="52" height="26" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                   <polyline points="1 18 10 12 18 15 27 6 36 9 47 3"></polyline>
                 </svg>
-                <p>No 24-hour trend series for this window yet.</p>
-                <span>The line chart populates once enough hourly availability buckets are recorded.</span>
+                <p>No trend series for this range yet.</p>
+                <span>The line chart populates once Prometheus has telemetry across the selected range.</span>
               </div>
             </div>
             <div class="avb-trend-xaxis" aria-hidden="true">

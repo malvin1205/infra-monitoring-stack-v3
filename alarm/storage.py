@@ -1067,16 +1067,6 @@ class AvailabilityBucketRepository:
             return float(row["max_end"]) if row and row["max_end"] is not None else None
 
     @staticmethod
-    def get_earliest_bucket_start(job: str = 'all', db_path: Optional[str] = None) -> Optional[float]:
-        """Oldest materialized bucket — the start of "since data began" ranges."""
-        with db_read(db_path) as conn:
-            row = conn.execute(
-                "SELECT MIN(bucket_start) as min_start FROM availability_buckets WHERE (job = ? OR ? = 'all')",
-                (job, job)
-            ).fetchone()
-            return float(row["min_start"]) if row and row["min_start"] is not None else None
-
-    @staticmethod
     def get_bucket_count_in_range(job: str, start_time: float, end_time: float, db_path: Optional[str] = None) -> int:
         with db_read(db_path) as conn:
             if job == 'all':

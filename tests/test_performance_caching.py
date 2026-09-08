@@ -240,6 +240,7 @@ class PerformanceCachingTests(unittest.TestCase):
 
         with patch.object(alarm_app, 'get_monitored_instances', return_value=['srv-sf-1', 'srv-sf-2']), \
              patch.object(json_store, 'load_json', return_value=[]), \
+             patch.object(alarm_app, '_build_fleet_trend', return_value=([], 3600)), \
              patch.object(alarm_app, 'fetch_prom_query_map', side_effect=fake_query_map):
 
             def make_avail_call(_):

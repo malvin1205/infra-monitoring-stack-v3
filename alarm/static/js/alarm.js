@@ -606,8 +606,6 @@ class InstancesPage {
       jobSelect.addEventListener('change', async e => {
         this.selectedJob = e.target.value;
         this._lastDataSignature = null;
-        // "Max history" span is job-scoped — re-resolve before reloading.
-        if (this.periodLabel === 'since') this.periodMinutes = await this._resolveSinceMinutes();
         this.load();
         this.loadAvailability();
         this._updateJobDefaultUI();
@@ -634,14 +632,12 @@ class InstancesPage {
         this._closeCustomRangePopover();
         this._setActiveRangeChip(range);
 
-        if (range === 'since' || range === 'mtd') {
+        if (range === 'mtd') {
           this.isRealtime = false;
           if (this.availabilityDetailBtn) this.availabilityDetailBtn.style.display = '';
           this.periodEnd = null;
           this.periodLabel = range;
-          this.periodMinutes = range === 'mtd'
-            ? this._monthToDateMinutes()
-            : await this._resolveSinceMinutes();
+          this.periodMinutes = this._monthToDateMinutes();
           const modalRangeSelectEl = document.getElementById('modalRangeSelect');
           if (modalRangeSelectEl) modalRangeSelectEl.value = range;
           this.loadAvailability(true);
@@ -725,15 +721,12 @@ class InstancesPage {
     const modalRangeSelect = document.getElementById('modalRangeSelect');
     if (modalRangeSelect) {
       modalRangeSelect.addEventListener('change', async e => {
-        if (e.target.value === 'since' || e.target.value === 'mtd') {
-          const v = e.target.value;
+        if (e.target.value === 'mtd') {
           this.isRealtime = false;
           this.periodEnd = null;
-          this.periodLabel = v;
-          this.periodMinutes = v === 'mtd'
-            ? this._monthToDateMinutes()
-            : await this._resolveSinceMinutes();
-          this._setActiveRangeChip(v);
+          this.periodLabel = 'mtd';
+          this.periodMinutes = this._monthToDateMinutes();
+          this._setActiveRangeChip('mtd');
           this.loadAvailability(true);
           return;
         }
@@ -1329,7 +1322,6 @@ class InstancesPage {
     else if (respMinutes === 10080) label = '7d';
     else if (respMinutes === 43200) label = '30d';
     if (this.periodLabel === 'custom') label = 'Custom';
-    else if (this.periodLabel === 'since') label = 'Max history';
     else if (this.periodLabel === 'mtd') label = 'Month to date';
 
     if (this.availabilityLabel) this.availabilityLabel.textContent = `Availability (${label})${limited ? ' · limited data' : ''}`;
@@ -1472,30 +1464,8 @@ class InstancesPage {
   // Human label for the active range, used in every "Availability (…)" caption.
   _rangeDisplay() {
     if (this.periodLabel === 'custom') return 'Custom';
-    if (this.periodLabel === 'since') return 'Max history';
     if (this.periodLabel === 'mtd') return 'Month to date';
     return this.periodLabel || '24h';
-  }
-
-  // "Max history" is dynamic — ask the backend for the span from the oldest
-  // bucket still in the archive (scoped to the current job filter) to now, in
-  // minutes; the backend caps it at bucket retention (~35d). Falls back to 24h
-  // when nothing has been recorded yet. Re-resolved on each
-  // explicit range/job change, not on the 15s poll (the span only creeps by
-  // 15s a tick — not worth a request each time).
-  async _resolveSinceMinutes() {
-    try {
-      let u = '/api/availability/data-range';
-      if (this.selectedJob && this.selectedJob !== 'all') u += `?job=${encodeURIComponent(this.selectedJob)}`;
-      const r = await fetch(u);
-      const d = await r.json();
-      if (d && d.ok && d.minutes) {
-        this._sinceStartTs = d.since_ts || null;
-        return Math.max(1, Math.round(d.minutes));
-      }
-    } catch (e) { /* fall through to default */ }
-    this._sinceStartTs = null;
-    return 1440;
   }
 
   _toggleCustomRangePopover() {
@@ -2039,21 +2009,68 @@ class InstancesPage {
     return avail >= 99.9 ? { cls: 'alt-ok', label: 'COMPLIANT' } : { cls: 'alt-warning', label: 'NON-COMPLIANT' };
   }
 
-  /* ── Availability Trend chart (24h hourly fleet availability) ──
+  // Human duration label for an offset of `sec` seconds before "now".
+  _trendOffsetLabel(sec) {
+    if (sec <= 60) return 'now';
+    if (sec < 3600) return `-${Math.round(sec / 60)}m`;
+    if (sec < 86400 * 2) return `-${Math.round(sec / 3600)}h`;
+    return `-${Math.round(sec / 86400)}d`;
+  }
+
+  // Absolute timestamp label for the hover tooltip — time-of-day for short
+  // windows, calendar date for multi-day ones.
+  _trendTsLabel(ts, windowSec) {
+    const d = new Date(ts * 1000);
+    const pad = n => String(n).padStart(2, '0');
+    if (windowSec <= 86400 * 2) {
+      return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    }
+    const mon = d.toLocaleString(undefined, { month: 'short' });
+    return `${mon} ${d.getDate()}, ${pad(d.getHours())}:00`;
+  }
+
+  /* ── Availability Trend chart (hourly fleet availability) ──
      Draws data.trend ([{ts, availability_pct}], newest last) as an SVG line +
-     area into #avbTrendPlot. Fewer than 2 points -> keep the placeholder. The
-     y-axis auto-zooms to the data (100% pinned at top) and the 3 grid labels
-     are rewritten to match. ── */
+     area into #avbTrendPlot, over the SAME window the breakdown is scored for
+     (data.trend_start_ts .. data.trend_end_ts) — 24h/7d/30d/MTD/custom, not a
+     frozen 24h. Fewer than 2 points -> keep the placeholder. The y-axis
+     auto-zooms to the data (100% pinned at top). A pointer overlay adds a
+     crosshair + tooltip on hover. ── */
   _renderAvailabilityTrend(data) {
     const plot = document.getElementById('avbTrendPlot');
     if (!plot) return;
+    const section = plot.closest('.avb-trend-section');
     const emptyEl = plot.querySelector('.avb-trend-empty');
     const gridLabels = plot.querySelectorAll('.avb-trend-grid span i');
+    const subEl = section && section.querySelector('.modal-title-sub');
+    const xAxisSpans = section ? section.querySelectorAll('.avb-trend-xaxis span') : [];
     let wrap = document.getElementById('avbTrendSvgWrap');
+    let hover = document.getElementById('avbTrendHover');
 
     const pts = Array.isArray(data && data.trend)
       ? data.trend.filter(p => p && typeof p.ts === 'number' && typeof p.availability_pct === 'number')
       : [];
+
+    const endTs = typeof data.trend_end_ts === 'number' ? data.trend_end_ts : (Date.now() / 1000);
+    const startTs = typeof data.trend_start_ts === 'number' && data.trend_start_ts < endTs
+      ? data.trend_start_ts
+      : endTs - 86400;
+    const windowSec = Math.max(1, endTs - startTs);
+
+    // Caption reflects the active range (drives from periodLabel, same source
+    // as every other "Availability (…)" label in the modal).
+    if (subEl) {
+      const rangeTxt = this.periodLabel === 'mtd' ? 'month to date'
+        : this.periodLabel === 'custom' ? 'selected range'
+          : `last ${this.periodLabel || '24h'}`;
+      subEl.textContent = `· ${rangeTxt}`;
+    }
+    // 5 evenly spaced x-axis ticks across the real window.
+    if (xAxisSpans.length === 5) {
+      for (let i = 0; i < 5; i++) {
+        xAxisSpans[i].textContent = this._trendOffsetLabel(windowSec * (1 - i / 4));
+      }
+    }
 
     const resetGrid = () => {
       if (gridLabels.length === 3) {
@@ -2065,6 +2082,7 @@ class InstancesPage {
 
     if (pts.length < 2) {
       if (wrap) wrap.remove();
+      if (hover) hover.remove();
       if (emptyEl) emptyEl.classList.remove('hidden');
       resetGrid();
       return;
@@ -2073,11 +2091,8 @@ class InstancesPage {
 
     if (emptyEl) emptyEl.classList.add('hidden');
 
-    const endTs = typeof data.trend_end_ts === 'number' ? data.trend_end_ts : (Date.now() / 1000);
-    const startTs = endTs - 86400;
-
     // y-domain: 100% pinned at the top, lower bound snapped below the worst
-    // hour (never above 95, never below 0) so a near-flat healthy line still
+    // slot (never above 95, never below 0) so a near-flat healthy line still
     // shows shape without lying about the scale.
     const worst = Math.min(...pts.map(p => p.availability_pct));
     const yMax = 100;
@@ -2091,7 +2106,7 @@ class InstancesPage {
     }
 
     const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
-    const xOf = ts => clamp(((ts - startTs) / 86400) * 100, 0, 100);
+    const xOf = ts => clamp(((ts - startTs) / windowSec) * 100, 0, 100);
     const yOf = v => clamp(((yMax - v) / (yMax - yMin)) * 100, 0, 100);
     const coords = pts.map(p => [xOf(p.ts), yOf(p.availability_pct)]);
 
@@ -2113,6 +2128,50 @@ class InstancesPage {
       `<path class="avb-trend-area" d="${areaD}"></path>` +
       `<path class="avb-trend-line" d="${lineD}" vector-effect="non-scaling-stroke"></path>` +
       `</svg>`;
+
+    // ── Interactive hover overlay: crosshair + dot + tooltip on the nearest
+    // slot. Overlay + listeners are created once and reused; the point data
+    // lives on the instance so the persistent handler always sees fresh data.
+    this._trendHoverState = { coords, pts, windowSec };
+    if (!hover) {
+      hover = document.createElement('div');
+      hover.id = 'avbTrendHover';
+      hover.className = 'avb-trend-hover';
+      hover.innerHTML =
+        '<div class="avb-trend-cross"></div>' +
+        '<div class="avb-trend-dot"></div>' +
+        '<div class="avb-trend-tip"></div>';
+      plot.appendChild(hover);
+
+      const move = e => {
+        const st = this._trendHoverState;
+        if (!st || st.coords.length < 2) return;
+        const rect = hover.getBoundingClientRect();
+        if (!rect.width) return;
+        const xp = clamp(((e.clientX - rect.left) / rect.width) * 100, 0, 100);
+        let best = 0, bd = Infinity;
+        for (let i = 0; i < st.coords.length; i++) {
+          const d = Math.abs(st.coords[i][0] - xp);
+          if (d < bd) { bd = d; best = i; }
+        }
+        const [cx, cy] = st.coords[best];
+        const p = st.pts[best];
+        const cross = hover.querySelector('.avb-trend-cross');
+        const dot = hover.querySelector('.avb-trend-dot');
+        const tip = hover.querySelector('.avb-trend-tip');
+        cross.style.left = `${cx}%`;
+        dot.style.left = `${cx}%`;
+        dot.style.top = `${cy}%`;
+        tip.textContent = `${this._trendTsLabel(p.ts, st.windowSec)} · ${p.availability_pct.toFixed(2)}%`;
+        tip.style.left = `${cx}%`;
+        tip.style.top = `${cy}%`;
+        tip.classList.toggle('flip-x', cx > 62);
+        tip.classList.toggle('flip-y', cy < 22);
+        hover.classList.add('active');
+      };
+      hover.addEventListener('pointermove', move);
+      hover.addEventListener('pointerleave', () => hover.classList.remove('active'));
+    }
   }
 
   _renderAvailabilityBreakdown(source = 'direct') {

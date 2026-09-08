@@ -1559,80 +1559,103 @@ def _availability_status_counts(entries, live_map=None):
     return counts
 
 
-def _build_fleet_trend(db_bucket_records, trend_end_ts, hours=24):
-    """Per-hour fleet availability over the last `hours`, for the modal's
-    Availability Trend line chart. Fleet availability for one hour =
-    sum(uptime_seconds) / sum(coverage_seconds) across every instance's bucket
-    for that hour. Hours with zero fleet coverage are omitted (the chart shows
-    a gap). Returns [] when no materialized buckets fall in the window — the
-    frontend keeps its "not enough hourly buckets yet" placeholder in that case.
+_FLEET_TREND_CACHE = {}          # key -> (wall_ts, (series, slot))
+_FLEET_TREND_CACHE_TTL = 60.0    # hourly slots — a minute stale is nothing
+
+
+def _build_fleet_trend(trend_end_ts, window_seconds, instances, max_points=180):
+    """Fleet availability time series straight from the Prometheus TSDB, over the
+    SAME window the rest of the response is scored against
+    ([trend_end_ts - window_seconds, trend_end_ts]), for the modal's
+    Availability Trend chart.
+
+    One `query_range`, coverage-weighted fleet availability per slot:
+
+        sum(sum_over_time(<m>{instance=~"..."}[slot]))
+        / sum(count_over_time(<m>{instance=~"..."}[slot]))
+
+    evaluated at each slot boundary — total UP samples over total samples, the
+    TSDB analogue of the old sum(uptime)/sum(coverage) over hourly buckets, but
+    no longer bounded by how far the SQLite archive happens to reach back.
+
+    `instances` MUST be the exact set the rest of /api/availability scored
+    (`monitored_instances`). The selector is pinned to it so the line matches
+    the Fleet Availability headline: an unscoped `probe_success` also sums the
+    other blackbox jobs Prometheus scrapes (icmp pings, external probes) — a
+    healthier population that dragged the line ~6pts above the real fleet.
+
+    `<m>` is probe_success, falling back to `up` for deployments with no
+    blackbox probes. A slot is one hour for short windows, or a whole number of
+    hours chosen to keep the series under `max_points` for longer ones (≈3h at
+    7d, ≈6h at 30d). Slots the TSDB has no samples for (NaN) are omitted so the
+    chart shows a gap.
+
+    Returns (series, slot_seconds). series is [] on any query failure / empty
+    TSDB / empty instance set — the frontend keeps its placeholder.
     """
-    if not db_bucket_records:
-        return []
-    cutoff = float(trend_end_ts) - hours * 3600.0
-    by_hour = {}
-    for b in db_bucket_records:
-        try:
-            bs = float(b.get("bucket_start", 0) or 0)
-        except (TypeError, ValueError):
-            continue
-        if bs < cutoff or bs >= float(trend_end_ts):
-            continue
-        agg = by_hour.setdefault(bs, [0.0, 0.0])
-        agg[0] += float(b.get("uptime_seconds", 0) or 0)
-        agg[1] += float(b.get("coverage_seconds", 0) or 0)
-    series = []
-    for bs in sorted(by_hour):
-        up, cov = by_hour[bs]
-        if cov <= 0:
-            continue
-        series.append({
-            "ts": int(bs),
-            "availability_pct": round(max(0.0, min(100.0, (up / cov) * 100.0)), 2),
-        })
-    return series
+    end = int(trend_end_ts)
+    win = max(3600.0, float(window_seconds or 0.0))
+    slot = 3600
+    if win / slot > max_points:
+        slot = int(math.ceil(win / max_points / 3600.0) * 3600.0)
+    # First eval point is one slot in, so every point summarizes a slot that
+    # sits fully inside [end - win, end] rather than reaching back before it.
+    start = end - int(win) + slot
 
+    if not instances:
+        return [], slot
 
-@app.route('/api/availability/data-range')
-@rate_limit(120, 60)
-def api_availability_data_range():
-    """Resolve the "Max history" range: oldest bucket still in the archive for
-    this job filter -> now, expressed as a minutes span the rest of the range
-    pipeline (/api/availability, /api/target-history, charts) already
-    understands. Bounded by AVAIL_BUCKET_RETENTION_SECONDS — the aggregator
-    prunes anything older, so this is NOT "since server start", it is "as far
-    back as the archive still reaches". `minutes` is null when there is
-    nothing recorded yet."""
-    job_filter = request.args.get('job', DEFAULT_JOB_FILTER)
-    job_key = job_filter if (job_filter and job_filter != 'all') else 'all'
-    since_ts = None
-    try:
-        since_ts = AvailabilityBucketRepository.get_earliest_bucket_start(job_key)
-    except Exception:
-        logger.warning("data-range: earliest bucket lookup failed", exc_info=True)
-    # No materialized archive yet (fresh install, aggregator hasn't run): anchor
-    # to when the Prometheus endpoint was registered — the earliest point
-    # continuous monitoring could have started. NOT the oldest incident: one
-    # stale alert row from a week ago would stretch the window to 7d while
-    # Prometheus's in-memory buffer only answers for ~24h, making the whole
-    # fleet read as 86% "unmonitored".
-    if since_ts is None:
+    # 60s cache: the whole /api/availability payload is already cached, but on a
+    # miss (and under the single-flight fan-out) this keeps the extra query_range
+    # to at most once a minute regardless of request volume.
+    ck = (tuple(sorted(instances)), int(win), slot, max_points)
+    hit = _FLEET_TREND_CACHE.get(ck)
+    if hit and (time.time() - hit[0]) < _FLEET_TREND_CACHE_TTL:
+        return hit[1]
+
+    # Backtick raw string: re.escape() emits `\.` for the dots in an IP, which a
+    # double-quoted PromQL string rejects as an unknown escape. Backtick strings
+    # take backslashes literally. Instance labels never contain a backtick.
+    inst_re = "|".join(re.escape(i) for i in instances)
+    sel = f'{{instance=~`{inst_re}`}}'
+
+    for metric in ("probe_success", "up"):
+        expr = (
+            f"sum(sum_over_time({metric}{sel}[{slot}s])) "
+            f"/ sum(count_over_time({metric}{sel}[{slot}s]))"
+        )
+        path = (
+            f"/api/v1/query_range?query={quote(expr)}"
+            f"&start={start}&end={end}&step={slot}"
+        )
         try:
-            ep = EndpointRepository.get_active_endpoint()
-            if ep and ep.get("created_at"):
-                since_ts = float(ep["created_at"])
+            raw, _ = promclient.fetch_prometheus_json(path, use_cache=True, cache_ttl=45.0, timeout=6.0)
         except Exception:
-            since_ts = None
-    now = time.time()
-    if since_ts is None or since_ts >= now:
-        return jsonify({"ok": True, "since_ts": None, "minutes": None})
-    # Clamp to retention: the created_at fallback (and a stale-clock bucket) can
-    # point past the prune horizon, and a window wider than the archive just
-    # reads as "unmonitored" for the missing part.
-    since_ts = max(since_ts, now - AVAIL_BUCKET_RETENTION_SECONDS)
-    minutes = max(1, int(round((now - since_ts) / 60.0)))
-    minutes = min(minutes, int(AVAIL_BUCKET_RETENTION_SECONDS // 60))
-    return jsonify({"ok": True, "since_ts": round(since_ts, 1), "minutes": minutes})
+            logger.warning("fleet trend: %s query_range failed", metric, exc_info=True)
+            raw = None
+        if not raw or raw.get("status") != "success":
+            continue
+        result = raw.get("data", {}).get("result", [])
+        if not result:
+            continue
+        series = []
+        for pair in result[0].get("values", []):
+            try:
+                ts = int(float(pair[0]))
+                frac = float(pair[1])
+            except (ValueError, TypeError, IndexError):
+                continue
+            if frac != frac:  # NaN -> no samples in this slot, leave a gap
+                continue
+            series.append({
+                "ts": ts,
+                "availability_pct": round(max(0.0, min(100.0, frac * 100.0)), 2),
+            })
+        if series:
+            _FLEET_TREND_CACHE[ck] = (time.time(), (series, slot))
+            return series, slot
+    _FLEET_TREND_CACHE[ck] = (time.time(), ([], slot))
+    return [], slot
 
 
 @app.route('/api/availability')
@@ -1765,6 +1788,8 @@ def api_availability():
                 "analytics": empty_summary.get("analytics", {}),
                 "trend": [],
                 "trend_end_ts": int(req_end),
+                "trend_start_ts": int(req_end - minutes * 60.0),
+                "trend_bucket_seconds": 3600,
                 "source": "nodata"
             }
             with _AVAILABILITY_CACHE_LOCK:
@@ -1879,6 +1904,8 @@ def api_availability():
                 )
             )
 
+            trend_series, trend_slot_sec = _build_fleet_trend(req_end, minutes * 60.0, monitored_instances)
+
             t_ser_start = time.perf_counter()
             total_backend_ms = (t_ser_start - t_req_start) * 1000.0
 
@@ -1937,8 +1964,10 @@ def api_availability():
                 "entries": summary_dict['per_server']['values'],
                 "targets": {e['id']: e['availability_pct'] for e in summary_dict['per_server']['values']},
                 "analytics": summary_dict.get('analytics', {}),
-                "trend": _build_fleet_trend(db_bucket_records, req_end),
+                "trend": trend_series,
                 "trend_end_ts": int(req_end),
+                "trend_start_ts": int(req_end - minutes * 60.0),
+                "trend_bucket_seconds": trend_slot_sec,
                 "source": "materialized",
                 "_trace": trace_data,
             }
@@ -2139,6 +2168,8 @@ def api_availability():
             )
         )
 
+        trend_series, trend_slot_sec = _build_fleet_trend(req_end, minutes * 60.0, monitored_instances)
+
         t_ser_start = time.perf_counter()
         total_backend_ms = (t_ser_start - t_req_start) * 1000.0
 
@@ -2198,8 +2229,10 @@ def api_availability():
             "entries": summary_dict['per_server']['values'],
             "targets": {e['id']: e['availability_pct'] for e in summary_dict['per_server']['values']},
             "analytics": summary_dict.get('analytics', {}),
-            "trend": _build_fleet_trend(db_bucket_records, req_end),
+            "trend": trend_series,
             "trend_end_ts": int(req_end),
+            "trend_start_ts": int(req_end - minutes * 60.0),
+            "trend_bucket_seconds": trend_slot_sec,
             "source": hybrid_meta.get("source", "fallback"),
             "_trace": trace_data,
         }
@@ -2896,9 +2929,8 @@ def start_alert_poller():
 # ── Background Availability Aggregator ───────────────────────────────────────
 _AVAIL_AGGREGATOR_WORKER_ID = f"{os.getpid()}_{uuid.uuid4().hex[:8]}"
 AVAIL_AGGREGATE_INTERVAL_SECONDS = 60.0
-# Buckets older than this are pruned every aggregator cycle, so it is also the
-# real floor for the "Max history" range — the archive holds nothing older, and
-# the chip must not claim a window the data can't back.
+# Buckets older than this are pruned every aggregator cycle — the archive holds
+# nothing older, so no range query can return data past this horizon.
 AVAIL_BUCKET_RETENTION_SECONDS = 35 * 86400
 _avail_aggregator_started = False
 # Heartbeat for /health — set at the top of every aggregator cycle (leader or
