@@ -8,7 +8,7 @@ Dashboard monitoring ketersediaan server, website, dan jaringan secara real-time
 
 <img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/e6e97e26-b230-41c5-ad9d-0c90aee830e7" />
 
-<img width="1920" height="1080" alt="Availability Metrics" src="https://github.com/user-attachments/assets/0ce42ca3-36e2-4d00-b3fe-3a9d8e3da3e8" />
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/36739564-8b7d-48ba-820a-14feb0683b28" />
 
 <img width="1920" height="1080" alt="Maintenance Window" src="https://github.com/user-attachments/assets/df0d3c5d-85a5-4493-b610-9a209139bf99" />
 
