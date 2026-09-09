@@ -14,7 +14,7 @@ Dashboard monitoring ketersediaan server, website, dan jaringan secara real-time
 
 <img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/237ac261-f64c-4f8d-a1a5-d13366dc19a0" />
 
-<img width="1920" height="1080" alt="Telegram Notification Config" src="https://github.com/user-attachments/assets/ba7866d4-998c-4dc7-a69c-0d3cd6104ff3" />
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/50f504a5-d596-4c4c-9551-7f4e35ce6bf9" />
 
 <img width="1919" height="1079" alt="Target Management" src="https://github.com/user-attachments/assets/02c94b1e-5232-4cd1-9aa1-46294870a28d" />
 
