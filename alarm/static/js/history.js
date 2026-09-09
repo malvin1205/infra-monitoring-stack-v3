@@ -1,10 +1,7 @@
 /* History page — incident timeline + per-incident detail. */
 import { escapeHtml } from './ui/format.js';
 import { apiFetch } from './net.js';
-// isAdminLike still lives in alarm.js; this one import keeps a cycle
-// (alarm.js imports HistoryPage). Safe — used only inside methods, never
-// at module-eval time. Goes away when auth.js is split out.
-import { isAdminLike } from './alarm.js';
+import { isAdminLike } from './auth.js';
 
 export class HistoryPage {
   constructor(monitor) {
