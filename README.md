@@ -18,6 +18,10 @@ Dashboard monitoring ketersediaan server, website, dan jaringan secara real-time
 
 <img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/a8026a37-1706-4c17-bc43-f04d9cb5c4ad" />
 
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/c972effa-d8d2-4f70-b8fb-c8d9b2cf74cc" />
+
+
+
 ---
 
 ## Fitur Utama
