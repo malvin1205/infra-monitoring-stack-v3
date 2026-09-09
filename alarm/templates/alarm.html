@@ -6,21 +6,7 @@
   <meta name="description" content="InfraWatch — Internal network ping monitoring NOC dashboard">
   <title>InfraWatch · Internal Network Monitor</title>
 
-  <script>
-    /* Set the theme before the stylesheet applies so there is no flash:
-       explicit choice in localStorage wins, otherwise follow the OS,
-       otherwise dark. The <html> tag ships data-theme="dark" as the SSR
-       default; this only changes it for a stored/OS light preference. */
-    (function () {
-      try {
-        var t = localStorage.getItem('iw-theme');
-        if (t !== 'light' && t !== 'dark') {
-          t = (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) ? 'light' : 'dark';
-        }
-        document.documentElement.setAttribute('data-theme', t);
-      } catch (e) { /* private mode / storage blocked — keep the SSR default */ }
-    })();
-  </script>
+  <script src="{{ url_for('static', filename='js/theme.js') }}?v={{ asset_version('js/theme.js') }}"></script>
 
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -1623,63 +1609,5 @@
   </div>
 
   <script defer src="{{ url_for('static', filename='js/alarm.js') }}?v={{ asset_version('js/alarm.js') }}"></script>
-  <script>
-    /* ── Inline theme + splash enter init ─── */
-    (function () {
-      let saved = null;
-      try { saved = localStorage.getItem('iw-theme'); } catch (e) { /* private mode */ }
-      if (saved !== 'light' && saved !== 'dark') {
-        // No explicit choice yet — honour the OS preference, default dark.
-        saved = (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) ? 'light' : 'dark';
-      }
-      document.documentElement.setAttribute('data-theme', saved);
-      const darkIcon = document.getElementById('themeIconDark');
-      const lightIcon = document.getElementById('themeIconLight');
-      if (saved === 'light') {
-        if (darkIcon) darkIcon.style.display = 'none';
-        if (lightIcon) lightIcon.style.display = '';
-      }
-
-      const themeBtn = document.getElementById('themeToggleBtn');
-      if (themeBtn) {
-        themeBtn.addEventListener('click', () => {
-          const current = document.documentElement.getAttribute('data-theme');
-          const next = current === 'dark' ? 'light' : 'dark';
-          document.documentElement.setAttribute('data-theme', next);
-          localStorage.setItem('iw-theme', next);
-          if (next === 'dark') {
-            if (darkIcon) darkIcon.style.display = '';
-            if (lightIcon) lightIcon.style.display = 'none';
-          } else {
-            if (darkIcon) darkIcon.style.display = 'none';
-            if (lightIcon) lightIcon.style.display = '';
-          }
-        });
-      }
-
-      // Direct Splash Enter & Audio Unlock Listener with Persistent Dismissal
-      document.addEventListener('DOMContentLoaded', function () {
-        const enterBtn = document.getElementById('enterDashboardBtn');
-        const splashOverlay = document.getElementById('splashOverlay');
-        if (splashOverlay) {
-          if (localStorage.getItem('iw-splash-dismissed') === 'true' || localStorage.getItem('iw-audio-unlocked') === 'true') {
-            splashOverlay.classList.add('splash-hidden');
-          }
-        }
-        if (enterBtn && splashOverlay) {
-          enterBtn.addEventListener('click', function () {
-            if (window.monitor && typeof window.monitor.unlockAudio === 'function') {
-              window.monitor.unlockAudio();
-            }
-            try {
-              localStorage.setItem('iw-splash-dismissed', 'true');
-              localStorage.setItem('iw-audio-unlocked', 'true');
-            } catch (e) {}
-            splashOverlay.classList.add('splash-hidden');
-          });
-        }
-      });
-    })();
-  </script>
 </body>
 </html>
