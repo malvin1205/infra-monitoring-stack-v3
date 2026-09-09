@@ -12,12 +12,12 @@
   color-scheme: dark;
 
   /* Base */
-  --bg: #080C14;
-  --bg-elevated: #0C101A;
-  --bg-card: #0E1420;
-  --surface: #101522;
-  --surface-raised: #151B2A;
-  --surface-hover: #1B2234;
+  --bg: #020408;
+  --bg-elevated: #050810;
+  --bg-card: #080D17;
+  --surface: #060A12;
+  --surface-raised: #0B101E;
+  --surface-hover: #11182B;
 
   /* Borders */
   --border: rgba(255, 255, 255, 0.08);
@@ -28,7 +28,7 @@
   --text-primary: #F8FAFC;
   --text-secondary: #94A3B8;
   --text-muted: #7E8B9B;
-  --text-inverse: #080C14;
+  --text-inverse: #020408;
 
   /* Semantic */
   --success: #22C55E;
@@ -280,6 +280,7 @@ html {
   text-rendering: optimizeLegibility;
   scroll-behavior: smooth;
   height: 100%;
+  background: var(--bg);
 }
 
 body {
@@ -443,7 +444,7 @@ input {
 }
 
 .interval-select option {
-  background-color: #1E293B;
+  background-color: #020408;
   color: #F8FAFC;
   padding: 8px 12px;
 }
@@ -464,7 +465,7 @@ input {
   appearance: none;
   -webkit-appearance: none;
   -moz-appearance: none;
-  background-color: var(--surface-raised, #1E293B);
+  background-color: var(--surface-raised, #0B101E);
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2338BDF8' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E");
   background-repeat: no-repeat;
   background-position: right 10px center;
@@ -486,7 +487,7 @@ input {
 
 .filter-select:hover,
 .interval-select:hover {
-  background-color: var(--surface-hover, #243044);
+  background-color: var(--surface-hover, #11182B);
   border-color: var(--accent, #38BDF8);
   color: #FFFFFF;
 }
@@ -501,7 +502,7 @@ input {
 
 .filter-select option,
 .interval-select option {
-  background-color: #080C14 !important;
+  background-color: #020408 !important;
   color: #F8FAFC !important;
   padding: 10px 14px !important;
   font-size: 12px !important;
@@ -1542,7 +1543,7 @@ html, body {
   position: fixed;
   inset: 0;
   z-index: 100000;
-  background: rgba(0, 0, 0, 0.7);
+  background: rgba(0, 0, 0, 0.82);
   backdrop-filter: blur(6px);
   -webkit-backdrop-filter: blur(6px);
   display: flex;
@@ -2775,7 +2776,7 @@ html, body {
   position: fixed;
   inset: 0;
   z-index: 990;
-  background: rgba(4, 8, 18, 0.78);
+  background: rgba(2, 4, 8, 0.85);
   backdrop-filter: blur(8px);
   -webkit-backdrop-filter: blur(8px);
   opacity: 0;
@@ -3795,7 +3796,7 @@ html, body {
   position: fixed;
   inset: 0;
   z-index: 1000000;
-  background: rgba(15, 23, 42, 0.96);
+  background: rgba(2, 4, 8, 0.96);
   backdrop-filter: blur(16px);
   -webkit-backdrop-filter: blur(16px);
   display: flex;
