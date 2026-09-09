@@ -13,6 +13,7 @@
 
 import './ui/dialog.js'; // window.trapModalFocus, window.showConfirmDialog
 import { escapeHtml, slowThresholdMs } from './ui/format.js';
+import { calculateNiceScale, buildMSGradientDefs } from './ui/charts.js';
 
 const JOB_DEFAULT_LS_KEY = 'infrawatch.defaultJob';
 
@@ -4279,99 +4280,6 @@ class InstancesPage {
     ].join('');
   }
 
-  _calculateNiceScale(minVal, maxVal, maxTicks = 4) {
-    let min = 0;
-    if (minVal < 0) min = minVal;
-    
-    let max = Math.max(min + 0.1, maxVal);
-    let rawMax = max > 0 ? max * 1.15 : 1.0;
-    let range = rawMax - min;
-    
-    let rawStep = range / maxTicks;
-    let exponent = Math.floor(Math.log10(rawStep));
-    let fraction = rawStep / Math.pow(10, exponent);
-    
-    let niceFraction;
-    if (fraction < 1.25) niceFraction = 1;
-    else if (fraction < 2.5) niceFraction = 2;
-    else if (fraction < 3.75) niceFraction = 3;
-    else if (fraction < 7.5) niceFraction = 5;
-    else niceFraction = 10;
-    
-    let step = niceFraction * Math.pow(10, exponent);
-    if (step <= 0) step = 1;
-
-    let niceMin = Math.floor(min / step) * step;
-    if (niceMin < 0 && min >= 0) niceMin = 0;
-    
-    let niceMax = Math.ceil(rawMax / step) * step;
-    while (niceMax < max) {
-      niceMax += step;
-    }
-
-    let ticks = [];
-    for (let tick = niceMin; tick <= niceMax + (step * 0.0001); tick += step) {
-      const cleanTick = Math.round(tick * 10000) / 10000;
-      ticks.push(cleanTick);
-    }
-
-    const formatTick = (val) => {
-      if (val >= 1000) {
-        return val.toLocaleString('en-US', { maximumFractionDigits: 0 });
-      }
-      if (step >= 10) {
-        return val.toFixed(2);
-      }
-      if (step >= 1) {
-        return val.toFixed(2);
-      }
-      if (step >= 0.1) {
-        return val.toFixed(2);
-      }
-      return val.toFixed(3);
-    };
-
-    return {
-      niceMin,
-      niceMax,
-      step,
-      ticks,
-      formatTick
-    };
-  }
-
-  _buildMSGradientDefs(rangeMin, rangeMax, gradIdLine, gradIdArea) {
-    const rangeSpan = Math.max(0.1, rangeMax - rangeMin);
-    
-    const getOffsetPct = (msVal) => {
-      const ratio = (msVal - rangeMin) / rangeSpan;
-      return Math.max(0, Math.min(100, ratio * 100)).toFixed(1);
-    };
-
-    const off100 = getOffsetPct(100);
-    const off300 = getOffsetPct(300);
-    const off500 = getOffsetPct(500);
-
-    const topColor = rangeMax > 500 ? '#EF4444' : (rangeMax > 200 ? '#F59E0B' : '#22C55E');
-    const topOpacity = rangeMax > 500 ? '0.30' : '0.18';
-
-    return `
-      <defs>
-        <linearGradient id="${gradIdLine}" x1="0" y1="1" x2="0" y2="0">
-          <stop offset="0%" stop-color="#22C55E"/>
-          <stop offset="${off100}%" stop-color="#22C55E"/>
-          <stop offset="${off300}%" stop-color="#F59E0B"/>
-          <stop offset="${off500}%" stop-color="#EF4444"/>
-          <stop offset="100%" stop-color="${topColor}"/>
-        </linearGradient>
-        <linearGradient id="${gradIdArea}" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stop-color="${topColor}" stop-opacity="${topOpacity}"/>
-          <stop offset="60%" stop-color="#22C55E" stop-opacity="0.08"/>
-          <stop offset="100%" stop-color="#22C55E" stop-opacity="0.0"/>
-        </linearGradient>
-      </defs>`;
-  }
-
   _renderSparkline(points, isInternalCall = false) {
     const wrap = document.getElementById('drawerSparkline');
     const badge = document.getElementById('drawerSparklineBadge');
@@ -4457,7 +4365,7 @@ class InstancesPage {
     }
 
     // Dynamic Adaptive Nice Scale Math
-    const niceScale = this._calculateNiceScale(minL, maxL, 4);
+    const niceScale = calculateNiceScale(minL, maxL, 4);
     const rangeMin = niceScale.niceMin;
     const rangeMax = niceScale.niceMax;
     const rangeSpan = Math.max(0.001, rangeMax - rangeMin);
@@ -4513,7 +4421,7 @@ class InstancesPage {
     const tMidStr = fmtTime(t0 + (tN - t0) / 2);
     const tNStr = fmtTime(tN);
 
-    const defsHtml = this._buildMSGradientDefs(rangeMin, rangeMax, 'sgLineGrad', 'sgAreaGrad');
+    const defsHtml = buildMSGradientDefs(rangeMin, rangeMax, 'sgLineGrad', 'sgAreaGrad');
 
     // Build SVG & Adaptive ms Meter Overlay HTML
     wrap.innerHTML = `
@@ -4747,7 +4655,7 @@ class InstancesPage {
     }
 
     // Dynamic Adaptive Nice Scale Math
-    const niceScale = this._calculateNiceScale(minL, maxL, 4);
+    const niceScale = calculateNiceScale(minL, maxL, 4);
     const rangeMin = niceScale.niceMin;
     const rangeMax = niceScale.niceMax;
     const rangeSpan = Math.max(0.001, rangeMax - rangeMin);
@@ -4803,7 +4711,7 @@ class InstancesPage {
     const tMidStr = fmtTime(t0 + (tN - t0) / 2);
     const tNStr = fmtTime(tN);
 
-    const defsHistHtml = this._buildMSGradientDefs(rangeMin, rangeMax, 'sgHistLineGrad', 'sgHistGrad');
+    const defsHistHtml = buildMSGradientDefs(rangeMin, rangeMax, 'sgHistLineGrad', 'sgHistGrad');
 
     wrap.innerHTML = `
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px; font-size:11px; font-weight:600; color:var(--text-secondary); opacity:0.8; padding:0 2px;">
