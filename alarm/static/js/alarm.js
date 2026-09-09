@@ -16,6 +16,7 @@ import { escapeHtml, slowThresholdMs } from './ui/format.js';
 import { calculateNiceScale, buildMSGradientDefs } from './ui/charts.js';
 import { LogsPage } from './logs.js';
 import { HistoryPage } from './history.js';
+import { apiFetch } from './net.js';
 
 const JOB_DEFAULT_LS_KEY = 'infrawatch.defaultJob';
 
@@ -298,24 +299,6 @@ function updateUserUI(user) {
 // timestamp and log row. 'id-ID' renders 24h "HH.MM" and "DD Mmm"; switch to
 // e.g. 'en-GB' for "HH:MM" if the wallboard audience is non-Indonesian.
 const DATE_LOCALE = 'id-ID';
-
-// Global API Fetch helper using secure session cookie and CSRF protection
-export async function apiFetch(url, options = {}) {
-  const { headers, ...rest } = options;
-  const mergedHeaders = {
-    'X-Requested-With': 'XMLHttpRequest',
-    ...(headers || {})
-  };
-  const res = await fetch(url, {
-    ...rest,
-    headers: mergedHeaders,
-    credentials: 'same-origin'
-  });
-  if (res.status === 401 && !url.includes('/api/auth/')) {
-    showLoginModal();
-  }
-  return res;
-}
 
 /* ════════════════════════════════════════════════════════════════════════════
    INSTANCES PAGE
@@ -5662,6 +5645,9 @@ class ServerMonitor {
 
 
 function _initAuthHandlers() {
+  // apiFetch (net.js) dispatches this on a 401 instead of reaching in here.
+  window.addEventListener('iw:unauthorized', () => showLoginModal());
+
   // First-run Admin Setup Form
   const setupForm = document.getElementById('setupForm');
   if (setupForm) {
