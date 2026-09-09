@@ -99,8 +99,16 @@ def register_web_middleware(app):
         response.headers['Content-Security-Policy'] = _CSP
 
         if is_static:
-            # ?v=<mtime> already busts this on every change, so cache hard.
-            response.headers['Cache-Control'] = 'public, max-age=604800, immutable'
+            if request.path.endswith(('.js', '.css')):
+                # A module pulled in by another module's `import` is not
+                # referenced in the template, so asset_version()'s ?v= bust
+                # never reaches it — `immutable` would pin a stale copy for a
+                # week after deploy. `no-cache` = keep the copy but revalidate
+                # every load (cheap 304 on a LAN wallboard).
+                response.headers['Cache-Control'] = 'no-cache'
+            else:
+                # ?v=<mtime> already busts this on every change, so cache hard.
+                response.headers['Cache-Control'] = 'public, max-age=604800, immutable'
         else:
             response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
             response.headers['Pragma'] = 'no-cache'
