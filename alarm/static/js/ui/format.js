@@ -20,3 +20,8 @@ export function escapeHtml(str) {
 export function slowThresholdMs(t) {
   return (t && t.slowThresholdMs != null) ? t.slowThresholdMs : 500;
 }
+
+// One place to change the date/time locale for every chart axis, drawer
+// timestamp and log row. 'id-ID' renders 24h "HH.MM" and "DD Mmm"; switch to
+// e.g. 'en-GB' for "HH:MM" if the wallboard audience is non-Indonesian.
+export const DATE_LOCALE = 'id-ID';
