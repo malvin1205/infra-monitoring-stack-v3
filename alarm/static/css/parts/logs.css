@@ -1,0 +1,799 @@
+/* ── Alert Logs / Incident History modal ───────────────────────────
+   Dense NOC-style layout: fixed header/tabs/toolbar, single scrolling
+   list per tab, aligned table columns shared between a static header
+   row (.data-table-head) and the JS-rendered rows. Scoped under
+   .logs-modal-card so it never leaks into other modals that reuse
+   .modal-header/.modal-body/.chip/.search-input/.btn-sm. ──────────── */
+
+.nav-badge {
+  position: absolute;
+  top: -4px;
+  right: -4px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: var(--r-pill);
+  background: var(--critical);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 16px;
+  text-align: center;
+}
+
+.nav-badge-inline {
+  position: static;
+  display: inline-block;
+  margin-left: 6px;
+  min-width: 15px;
+  height: 15px;
+  line-height: 15px;
+  font-size: 9.5px;
+}
+
+/* Modal shell */
+.logs-modal-card {
+  max-width: 1500px;
+  width: calc(100vw - 40px);
+  height: 90vh;
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
+  border-radius: var(--r-lg);
+}
+
+.logs-modal-card .modal-header {
+  height: 56px;
+  padding: 0 20px;
+  flex-shrink: 0;
+}
+
+.logs-modal-card .modal-body {
+  flex: 1;
+  min-height: 0;
+  max-height: none;
+  padding: 16px 20px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow: hidden;
+}
+
+/* Tabs — underline + tint on active, no raised chip background */
+.logs-modal-card .logs-tabs {
+  display: flex;
+  flex-shrink: 0;
+  gap: 2px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 0;
+}
+
+.logs-modal-card .logs-tabs .chip {
+  padding: 8px 14px 9px;
+  border-radius: 8px 8px 0 0;
+  font-weight: 500;
+}
+
+.logs-modal-card .logs-tabs .chip-active,
+.logs-modal-card .logs-tabs .chip-active:hover {
+  background: var(--accent-bg);
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+  font-weight: 600;
+  box-shadow: none;
+}
+
+.logs-tab-panel {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  gap: 12px;
+}
+
+.logs-tab-panel.hidden {
+  display: none;
+}
+
+/* Filter bar — one row, no wrap, actions pushed right by the search input's flex:1 */
+.logs-modal-card .logs-toolbar {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+  height: 40px;
+  gap: 12px;
+  flex-wrap: nowrap;
+  margin-bottom: 0;
+}
+
+.logs-toolbar .search-input {
+  flex: 1;
+  min-width: 160px;
+  height: 30px;
+  border-radius: var(--r-sm);
+}
+
+.logs-filter-group {
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.logs-live-toggle {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.logs-toolbar .btn-sm {
+  flex-shrink: 0;
+}
+
+.chip.filter-btn-active,
+.chip.filter-btn-active:hover {
+  background: var(--surface-raised);
+  color: var(--text-primary);
+  font-weight: 700;
+  border-bottom-color: var(--accent);
+  box-shadow: var(--shadow-sm);
+}
+
+/* Incident stat cards — compact, equal width, no glow */
+.hist-stat-row {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 12px;
+  flex-shrink: 0;
+}
+
+.hist-stat-card {
+  height: 90px;
+  padding: 12px 16px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 4px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.hist-stat-value {
+  font-size: 26px;
+  font-weight: 700;
+  color: var(--text-primary);
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+}
+
+.hist-stat-label {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
+.hist-stat-critical .hist-stat-value { color: var(--critical); }
+.hist-stat-warning .hist-stat-value { color: #F59E0B; }
+
+.history-meta-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 12px;
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+
+/* Table shell — header stays put, only the body scrolls (single scrollbar) */
+.data-table {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.data-table-head {
+  display: grid;
+  gap: 12px;
+  align-items: center;
+  padding: 0 16px;
+  height: 32px;
+  flex-shrink: 0;
+  background: var(--bg-elevated);
+  border-bottom: 1px solid var(--border);
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.data-table-head.hist-grid,
+.history-row-full {
+  grid-template-columns: 1fr 92px 82px 100px 100px 100px 90px;
+}
+
+/* Toolbar/meta-row selects reuse .avail-range-select's look (Availability
+   Breakdown's date-range dropdown) without its icon-reserved left padding —
+   no new dropdown component, just the same chrome without the icon gutter. */
+.logs-toolbar #historySortSelect,
+.history-meta-filters .avail-range-select {
+  padding-left: 10px;
+  height: 28px;
+}
+
+.history-meta-row {
+  flex-wrap: wrap;
+  row-gap: 6px;
+}
+
+.history-meta-filters {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.data-table-head.maint-grid,
+.maint-row {
+  grid-template-columns: 1fr 1.4fr 140px 90px;
+}
+
+/* List body — thin custom scrollbar */
+.log-stream,
+.history-full-table {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  padding: 10px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+
+/* One wrapper per row (header + its expanded detail, when open) so spacing
+   sits between whole entries, not between a header and its own detail. */
+.al-entry,
+.history-entry {
+  margin-bottom: 7px;
+}
+
+.al-entry:last-child,
+.history-entry:last-child {
+  margin-bottom: 0;
+}
+
+.log-stream::-webkit-scrollbar,
+.history-full-table::-webkit-scrollbar {
+  width: 6px;
+}
+
+.log-stream::-webkit-scrollbar-track,
+.history-full-table::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.log-stream::-webkit-scrollbar-thumb,
+.history-full-table::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: var(--r-pill);
+}
+
+.log-stream::-webkit-scrollbar-thumb:hover,
+.history-full-table::-webkit-scrollbar-thumb:hover {
+  background: var(--text-muted);
+}
+
+/* Maintenance rows keep the original dense grid-table look (out of scope
+   for the Concept A revamp below — split out of the old shared
+   .log-entry/.history-row/.maint-row rule so the two can diverge). */
+.maint-row {
+  display: grid;
+  gap: 12px;
+  align-items: center;
+  padding: 0 16px;
+  height: 54px;
+  font-size: 13px;
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--border-subtle);
+  transition: background var(--t-fast);
+}
+
+.maint-row:hover {
+  background: var(--surface-hover);
+}
+
+/* ── Live Alert Log — Concept A (grouped flapping timeline) ─────────────
+   One shared "meta bar" strip replaces the old fixed 7-column table head:
+   the row shape now varies (single / grouped / firing / resolved), so a
+   rigid column grid stopped making sense. Loud red is reserved for what's
+   FIRING right now; resolved rows go quiet; a host that fired 2+ times in
+   the grouping window collapses into one expandable group row. */
+.al-meta-bar {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  padding: 2px 6px 8px;
+  flex-shrink: 0;
+}
+
+.al-meta-count {
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+  letter-spacing: 0.04em;
+  font-weight: 500;
+}
+
+.al-meta-count strong {
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+
+.al-legend {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  font-size: 10.5px;
+  color: var(--text-muted);
+}
+
+.al-legend-item {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.al-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 12px 15px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--border);
+  outline: none;
+  cursor: default;
+}
+
+.al-row-firing {
+  background: linear-gradient(135deg, var(--critical-bg), transparent 70%);
+  border-color: var(--critical-border);
+}
+
+/* A flap group is a caution signal (this host is unstable) even once it's
+   quiet — amber, not the navigational accent blue. If any occurrence in the
+   group is still firing right now, that outranks "unstable": full critical
+   red, same as a plain firing row. */
+.al-row-group {
+  background: linear-gradient(135deg, var(--warning-bg), transparent 70%);
+  border-color: var(--warning-border);
+  cursor: pointer;
+}
+
+.al-row-group-active {
+  background: linear-gradient(135deg, var(--critical-bg), transparent 70%);
+  border-color: var(--critical-border);
+}
+
+.al-row-resolved {
+  opacity: 0.82;
+}
+
+.al-row-group:focus-visible,
+.al-row-resolved:focus-visible {
+  cursor: pointer;
+}
+
+.al-row[tabindex]:focus-visible {
+  outline: 4px solid #FFFFFF;
+  outline-offset: -2px;
+  box-shadow: 0 0 0 8px rgba(56, 189, 248, 0.6), 0 0 25px rgba(255, 255, 255, 0.8);
+}
+
+.al-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  box-sizing: border-box;
+}
+
+.al-dot-firing {
+  background: var(--critical);
+  box-shadow: 0 0 0 5px rgba(239, 68, 68, 0.16);
+}
+
+/* Live Alert Log: green = back to healthy (matches the rest of the app's
+   "up" color). Incident History uses its own .history-dot-resolved instead
+   — a retrospective report keeps the original severity color, a live feed
+   just wants "is it OK now". */
+.al-dot-resolved {
+  border: 1.5px solid var(--success);
+}
+
+.al-expand-icon {
+  flex-shrink: 0;
+  color: #F59E0B;
+  transition: transform var(--t-fast);
+}
+
+.al-row-group-active .al-expand-icon {
+  color: var(--critical);
+}
+
+.al-row-group[aria-expanded="true"] .al-expand-icon {
+  transform: rotate(90deg);
+}
+
+.al-chip {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 150px;
+}
+
+.al-host {
+  font-family: var(--font-mono);
+  font-size: 13.5px;
+  font-weight: 700;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.al-row-resolved .al-host {
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.al-sub {
+  font-size: 10.5px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.al-badge {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  padding: 4px 10px;
+  border-radius: 6px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.al-badge-firing {
+  color: var(--critical);
+  background: rgba(239, 68, 68, 0.16);
+}
+
+.al-badge-resolved {
+  color: var(--success);
+  background: transparent;
+}
+
+.al-badge-group {
+  color: #F59E0B;
+  background: var(--warning-bg);
+}
+
+.al-badge-group-active {
+  color: var(--critical);
+  background: rgba(239, 68, 68, 0.16);
+}
+
+.al-fill {
+  font-size: 12px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.al-duration {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  color: var(--text-primary);
+  margin-left: auto;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+
+.al-row-resolved .al-duration {
+  color: var(--text-muted);
+}
+
+.al-time {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-muted);
+  width: 66px;
+  text-align: right;
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Expanded contents of a flap group — the individual firing/resolved
+   events that were collapsed into the group row above it. */
+.al-group-body {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 2px 15px 12px 41px;
+}
+
+.al-group-event {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+.al-group-event-firing {
+  color: var(--critical);
+}
+
+/* ── Incident History — same grouping applied retrospectively ─────────── */
+.history-row-full {
+  display: grid;
+  gap: 12px;
+  align-items: center;
+  padding: 12px 16px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--border);
+  background: transparent;
+  cursor: pointer;
+  outline: none;
+}
+
+.history-row-full:hover {
+  background: var(--surface-hover);
+}
+
+.history-row-full:focus-visible {
+  outline: 4px solid #FFFFFF;
+  outline-offset: -2px;
+  box-shadow: 0 0 0 8px rgba(56, 189, 248, 0.6), 0 0 25px rgba(255, 255, 255, 0.8);
+}
+
+/* Loud red is reserved for a row that's firing RIGHT NOW — a resolved
+   incident, however many times it flapped historically, is a retrospective
+   fact, not an active problem, so it stays as quiet as any other resolved
+   row. Same rule as the Live Alert Log. */
+.history-row-active {
+  background: linear-gradient(135deg, var(--critical-bg), transparent 70%);
+  border-color: var(--critical-border);
+}
+
+.history-time {
+  color: var(--text-muted);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.history-chip {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  overflow: hidden;
+}
+
+.history-host {
+  font-family: var(--font-mono);
+  font-weight: 700;
+  font-size: 13.5px;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-row-full:not(.history-row-active) .history-host {
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.history-sub {
+  font-size: 10.5px;
+  color: var(--text-muted);
+  margin-top: 1px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Who acknowledged this incident (and when) — a distinct accent color from
+   .history-sub's muted gray so "someone's already on this" is scannable at
+   wallboard distance without reading the text. */
+.history-ack {
+  font-size: 10.5px;
+  color: var(--accent);
+  margin-top: 1px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-resolve-btn {
+  margin-top: 4px;
+  padding: 2px 8px;
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 1.4;
+  color: var(--critical);
+  background: var(--critical-bg);
+  border: 1px solid var(--critical-border);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.history-resolve-btn:hover { filter: brightness(1.08); }
+.history-resolve-btn:focus-visible { outline: 2px solid var(--critical); outline-offset: 1px; }
+
+.history-sev {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+/* Severity color is a property of the alert (critical=red, warning=amber),
+   independent of open/resolved — that distinction lives on the status dot
+   (red ring vs green ring) and the row background (.history-row-active),
+   not on the severity label. */
+.history-sev-critical { color: var(--critical); }
+.history-sev-warning { color: #F59E0B; }
+
+.history-occurrences {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+}
+
+.history-downtime {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--text-secondary);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.history-lastseen {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-muted);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.history-firstseen {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Status column — Ongoing (still down, no resolve event yet) vs Resolved.
+   Ongoing gets a pulsing ring on the dot, the same red used everywhere else
+   for "firing now" (.history-row-active), so it reads at wallboard distance
+   without needing to parse the text label. */
+.history-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+
+.history-status-ongoing { color: var(--critical); }
+.history-status-resolved { color: var(--text-muted); }
+
+.history-status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.history-status-ongoing .history-status-dot {
+  background: var(--critical);
+  animation: historyOngoingPulse 1.6s ease-in-out infinite;
+}
+
+.history-status-resolved .history-status-dot {
+  background: transparent;
+  border: 1.5px solid var(--text-muted);
+}
+
+@keyframes historyOngoingPulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.55); }
+  50%      { box-shadow: 0 0 0 5px rgba(239, 68, 68, 0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .history-status-ongoing .history-status-dot { animation: none; }
+}
+
+.history-pager {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 10px;
+  flex-shrink: 0;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.history-pager-label {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+
+/* ── Maintenance Manager ────────────────────────────────────────── */
+.maint-group-label {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  margin: 12px 2px 6px;
+}
+
+.maint-group-label:first-child {
+  margin-top: 0;
+}
+
+.maint-target {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.maint-reason {
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.maint-window {
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.maint-window-active {
+  color: var(--accent);
+}
+
+/* Responsive — 1366px is the narrowest supported width; drop the wide
+   modal to viewport width and let columns compress via minmax() rather
+   than wrapping the toolbar. */
+@media (max-width: 1400px) {
+  .logs-modal-card {
+    width: calc(100vw - 24px);
+  }
+}
+

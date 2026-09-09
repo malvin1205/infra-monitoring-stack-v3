@@ -1,0 +1,266 @@
+/* ============================================================================
+   InfraWatch NOC — Premium Minimalist Design System
+   Inspired by: Linear, Vercel, Better Stack, Datadog
+   ============================================================================ */
+
+/* Fonts (Inter + JetBrains Mono) are loaded via <link rel="stylesheet"> in
+   alarm.html <head> with a preconnect — a render-blocking @import here would
+   only re-request the same sheet on a slower serialized path. */
+
+/* ── Design Tokens — Dark Mode ────────────────────────── */
+:root {
+  color-scheme: dark;
+
+  /* Base */
+  --bg: #020408;
+  --bg-elevated: #050810;
+  --bg-card: #080D17;
+  --surface: #060A12;
+  --surface-raised: #0B101E;
+  --surface-hover: #11182B;
+
+  /* Borders */
+  --border: rgba(255, 255, 255, 0.08);
+  --border-subtle: rgba(255, 255, 255, 0.04);
+  --border-strong: rgba(255, 255, 255, 0.14);
+
+  /* Text */
+  --text-primary: #F8FAFC;
+  --text-secondary: #94A3B8;
+  --text-muted: #7E8B9B;
+  --text-inverse: #020408;
+
+  /* Semantic */
+  --success: #22C55E;
+  --success-bg: rgba(34, 197, 94, 0.10);
+  --success-border: rgba(34, 197, 94, 0.20);
+
+  --warning: #ffd500;
+  --warning-bg: rgba(255, 213, 0, 0.10);
+  --warning-border: rgba(255, 213, 0, 0.22);
+
+  --critical: #EF4444;
+  --critical-bg: rgba(239, 68, 68, 0.08);
+  --critical-border: rgba(239, 68, 68, 0.18);
+
+  --accent: #38BDF8;
+  --accent-bg: rgba(56, 189, 248, 0.08);
+
+  /* Typography */
+  --font: 'Inter', -apple-system, system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+
+  /* Type scale — canonical sizes. The stylesheet still carries ~220 raw
+     font-size:Npx literals (audit F/N5); migrate them to these on touch,
+     snapping to the nearest step. Don't add new px font-sizes. */
+  --fs-2xs: 10px;
+  --fs-xs:  11px;
+  --fs-sm:  12px;
+  --fs-md:  13px;
+  --fs-base: 14px;
+  --fs-lg:  16px;
+  --fs-xl:  20px;
+  --fs-2xl: 26px;
+
+  /* Spacing scale (4px base). Same migration guidance as the type scale —
+     replace raw px padding/margin/gap with these on touch. */
+  --space-0-5: 2px;
+  --space-1: 4px;
+  --space-1-5: 6px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+
+  /* Radii */
+  --r-sm: 8px;
+  --r-md: 12px;
+  --r-lg: 16px;
+  --r-xl: 20px;
+
+  /* Shadows */
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.3), 0 1px 2px rgba(0, 0, 0, 0.2);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.4), 0 2px 6px rgba(0, 0, 0, 0.3);
+  --shadow-lg: 0 12px 40px rgba(0, 0, 0, 0.6), 0 4px 16px rgba(0, 0, 0, 0.4);
+  --shadow-drawer: -8px 0 40px rgba(0, 0, 0, 0.5);
+
+  /* Transitions */
+  --t-fast: 150ms ease;
+  --t-base: 200ms ease;
+  --t-slow: 300ms ease;
+
+  /* Layout & Helpers */
+  --topnav-h: 56px;
+  --drawer-w: 360px;
+
+  /* Host card floor — grid capacity math (alarm.js calculateGridCapacity)
+     reads these instead of hardcoding a page size, so a card never gets
+     shrunk past a readable size just to cram more hosts onto a page. */
+  --hc-min-w: 120px;
+  --hc-min-h: 56px;
+  --bg-hover: var(--surface-hover);
+  --border-focus: var(--accent);
+  --r-full: 9999px;
+  --r-pill: 9999px;
+}
+
+/* ── Responsive breakpoints (canonical scale) ─────────────
+   Use these values only. Historical rules still reference a
+   few near-neighbours (720↔768, 620↔640) — treat those as
+   the same tier when editing; don't introduce new ones.
+     xs   480   phone
+     sm   640   large phone / small tablet
+     md   768   tablet
+     lg   1024  small laptop
+     xl   1400  desktop
+     tv   1920  wallboard
+   ──────────────────────────────────────────────────────── */
+
+/* ── Design Tokens — Light Mode ───────────────────────── */
+[data-theme="light"] {
+  color-scheme: light;
+  --bg: #F8FAFC;
+  --bg-elevated: #F1F5F9;
+  --bg-card: #FFFFFF;
+  --surface: #FFFFFF;
+  --surface-raised: #F8FAFC;
+  --surface-hover: #F1F5F9;
+  --bg-hover: #E2E8F0;
+  --border-focus: var(--accent);
+  --r-full: 9999px;
+
+  --border: rgba(0, 0, 0, 0.07);
+  --border-subtle: rgba(0, 0, 0, 0.04);
+  --border-strong: rgba(0, 0, 0, 0.12);
+
+  --text-primary: #0F172A;
+  --text-secondary: #475569;
+  /* was #94A3B8 — ~2.8:1 on the light page background, fails WCAG AA. */
+  --text-muted: #64748B;
+  --text-inverse: #F8FAFC;
+
+  /* Semantic FOREGROUNDS must be re-mapped for light mode: the dark-mode
+     values (#ffd500 especially) sit at ~1.4:1 on a near-white background. */
+  --success: #15803D;
+  --warning: #B45309;
+  --critical: #B91C1C;
+  --accent: #0284C7;
+
+  --success-bg: rgba(21, 128, 61, 0.08);
+  --success-border: rgba(21, 128, 61, 0.20);
+  --warning-bg: rgba(180, 83, 9, 0.09);
+  --warning-border: rgba(180, 83, 9, 0.22);
+  --critical-bg: rgba(185, 28, 28, 0.07);
+  --critical-border: rgba(185, 28, 28, 0.18);
+  --accent-bg: rgba(2, 132, 199, 0.08);
+
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.08), 0 1px 2px rgba(0, 0, 0, 0.05);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.10), 0 2px 6px rgba(0, 0, 0, 0.07);
+  --shadow-lg: 0 12px 40px rgba(0, 0, 0, 0.15), 0 4px 16px rgba(0, 0, 0, 0.10);
+  --shadow-drawer: -8px 0 40px rgba(0, 0, 0, 0.12);
+}
+
+/* Visually hidden but exposed to assistive tech (headings, labels). */
+.sr-only {
+  position: absolute !important;
+  width: 1px; height: 1px;
+  padding: 0; margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ── Keyboard focus safety net ────────────────────────────
+   Many component rules set `outline: none` and rely on their own
+   `:focus-visible` restyle. This zero-specificity `:where()` rule guarantees a
+   visible ring for anything focusable that slipped through without one — a
+   component's own :focus-visible still wins on specificity. Only shows for
+   keyboard focus, never mouse. ──────────────────────────── */
+:where(a, button, input, select, textarea, summary, [tabindex]:not([tabindex="-1"]), [role="button"], [role="tab"], [role="option"]):focus-visible {
+  outline: 2px solid var(--border-focus, var(--accent));
+  outline-offset: 2px;
+}
+
+/* ── Light Theme — Colored Box Overrides ──────────────────
+   Summary cards & host grid tiles use hardcoded saturated
+   colors for dark mode; in light mode they switch to pastel
+   backgrounds with dark saturated text so contrast stays
+   readable against the bright page background. ──────────── */
+
+/* Summary cards */
+[data-theme="light"] .summary-card:nth-child(1) {
+  background: #dbeafe;
+  border-color: #93c5fd;
+  box-shadow: 0 0 14px -6px rgba(37, 99, 235, 0.22);
+}
+[data-theme="light"] .summary-card:nth-child(1) .sc-value { color: #1d4ed8 !important; }
+[data-theme="light"] .summary-card:nth-child(1) .sc-label { color: rgba(29, 64, 175, 0.8) !important; }
+
+[data-theme="light"] .summary-card:nth-child(2) {
+  background: #dcfce7;
+  border-color: #86efac;
+  box-shadow: 0 0 14px -6px rgba(34, 197, 94, 0.22);
+}
+[data-theme="light"] .summary-card:nth-child(2) .sc-value { color: var(--success) !important; }
+[data-theme="light"] .summary-card:nth-child(2) .sc-label { color: rgba(20, 83, 45, 0.8) !important; }
+
+[data-theme="light"] .summary-card:nth-child(3) {
+  background: #fef3c7;
+  border-color: #fcd34d;
+  box-shadow: 0 0 14px -6px rgba(245, 158, 11, 0.22);
+}
+[data-theme="light"] .summary-card:nth-child(3) .sc-value { color: var(--warning) !important; }
+[data-theme="light"] .summary-card:nth-child(3) .sc-label { color: rgba(146, 64, 14, 0.8) !important; }
+
+[data-theme="light"] .summary-card:nth-child(4) {
+  background: #fee2e2;
+  border-color: #fca5a5;
+  box-shadow: 0 0 14px -6px rgba(239, 68, 68, 0.22);
+}
+[data-theme="light"] .summary-card:nth-child(4) .sc-value { color: var(--critical) !important; }
+[data-theme="light"] .summary-card:nth-child(4) .sc-label { color: rgba(127, 29, 29, 0.8) !important; }
+
+[data-theme="light"] .summary-card:nth-child(5) {
+  background: #e0f2fe;
+  border-color: #7dd3fc;
+  box-shadow: 0 0 14px -6px rgba(2, 132, 199, 0.22);
+}
+[data-theme="light"] .summary-card:nth-child(5) .sc-value { color: #0369a1 !important; }
+[data-theme="light"] .summary-card:nth-child(5) .sc-label { color: rgba(7, 89, 133, 0.8) !important; }
+[data-theme="light"] .summary-card:nth-child(5) .sc-detail-btn {
+  background: rgba(3, 105, 161, 0.12);
+  border-color: rgba(3, 105, 161, 0.35);
+  color: #0369a1;
+}
+[data-theme="light"] .summary-card:nth-child(5) .sc-detail-btn:hover,
+[data-theme="light"] .summary-card:nth-child(5) .sc-detail-btn:focus-visible {
+  background: rgba(3, 105, 161, 0.22);
+  border-color: rgba(3, 105, 161, 0.6);
+}
+
+/* Host grid tiles */
+[data-theme="light"] .host-card.hc-up {
+  background: linear-gradient(180deg, #bbf7d0 0%, #86efac 100%);
+  border-color: rgba(34, 197, 94, 0.5);
+}
+[data-theme="light"] .host-card.hc-up .hc-ip { color: #14532d !important; }
+[data-theme="light"] .host-card.hc-up .hc-latency { color: rgba(20, 83, 45, 0.7) !important; }
+
+[data-theme="light"] .host-card.hc-slow {
+  background: linear-gradient(180deg, #fef08a 0%, #fcd34d 100%);
+  border-color: rgba(245, 158, 11, 0.5);
+}
+[data-theme="light"] .host-card.hc-slow .hc-ip { color: #78350f !important; }
+[data-theme="light"] .host-card.hc-slow .hc-latency { color: rgba(120, 53, 15, 0.7) !important; }
+
+[data-theme="light"] .host-card.hc-down {
+  background: linear-gradient(180deg, #fecaca 0%, #fca5a5 100%);
+  border-color: rgba(239, 68, 68, 0.5);
+}
+[data-theme="light"] .host-card.hc-down .hc-ip { color: #7f1d1d !important; }
+[data-theme="light"] .host-card.hc-down .hc-latency { color: rgba(127, 29, 29, 0.7) !important; }
+
