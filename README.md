@@ -12,7 +12,7 @@ Dashboard monitoring ketersediaan server, website, dan jaringan secara real-time
 
 <img width="1917" height="1078" alt="image" src="https://github.com/user-attachments/assets/eaf7a1e3-79f1-4e79-9057-b9047cc4c66a" />
 
-<img width="1920" height="1080" alt="Dependency Correlation" src="https://github.com/user-attachments/assets/4865a4ab-f06b-4b3d-9272-ab53a354bcf5" />
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/237ac261-f64c-4f8d-a1a5-d13366dc19a0" />
 
 <img width="1920" height="1080" alt="Telegram Notification Config" src="https://github.com/user-attachments/assets/ba7866d4-998c-4dc7-a69c-0d3cd6104ff3" />
 
