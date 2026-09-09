@@ -1,10 +1,9 @@
 # Runtime dependencies — fully pinned (direct + transitive) so a rebuild can
 # never pull an untested Werkzeug/Jinja2/etc. Regenerate with:
-#   pip install Flask==3.1.1 gunicorn==23.0.0 PyYAML==6.0.3 && pip freeze
+#   pip install Flask==3.1.1 gunicorn==23.0.0 && pip freeze
 # Flask 3.1.1 carries the fix for CVE-2025-47278 (SECRET_KEY_FALLBACKS signing).
 Flask==3.1.1
 gunicorn==23.0.0
-PyYAML==6.0.3
 
 # Transitive (pinned explicitly):
 Werkzeug==3.1.8

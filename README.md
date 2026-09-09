@@ -27,10 +27,10 @@ Dashboard monitoring ketersediaan server, website, dan jaringan secara real-time
 - **Notifikasi Telegram**: Kirim alert otomatis (FIRING / RESOLVED) ke bot/channel Telegram secara asynchronous.
 - **Maintenance Mode**: Penjadwalan jendela perawatan per target/job untuk mencegah alarm palsu.
 - **Dependency / Alert Correlation**: Hubungan parent-child antar host untuk meredam alert turunan saat gateway/parent down.
-- **SLA & Availability Engine**: Menghitung persentase uptime (1 jam - 90 hari), sparkline riwayat latensi, dan statistik downtime.
+- **Deep SLA & Availability Engine**: Kalkulasi ketersediaan deep yang menghitung persentase uptime (1 jam - 90 hari), rekonsiliasi hybrid Prometheus TSDB dan SQLite hourly buckets, SLA error budget, sparkline latensi, dan single-flight request coalescing.
 - **Role-Based Access Control (RBAC)**: Pemisahan hak akses berjenjang antara Owner (akun pendiri yang diproteksi permanen), Administrator, dan Read-Only Viewer.
 - **Failover Prometheus Endpoint & Per-Endpoint Job Filter**: Dukungan multiple endpoint Prometheus dengan auto-failover, sinkronisasi antar klien, dan preferensi Default Job tersimpan per endpoint.
-- **Synthetic Alert Poller**: Poller background bawaan yang langsung mendeteksi status probe tanpa wajib memasang Alertmanager.
+- **Synthetic Target Poller & Availability Aggregator**: Background worker mandiri yang mendeteksi transisi status probe, SlowResponse debouncing, dan agregasi bucket availability berkala dengan sistem distributed lease.
 - **Liveness & Readiness Probes**: Endpoint `/health/live` dan `/health/ready` terstandar untuk healthcheck container dan orkestrasi Kubernetes.
 
 ---
@@ -111,7 +111,7 @@ docker compose ps
 | `/api/auth/users` | `GET` 🔒 / `POST` 🔒 | Manajemen daftar user (khusus Owner & Admin) |
 | `/api/auth/users/<id>` | `PATCH` 🔒 | Ubah role / status aktif / password user (Owner diproteksi) |
 | `/api/prometheus-targets` | `GET` | Daftar target hasil discovery Prometheus (untuk dropdown Add Target) |
-| `/api/targets` | `GET` / `POST` 🔒 / `DELETE` 🔒 | Kelola daftar kurasi target (`targets/websites.yml`) |
+| `/api/targets` | `GET` / `POST` 🔒 / `DELETE` 🔒 | Kelola daftar target yang dimonitor (tombstone di SQLite) |
 | `/api/jobs` | `GET` | Daftar nama job Prometheus (diagnostik curl) |
 | `/api/maintenance` | `GET` / `POST` 🔒 | List & pembuatan jadwal Maintenance Window |
 | `/api/maintenance/<id>` | `DELETE` 🔒 | Hapus jadwal Maintenance Window |
@@ -140,14 +140,40 @@ docker compose ps
 
 ---
 
-## Manajemen Target (`targets/websites.yml`)
+## Manajemen Target & Prometheus Auto-Discovery
 
-`targets/websites.yml` adalah **daftar kurasi milik InfraWatch**, bukan konfigurasi scrape Prometheus. Isinya: subset target hasil *discovery* Prometheus yang di-*pin* operator lewat tombol **Add Target**. Efek nyata sebuah entri: target tetap tampil di wallboard dan tetap ikut kalkulasi SLA **meskipun** Prometheus berhenti men-scrape-nya (mem-`POST` ulang target yang belum di-hapus tidak mengubah apa-apa — sudah dimonitor). Synthetic poller & dashboard tetap men-scan **semua** target hasil discovery, bukan hanya yang di-pin.
+Seluruh target monitoring di InfraWatch v3 dideteksi secara dinamis melalui **Auto-Discovery langsung dari Prometheus** (`/api/v1/targets`). Anda cukup mengonfigurasi scrape job dan target di Prometheus / Blackbox Exporter eksternal Anda.
 
-- **Sumber utama data tetap Prometheus.** Poller & dashboard membaca `probe_success` / `probe_duration_seconds` dari `PROMETHEUS_URL`. Sebuah entri di `websites.yml` yang **belum** di-scrape Prometheus manapun akan muncul berstatus **Unknown** (tanpa latency / HTTP code) sampai scrape config Prometheus eksternal Anda menjangkaunya. API `POST /api/targets` mengembalikan field `warning` bila mendeteksi kondisi ini.
-- **InfraWatch tidak mem-provision Prometheus.** Tidak ada `file_sd_config` yang di-generate dari repo ini dan tidak ada panggilan `/-/reload`. Bila Anda memang ingin `websites.yml` dipakai Prometheus, wiring `file_sd_config` + reload adalah tanggung jawab konfigurasi Prometheus Anda sendiri (di luar repo ini).
-- **Persistensi.** File ini di-*bind mount* (`./alarm/targets:/app/targets`) sehingga selamat dari restart container, tetapi **tidak di-track git** dan tidak masuk image. Setiap `save` menulis `websites.yml.bak` sebagai titik pulih. Untuk migrasi host, salin `alarm/targets/websites.yml` secara manual — kalau tidak, host baru mulai dari daftar kosong (`websites.yml.example`).
-- **Hapus target bersifat reversibel.** `DELETE /api/targets` menyembunyikan target dari InfraWatch (tombstone di SQLite) — bukan menghentikan Prometheus men-scrape-nya. `GET /api/targets` mengembalikan daftar `deleted`; mem-`POST` ulang URL yang sama akan memulihkannya.
+- **Auto-Discovery**: Poller & dashboard membaca target aktif beserta metrik `probe_success` / `probe_duration_seconds` dari `PROMETHEUS_URL`. Tidak ada file YAML konfigurasi lokal yang perlu dikelola secara manual.
+- **Hapus Target (Tombstone Reversibel)**: Operator dapat menyembunyikan target tertentu dari monitoring wallboard via tombol hapus di detail host (`DELETE /api/targets`). Target yang dihapus disimpan sebagai tombstone di SQLite (`deleted_targets`), bukan menghentikan scraping di Prometheus.
+- **Pulihkan Target**: Target yang disembunyikan dapat dipulihkan kembali melalui dropdown **Add Target** di dashboard (`POST /api/targets`).
+
+---
+
+## Arsitektur & Desain Modular
+
+InfraWatch v3 dibangun menggunakan prinsip arsitektur modular yang terisolasi dengan seam yang jelas antar subsistem:
+
+- **`alarm/core/availability` (Availability Engine)**:
+  - Mengelola kalkulasi ketersediaan armada, rekonsiliasi hybrid Prometheus TSDB dan pre-aggregated hourly bucket SQLite.
+  - Menghitung proyeksi SLA error budget dan tren armada rolling.
+  - Memiliki single-flight request coalescing dan TTL caching untuk mencegah lonjakan beban backend.
+
+- **`alarm/core/workers` (Background Workers)**:
+  - `TargetPoller`: Poller berbasis event Prometheus dengan debounce SlowResponse, auto-resume pasca-maintenance, dan rekonsiliasi alert orphaned.
+  - `AvailabilityAggregator`: Worker periodik yang mematerialisasi bucket ketersediaan 1-jam ke SQLite dengan mekanisme lease election (`AggregationLeaseRepository`).
+
+- **`alarm/core/monitoring` (Fleet State Engine)**:
+  - Pipeline 3 tahap: ingestion probe Prometheus, pengayaan target (maintenance, relasi dependensi, incident SQLite, operator ACK), dan reduksi status armada kanonikal.
+
+- **`alarm/storage` (Storage Subsystem)**:
+  - Koneksi SQLite berperforma tinggi dengan mode WAL (`PRAGMA synchronous = NORMAL`, `busy_timeout = 30000`) dan isolasi transaksi `BEGIN IMMEDIATE`.
+  - 4 domain repository terfokus: `alerts` (Incident, EventLog, Acknowledgment), `availability` (Buckets, Leases, SLA Targets, Slow Thresholds), `inventory` (Maintenance, Dependencies, Endpoints, Deleted Targets), dan `auth` (Users, Audit Logs).
+  - Migrasi skema database otomatis dan backward-compatible facade.
+
+- **`alarm/web` (Web & Security Layer)**:
+  - Proteksi SSRF untuk URL endpoint Prometheus eksternal.
+  - Sliding window rate limiting dan middleware keamanan request.
 
 ---
 

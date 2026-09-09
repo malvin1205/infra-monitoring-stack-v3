@@ -3184,8 +3184,8 @@ class InstancesPage {
       const prev = this.previousStates[t.instance];
       const curr = t.health || 'unknown';
       // Only a real 'down' ages a down-counter. 'unknown' = no Prometheus
-      // sample (e.g. an un-scraped websites.yml entry) — stamping now here is
-      // what produced the phantom "Down 57s" ticker on every startup.
+      // sample — stamping now here is what produced the phantom "Down 57s"
+      // ticker on every startup.
       if (curr === 'down') {
         if (t.downSince && t.downSince > 0) {
           this.downStartTimes[t.instance] = t.downSince * 1000;

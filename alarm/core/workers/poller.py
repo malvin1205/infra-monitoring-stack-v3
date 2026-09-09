@@ -1,88 +1,140 @@
-"""Background workers: the Prometheus-native alert poller and the availability
-aggregator — their pure transition/window logic, their per-cycle bodies, the
-thread launchers and the process-wide lifecycle guards.
+"""TargetPoller: Prometheus-native alert poller and transition engine.
 
-Extracted verbatim from app.py (Phase 2 step 9) — behaviour is unchanged.
-app.py re-imports every public name (constants, the `_poller_state` /
-`_slow_poller_state` / `_maintenance_active_prev` dicts, the `_LAST_*_TICK`
-heartbeats, `start_alert_poller` / `start_availability_aggregator`) so
-`import app as alarm_app; alarm_app._poller_state` and the tests' direct
-mutation of it keep working, and so does /health.
-
-The cycle bodies resolve their Prometheus-fetch and lease collaborators
-through `_ctx()` (a lazy lookup of the already-imported app module, never an
-import-time dependency) so a test's `patch.object(alarm_app, 'fetch_...')`
-is still honoured after the move. The DISABLE_ALERT_POLLER / DISABLE_
-AVAILABILITY_AGGREGATOR boot gate stays in app.py.
+Encapsulates:
+- Target health polling and state transition evaluation (TargetDown, SlowResponse)
+- Cold-start outage detection vs. recovery transitions
+- Instance-scoped maintenance window suppression and auto-resume
+- Orphaned alert auto-reconciliation
+- Worker heartbeat and self-health reporting
 """
+import logging
 import os
 import sys
-import math
-import time
-import uuid
 import threading
-import logging
+import time
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 try:
-    from config import DEFAULT_SLOW_RESPONSE_THRESHOLD_MS, SCRAPE_INTERVAL_SECONDS
-    from config import ALERTNAME_TARGET_DOWN, ALERTNAME_SLOW_RESPONSE
+    from config import (
+        ALERTNAME_SLOW_RESPONSE,
+        ALERTNAME_TARGET_DOWN,
+        DEFAULT_SLOW_RESPONSE_THRESHOLD_MS,
+        SCRAPE_INTERVAL_SECONDS,
+    )
     from storage import (
-        json_store, IncidentRepository, AvailabilityBucketRepository,
-        AggregationLeaseRepository, SlowThresholdRepository,
+        IncidentRepository,
+        SlowThresholdRepository,
+        json_store,
     )
-    from core.monitoring import classify_scrape_failure, _outage_past_grace, _SHARED_EXECUTOR
+    from core.monitoring import classify_scrape_failure, _outage_past_grace
+    import core.monitoring.queries as prom_queries
+    import core.monitoring.state as monitoring_state
     from core.alerts import (
-        _LAST_WEBHOOK_AT, active_incident_list, record_alert_event,
-        load_maintenance_windows, get_active_maintenance,
+        _LAST_WEBHOOK_AT,
+        active_incident_list,
+        get_active_maintenance,
+        load_maintenance_windows,
+        record_alert_event,
     )
-    from core.availability import (
-        reconstruct_time_series_intervals, derive_bucket_inputs, estimate_instance_cadence,
+    from core.workers.aggregator import (
+        _AVAIL_AGGREGATOR_WORKER_ID,
+        AVAIL_AGGREGATE_INTERVAL_SECONDS,
+        AVAIL_BUCKET_RETENTION_SECONDS,
+        _LAST_AGGREGATOR_TICK,
+        AvailabilityAggregator,
+        _aggregate_availability_cycle,
+        _availability_aggregation_windows,
+        availability_aggregator,
+        start_availability_aggregator,
     )
 except (ImportError, ValueError):
-    from alarm.config import DEFAULT_SLOW_RESPONSE_THRESHOLD_MS, SCRAPE_INTERVAL_SECONDS
-    from alarm.config import ALERTNAME_TARGET_DOWN, ALERTNAME_SLOW_RESPONSE
+    from alarm.config import (
+        ALERTNAME_SLOW_RESPONSE,
+        ALERTNAME_TARGET_DOWN,
+        DEFAULT_SLOW_RESPONSE_THRESHOLD_MS,
+        SCRAPE_INTERVAL_SECONDS,
+    )
     from alarm.storage import (
-        json_store, IncidentRepository, AvailabilityBucketRepository,
-        AggregationLeaseRepository, SlowThresholdRepository,
+        IncidentRepository,
+        SlowThresholdRepository,
+        json_store,
     )
-    from alarm.core.monitoring import classify_scrape_failure, _outage_past_grace, _SHARED_EXECUTOR
+    from alarm.core.monitoring import classify_scrape_failure, _outage_past_grace
+    import alarm.core.monitoring.queries as prom_queries
+    import alarm.core.monitoring.state as monitoring_state
     from alarm.core.alerts import (
-        _LAST_WEBHOOK_AT, active_incident_list, record_alert_event,
-        load_maintenance_windows, get_active_maintenance,
+        _LAST_WEBHOOK_AT,
+        active_incident_list,
+        get_active_maintenance,
+        load_maintenance_windows,
+        record_alert_event,
     )
-    from alarm.core.availability import (
-        reconstruct_time_series_intervals, derive_bucket_inputs, estimate_instance_cadence,
+    from alarm.core.workers.aggregator import (
+        _AVAIL_AGGREGATOR_WORKER_ID,
+        AVAIL_AGGREGATE_INTERVAL_SECONDS,
+        AVAIL_BUCKET_RETENTION_SECONDS,
+        _LAST_AGGREGATOR_TICK,
+        AvailabilityAggregator,
+        _aggregate_availability_cycle,
+        _availability_aggregation_windows,
+        availability_aggregator,
+        start_availability_aggregator,
     )
 
-logger = logging.getLogger("infrawatch")
-
-
-def _ctx():
-    """The app module — looked up lazily (never imported at module load) so
-    this file stays clear of an import cycle with app.py. The cycle bodies go
-    through it for the collaborators the tests rebind on the app module —
-    get_monitored_instances, get_instance_job_map, fetch_all_probe_metrics,
-    fetch_down_since_prom_map, fetch_prom_query_map, fetch_prom_range_map.
-    (Class method patches like AggregationLeaseRepository.acquire_or_renew hit
-    the shared storage class object, so those stay imported normally.)"""
-    return sys.modules.get("app") or sys.modules.get("alarm.app") or sys.modules.get("__main__")
-
+logger = logging.getLogger("infrawatch.poller")
 
 ALERT_POLL_INTERVAL_SECONDS = float(os.environ.get("ALERT_POLL_INTERVAL", "15"))
 WEBHOOK_ACTIVE_WINDOW_SECONDS = 120
-
-# SlowResponse (warning-severity, up-but-degraded) config. See
-# compute_slow_response_transitions() for the debounce rule this backs.
-# DEFAULT_SLOW_RESPONSE_THRESHOLD_MS is defined near the top of this file so
-# build_canonical_monitoring_state() can use it for the live grid too (F4).
 SLOW_RESPONSE_DEBOUNCE_N = int(os.environ.get("SLOW_RESPONSE_DEBOUNCE_N", "3"))
 
-_poller_state = {}  # instance -> 'up' | 'down', seeded from status.json at startup
-_slow_poller_state = {}  # instance -> {'consec_slow', 'consec_fast', 'firing'} for SlowResponse debounce
-_maintenance_active_prev = set()  # instance-scoped maintenance windows active as of the last poll tick
-_LAST_POLLER_TICK = [0.0]  # heartbeat for /health — set every tick, whether or not it did work
 
-def compute_state_transitions(success_map, prev_state):
+# ── Adapters ──────────────────────────────────────────────────────────────────
+
+class PrometheusQueryAdapter:
+    """Default adapter fetching metrics directly from core.monitoring.queries,
+    with transparent fallback for test monkeypatches on app.py.
+    """
+
+    def __init__(self, queries_module=None):
+        self._queries = queries_module or prom_queries
+
+    def fetch_all_probe_metrics(self, cache_ttl: float = 3.0, timeout: Optional[float] = None):
+        app_mod = sys.modules.get("app") or sys.modules.get("alarm.app")
+        if app_mod and hasattr(app_mod, "fetch_all_probe_metrics"):
+            app_fn = getattr(app_mod, "fetch_all_probe_metrics")
+            if app_fn != self._queries.fetch_all_probe_metrics:
+                return app_fn(cache_ttl=cache_ttl, timeout=timeout)
+        return self._queries.fetch_all_probe_metrics(cache_ttl=cache_ttl, timeout=timeout)
+
+    def fetch_down_since_prom_map(self):
+        app_mod = sys.modules.get("app") or sys.modules.get("alarm.app")
+        if app_mod and hasattr(app_mod, "fetch_down_since_prom_map"):
+            app_fn = getattr(app_mod, "fetch_down_since_prom_map")
+            if app_fn != self._queries.fetch_down_since_prom_map:
+                return app_fn()
+        return self._queries.fetch_down_since_prom_map()
+
+
+class MonitoringStateAdapter:
+    """Default adapter fetching monitored target state directly from core.monitoring.state,
+    with transparent fallback for test monkeypatches on app.py.
+    """
+
+    def __init__(self, state_module=None):
+        self._state = state_module or monitoring_state
+
+    def get_monitored_instances(self) -> List[str]:
+        app_mod = sys.modules.get("app") or sys.modules.get("alarm.app")
+        if app_mod and hasattr(app_mod, "get_monitored_instances"):
+            app_fn = getattr(app_mod, "get_monitored_instances")
+            if app_fn != self._state.get_monitored_instances:
+                return app_fn()
+        return self._state.get_monitored_instances()
+
+
+# ── Pure Transition Functions ─────────────────────────────────────────────────
+
+def compute_state_transitions(success_map: Dict[str, Any], prev_state: Dict[str, str]) -> Tuple[List[Tuple[str, bool]], Dict[str, str]]:
     """Pure function: given instance->probe_success value map and the last
     known state per instance, return (transitions, updated_state).
     - If target is first observed UP: seeds baseline state 'up', emits no transition (no false alert).
@@ -98,28 +150,25 @@ def compute_state_transitions(success_map, prev_state):
         new_state[inst] = 'up' if is_up else 'down'
         if prev is None:
             if not is_up:
-                # Cold-start / first observation: target is DOWN.
-                # Emit transition to establish active incident in status/logs/history.
                 transitions.append((inst, False))
         elif (prev == 'up') != is_up:
             transitions.append((inst, is_up))
     return transitions, new_state
 
-def compute_slow_response_transitions(readings, prev_state, thresholds, debounce_n=SLOW_RESPONSE_DEBOUNCE_N):
-    """Pure function (same shape as compute_state_transitions): given
-    instance->(is_up, response_time_ms) readings and the last debounce state
-    per instance, return (transitions, updated_state).
 
-    Response time is naturally noisy — firing/resolving on a single sample
-    would flap exactly like the occurrence-counting bug Incident History
-    task #1 fixed, just for a new alert type. Requires `debounce_n`
-    CONSECUTIVE over-threshold samples to fire, and `debounce_n` consecutive
-    under-threshold samples to resolve — one bad or one good sample alone
-    changes nothing. A target going DOWN supersedes "slow": streaks reset
-    and a firing SlowResponse resolves immediately (being down isn't a
-    degraded-but-up condition, it's TargetDown's job).
+def compute_slow_response_transitions(
+    readings: Dict[str, Tuple[bool, Optional[float]]],
+    prev_state: Dict[str, Dict[str, Any]],
+    thresholds: Dict[str, float],
+    debounce_n: int = SLOW_RESPONSE_DEBOUNCE_N,
+) -> Tuple[List[Tuple[str, bool]], Dict[str, Dict[str, Any]]]:
+    """Pure function: given instance->(is_up, response_time_ms) readings and
+    the last debounce state per instance, return (transitions, updated_state).
 
-    thresholds: {instance: threshold_ms}, missing -> caller's global default.
+    Requires `debounce_n` consecutive over-threshold samples to fire, and
+    `debounce_n` consecutive under-threshold samples to resolve.
+    A target going DOWN supersedes "slow": streaks reset and a firing
+    SlowResponse resolves immediately.
     """
     transitions = []
     new_state = {}
@@ -154,590 +203,340 @@ def compute_slow_response_transitions(readings, prev_state, thresholds, debounce
         new_state[inst] = st
     return transitions, new_state
 
-def _seed_poller_state():
-    # Currently-firing incidents (survived from before a backend restart) seed
-    # as 'down' so we don't re-fire a duplicate "went offline" for an outage
-    # that's already recorded — only its eventual recovery still needs to be
-    # observed and resolved. SQLite is the source of truth (audit F1).
-    for a in active_incident_list():
-        inst = a.get('instance')
-        if inst:
-            _poller_state[inst] = 'down'
 
-def _reconcile_orphaned_alerts(monitored_instances):
-    """Auto-resolves poller-owned alerts (TargetDown, SlowResponse) whose
-    instance no longer exists in the monitored set at all — e.g. removed
-    from Prometheus's scrape config entirely, not merely down. Without this,
-    such an alert can never be observed recovering (compute_state_transitions
-    / compute_slow_response_transitions only look at instances still present
-    in success_map/instances) and stays firing forever, permanently pinning
-    system status to CRITICAL/WARNING.
-    Reads the active set from SQLite (single source of truth, audit F1) so a
-    phantom incident that only exists in the DB — not in the status.json
-    cache — is still reconciled here. Only touches poller-owned alerts, and
-    only runs when `instances` is non-empty (Prometheus reachable) — see call
-    site."""
-    orphaned = [
-        a for a in active_incident_list()
-        if a.get('name') in (ALERTNAME_TARGET_DOWN, ALERTNAME_SLOW_RESPONSE) and a.get('instance') not in monitored_instances
-    ]
-    for a in orphaned:
-        _slow_poller_state.pop(a.get('instance'), None)
-        record_alert_event(
-            name=a.get('name'),
-            severity=a.get('severity', 'critical'),
-            instance=a.get('instance'),
-            summary=f"{a.get('instance')} auto-resolved (no longer monitored)",
-            job='',
-            event_time=time.time(),
-            is_now_firing=False,
-            receiver="prometheus-poller-reconcile",
-            key=a.get('key') or f"{a.get('name')}|{a.get('instance')}",
+# ── TargetPoller Module ───────────────────────────────────────────────────────
+
+class TargetPoller:
+    """Encapsulates target polling, transition computation, SlowResponse debouncing,
+    maintenance window evaluation, and self-health reporting.
+    """
+
+    def __init__(
+        self,
+        query_adapter=None,
+        state_adapter=None,
+        alert_sink: Optional[Callable] = None,
+        incident_repo=None,
+        active_incident_provider: Optional[Callable] = None,
+        maintenance_loader: Optional[Callable] = None,
+        maintenance_checker: Optional[Callable] = None,
+        slow_threshold_repo=None,
+        poll_interval_sec: Optional[float] = None,
+        webhook_active_window_sec: Optional[float] = None,
+        debounce_n: Optional[int] = None,
+        state: Optional[Dict[str, str]] = None,
+        slow_state: Optional[Dict[str, Dict[str, Any]]] = None,
+        maintenance_active_prev: Optional[Set[str]] = None,
+        last_tick_ref: Optional[List[float]] = None,
+        last_webhook_at_ref: Optional[List[float]] = None,
+    ):
+        self.query_adapter = query_adapter or PrometheusQueryAdapter()
+        self.state_adapter = state_adapter or MonitoringStateAdapter()
+        self.alert_sink = alert_sink or record_alert_event
+        self.incident_repo = incident_repo or IncidentRepository
+        self.active_incident_provider = active_incident_provider or active_incident_list
+        self.maintenance_loader = maintenance_loader or load_maintenance_windows
+        self.maintenance_checker = maintenance_checker or get_active_maintenance
+        self.slow_threshold_repo = slow_threshold_repo or SlowThresholdRepository
+
+        self.poll_interval_sec = (
+            poll_interval_sec if poll_interval_sec is not None else ALERT_POLL_INTERVAL_SECONDS
         )
+        self.webhook_active_window_sec = (
+            webhook_active_window_sec if webhook_active_window_sec is not None else WEBHOOK_ACTIVE_WINDOW_SECONDS
+        )
+        self.debounce_n = debounce_n if debounce_n is not None else SLOW_RESPONSE_DEBOUNCE_N
 
-def _poll_targets_once():
-    c = _ctx()
-    _LAST_POLLER_TICK[0] = time.time()
+        self._poller_state = state if state is not None else {}
+        self._slow_poller_state = slow_state if slow_state is not None else {}
+        self._maintenance_active_prev = (
+            maintenance_active_prev if maintenance_active_prev is not None else set()
+        )
+        self._last_tick_ref = last_tick_ref
+        self._last_webhook_at_ref = (
+            last_webhook_at_ref if last_webhook_at_ref is not None else _LAST_WEBHOOK_AT
+        )
+        self._last_tick = 0.0
 
-    if time.time() - _LAST_WEBHOOK_AT[0] < WEBHOOK_ACTIVE_WINDOW_SECONDS:
-        return  # Alertmanager delivered a webhook recently — it's authoritative, don't double-fire
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._started = False
 
-    instances = c.get_monitored_instances()
-    if not instances:
-        return
-
-    _reconcile_orphaned_alerts(instances)
-
-    success_map, duration_map, status_code_map = c.fetch_all_probe_metrics()
-    if not success_map:
-        return  # Prometheus unreachable this tick — never fabricate a transition from no data
-
-    # Instance-scoped maintenance: freeze this instance's tracked state for
-    # the window so no transition is recorded, then force one fresh check the
-    # moment the window ends — "auto resume monitoring". If it's still down,
-    # that's now a real transition (compute_state_transitions sees the forced
-    # 'up' vs the real 'down') and a fresh incident is raised; record_alert_
-    # event()'s own dedup no-ops it harmlessly if that incident was already
-    # firing from before the window.
-    #
-    # If it instead recovered WHILE under maintenance, compute_state_
-    # transitions sees forced-'up' == actual 'up' and never emits an event at
-    # all — so a TargetDown incident that started before the window and
-    # recovered silently during it would stay "firing" in SQLite forever
-    # (the poller never evaluates a maintained instance, so no resolve is
-    # ever recorded any other way). Confirm the real state right here instead
-    # and explicitly resolve — record_alert_event() no-ops safely if nothing
-    # was actually firing.
-    # ponytail: job-scoped maintenance is enforced only in record_alert_event()
-    # (still no false incident/alarm) — this resume nudge is instance-only;
-    # extend to jobs if job-wide maintenance flapping becomes a problem.
-    windows = load_maintenance_windows()
-    active_now = {inst for inst in instances if get_active_maintenance(inst, windows=windows)}
-    just_ended = _maintenance_active_prev - active_now
-    if just_ended:
+    def seed_state(self) -> None:
+        """Seed 'down' baseline from currently-firing incidents in SQLite so backend
+        restarts don't trigger duplicate 'went offline' alerts.
+        """
         try:
-            _slow_firing_instances = {
-                a['instance'] for a in IncidentRepository.get_active_incidents()
-                if a.get('name') == ALERTNAME_SLOW_RESPONSE
-            }
+            for a in self.active_incident_provider():
+                inst = a.get('instance')
+                if inst:
+                    self._poller_state[inst] = 'down'
         except Exception:
-            _slow_firing_instances = set()
-    for inst in just_ended:
-        _poller_state[inst] = 'up'
-        # Seed (not just discard) the debounce state to match what SQLite
-        # actually has open — popping this entirely would make
-        # compute_slow_response_transitions believe nothing was firing for
-        # this instance, so it could never observe a firing->resolved
-        # transition for a SlowResponse incident that's genuinely still
-        # 'firing' in the DB from before the window (same class of bug as
-        # TargetDown above, different mechanism: here it's the poller's own
-        # bookkeeping forgetting the DB's state, not a forced probe reading
-        # matching the real one). Fresh counters either way — a stale streak
-        # from right before maintenance shouldn't count toward the debounce.
-        _slow_poller_state[inst] = {
-            'consec_slow': 0, 'consec_fast': 0,
-            'firing': inst in _slow_firing_instances
-        }
-        val = success_map.get(inst)
-        if val is not None and str(val) in ('1', '1.0'):
-            record_alert_event(
+            logger.exception("TargetPoller: failed to seed state from active incidents")
+
+    def reconcile_orphaned_alerts(self, monitored_instances: List[str]) -> None:
+        """Auto-resolves poller-owned alerts (TargetDown, SlowResponse) whose
+        instance no longer exists in the monitored set at all.
+        """
+        try:
+            orphaned = [
+                a for a in self.active_incident_provider()
+                if a.get('name') in (ALERTNAME_TARGET_DOWN, ALERTNAME_SLOW_RESPONSE)
+                and a.get('instance') not in monitored_instances
+            ]
+            for a in orphaned:
+                inst = a.get('instance')
+                if inst:
+                    self._slow_poller_state.pop(inst, None)
+                self.alert_sink(
+                    name=a.get('name'),
+                    severity=a.get('severity', 'critical'),
+                    instance=inst,
+                    summary=f"{inst} auto-resolved (no longer monitored)",
+                    job='',
+                    event_time=time.time(),
+                    is_now_firing=False,
+                    receiver="prometheus-poller-reconcile",
+                    key=a.get('key') or f"{a.get('name')}|{inst}",
+                )
+        except Exception:
+            logger.exception("TargetPoller: reconcile orphaned alerts failed")
+
+    def poll_once(self, now: Optional[float] = None) -> None:
+        """Execute one evaluation cycle over all monitored targets."""
+        curr_time = now if now is not None else time.time()
+        self._last_tick = curr_time
+        if self._last_tick_ref is not None:
+            self._last_tick_ref[0] = curr_time
+
+        if curr_time - self._last_webhook_at_ref[0] < self.webhook_active_window_sec:
+            return  # Alertmanager delivered a webhook recently — don't double-fire
+
+        try:
+            instances = self.state_adapter.get_monitored_instances()
+        except Exception:
+            logger.exception("TargetPoller: get_monitored_instances failed")
+            return
+
+        if not instances:
+            return
+
+        self.reconcile_orphaned_alerts(instances)
+
+        try:
+            success_map, duration_map, status_code_map = self.query_adapter.fetch_all_probe_metrics()
+        except Exception:
+            logger.exception("TargetPoller: fetch_all_probe_metrics failed")
+            return
+
+        if not success_map:
+            return  # Prometheus unreachable this tick
+
+        windows = self.maintenance_loader()
+        active_now = {inst for inst in instances if self.maintenance_checker(inst, windows=windows)}
+        just_ended = self._maintenance_active_prev - active_now
+
+        if just_ended:
+            try:
+                slow_firing_instances = {
+                    a['instance']
+                    for a in self.incident_repo.get_active_incidents()
+                    if a.get('name') == ALERTNAME_SLOW_RESPONSE
+                }
+            except Exception:
+                slow_firing_instances = set()
+
+            for inst in just_ended:
+                self._poller_state[inst] = 'up'
+                self._slow_poller_state[inst] = {
+                    'consec_slow': 0,
+                    'consec_fast': 0,
+                    'firing': inst in slow_firing_instances,
+                }
+                val = success_map.get(inst)
+                if val is not None and str(val) in ('1', '1.0'):
+                    self.alert_sink(
+                        name=ALERTNAME_TARGET_DOWN,
+                        severity="critical",
+                        instance=inst,
+                        summary=f"{inst} recovered (confirmed after maintenance window ended)",
+                        job="blackbox",
+                        event_time=curr_time,
+                        is_now_firing=False,
+                        receiver="prometheus-poller",
+                        key=f"{ALERTNAME_TARGET_DOWN}|{inst}",
+                    )
+
+        self._maintenance_active_prev.clear()
+        self._maintenance_active_prev.update(active_now)
+
+        scoped = {inst: v for inst, v in success_map.items() if inst in instances and inst not in active_now}
+        transitions, new_state = compute_state_transitions(scoped, self._poller_state)
+
+        # Debounce down-transitions
+        if any(not is_up for _, is_up in transitions):
+            try:
+                down_since_map = self.query_adapter.fetch_down_since_prom_map()
+            except Exception:
+                down_since_map = {}
+            held = []
+            for inst, is_up in transitions:
+                if not is_up and not _outage_past_grace(down_since_map.get(inst), curr_time):
+                    new_state[inst] = self._poller_state.get(inst, 'up')
+                else:
+                    held.append((inst, is_up))
+            transitions = held
+
+        self._poller_state.update(new_state)
+
+        for inst, is_up in transitions:
+            lat = duration_map.get(inst)
+            try:
+                latency_ms = round(float(lat) * 1000, 1) if lat is not None else None
+            except (TypeError, ValueError):
+                latency_ms = None
+
+            http_status_code = status_code_map.get(inst)
+            last_error = None
+            if is_up:
+                summary = f"{inst} recovered"
+            else:
+                classification = classify_scrape_failure('down', '', http_status_code)
+                summary = f"{inst} is unreachable ({classification['category']})"
+                last_error = classification['detail']
+
+            self.alert_sink(
                 name=ALERTNAME_TARGET_DOWN,
                 severity="critical",
                 instance=inst,
-                summary=f"{inst} recovered (confirmed after maintenance window ended)",
+                summary=summary,
                 job="blackbox",
-                event_time=time.time(),
-                is_now_firing=False,
+                event_time=curr_time,
+                is_now_firing=(not is_up),
                 receiver="prometheus-poller",
                 key=f"{ALERTNAME_TARGET_DOWN}|{inst}",
+                latency_ms=latency_ms,
+                http_status_code=http_status_code,
+                last_error=last_error,
             )
-    _maintenance_active_prev.clear()
-    _maintenance_active_prev.update(active_now)
 
-    scoped = {inst: v for inst, v in success_map.items() if inst in instances and inst not in active_now}
-    transitions, new_state = compute_state_transitions(scoped, _poller_state)
+        # SlowResponse evaluation
+        readings = {}
+        for inst, val in scoped.items():
+            lat = duration_map.get(inst)
+            try:
+                rt_ms = round(float(lat) * 1000, 1) if lat is not None else None
+            except (TypeError, ValueError):
+                rt_ms = None
+            readings[inst] = (str(val) in ('1', '1.0'), rt_ms)
 
-    now = time.time()
-
-    # Debounce down-transitions: don't fire an outage until the target has been
-    # down for OUTAGE_GRACE_SECONDS (same gate as build_canonical_monitoring_state).
-    # A held instance is left UNLATCHED in _poller_state so the next tick
-    # re-checks it — a blip that recovers inside the window never fires.
-    if any(not is_up for _, is_up in transitions):
-        down_since_map = c.fetch_down_since_prom_map()
-        held = []
-        for inst, is_up in transitions:
-            if not is_up and not _outage_past_grace(down_since_map.get(inst), now):
-                new_state[inst] = _poller_state.get(inst, 'up')
-            else:
-                held.append((inst, is_up))
-        transitions = held
-
-    _poller_state.update(new_state)
-
-    for inst, is_up in transitions:
-        lat = duration_map.get(inst)
         try:
-            latency_ms = round(float(lat) * 1000, 1) if lat is not None else None
-        except (TypeError, ValueError):
-            latency_ms = None
+            slow_thresholds = self.slow_threshold_repo.get_all()
+        except Exception:
+            slow_thresholds = {}
 
-        http_status_code = status_code_map.get(inst)
-        last_error = None
-        if is_up:
-            summary = f"{inst} recovered"
-        else:
-            # Same classifier as /instances — poller has no per-instance
-            # lastError (that lives on /api/v1/targets, which this loop
-            # doesn't fetch), so this degrades to HTTP-code-based
-            # classification or "Unknown", same as any other probe-only target.
-            classification = classify_scrape_failure('down', '', http_status_code)
-            summary = f"{inst} is unreachable ({classification['category']})"
-            last_error = classification['detail']
-
-        record_alert_event(
-            name=ALERTNAME_TARGET_DOWN,
-            severity="critical",
-            instance=inst,
-            summary=summary,
-            job="blackbox",
-            event_time=now,
-            is_now_firing=(not is_up),
-            receiver="prometheus-poller",
-            key=f"{ALERTNAME_TARGET_DOWN}|{inst}",
-            latency_ms=latency_ms,
-            http_status_code=http_status_code,
-            last_error=last_error,
+        slow_transitions, new_slow_state = compute_slow_response_transitions(
+            readings, self._slow_poller_state, slow_thresholds, debounce_n=self.debounce_n
         )
+        self._slow_poller_state.update(new_slow_state)
 
-    # SlowResponse (warning-severity): evaluated every tick for every
-    # currently-scoped instance, independent of whether TargetDown had a
-    # transition — the debounce needs a consecutive-sample count, not just
-    # the ticks where something already changed. See
-    # compute_slow_response_transitions() for the debounce/threshold rules.
-    readings = {}
-    for inst, val in scoped.items():
-        lat = duration_map.get(inst)
-        try:
-            rt_ms = round(float(lat) * 1000, 1) if lat is not None else None
-        except (TypeError, ValueError):
-            rt_ms = None
-        readings[inst] = (str(val) in ('1', '1.0'), rt_ms)
+        for inst, is_now_firing in slow_transitions:
+            threshold = slow_thresholds.get(inst, DEFAULT_SLOW_RESPONSE_THRESHOLD_MS)
+            rt_ms = readings[inst][1]
+            summary = (
+                f"{inst} response time degraded ({rt_ms}ms > {threshold}ms threshold)"
+                if is_now_firing
+                else f"{inst} response time recovered"
+            )
+            self.alert_sink(
+                name=ALERTNAME_SLOW_RESPONSE,
+                severity="warning",
+                instance=inst,
+                summary=summary,
+                job="blackbox",
+                event_time=curr_time,
+                is_now_firing=is_now_firing,
+                receiver="prometheus-poller",
+                key=f"{ALERTNAME_SLOW_RESPONSE}|{inst}",
+                latency_ms=rt_ms,
+            )
 
-    try:
-        slow_thresholds = SlowThresholdRepository.get_all()
-    except Exception:
-        slow_thresholds = {}
-
-    slow_transitions, new_slow_state = compute_slow_response_transitions(
-        readings, _slow_poller_state, slow_thresholds
-    )
-    _slow_poller_state.update(new_slow_state)
-
-    for inst, is_now_firing in slow_transitions:
-        threshold = slow_thresholds.get(inst, DEFAULT_SLOW_RESPONSE_THRESHOLD_MS)
-        rt_ms = readings[inst][1]
-        summary = (
-            f"{inst} response time degraded ({rt_ms}ms > {threshold}ms threshold)" if is_now_firing
-            else f"{inst} response time recovered"
+    def get_health(self, now: Optional[float] = None) -> Dict[str, Any]:
+        """Compute and return health status dictionary for /health reporting."""
+        curr_time = now if now is not None else time.time()
+        poller_enabled = os.environ.get("DISABLE_ALERT_POLLER") != "1"
+        tick_age = (curr_time - self._last_tick) if self._last_tick > 0.0 else None
+        webhook_recent = (curr_time - self._last_webhook_at_ref[0]) < self.webhook_active_window_sec
+        alarm_service_ok = (
+            webhook_recent
+            or not poller_enabled
+            or (tick_age is not None and tick_age < self.poll_interval_sec * 3)
         )
-        record_alert_event(
-            name=ALERTNAME_SLOW_RESPONSE,
-            severity="warning",
-            instance=inst,
-            summary=summary,
-            job="blackbox",
-            event_time=now,
-            is_now_firing=is_now_firing,
-            receiver="prometheus-poller",
-            key=f"{ALERTNAME_SLOW_RESPONSE}|{inst}",
-            latency_ms=rt_ms,
-        )
+        return {
+            "ok": alarm_service_ok,
+            "last_tick_seconds_ago": round(tick_age, 1) if tick_age is not None else None,
+        }
 
-def _poller_loop():
-    _seed_poller_state()
-    while True:
-        try:
-            _poll_targets_once()
-        except Exception as e:
-            logger.error(f"Alert poller error: {e}", exc_info=True)
-        time.sleep(ALERT_POLL_INTERVAL_SECONDS)
+    def start(self) -> bool:
+        """Start the background poller daemon thread."""
+        if self._started:
+            return False
+        self._started = True
+        self._stop_event.clear()
 
-_poller_thread_started = False
+        def _loop():
+            self.seed_state()
+            while not self._stop_event.is_set():
+                try:
+                    self.poll_once()
+                except Exception as e:
+                    logger.error(f"Target poller error: {e}", exc_info=True)
+                self._stop_event.wait(self.poll_interval_sec)
+
+        self._thread = threading.Thread(target=_loop, name="target-poller", daemon=True)
+        self._thread.start()
+        logger.info(f"Target poller started (interval: {self.poll_interval_sec}s)")
+        return True
+
+    def stop(self) -> None:
+        """Stop the background poller daemon thread."""
+        self._stop_event.set()
+        self._started = False
+
+
+# ── Module Defaults & Backward Compatibility Re-exports ───────────────────────
+
+_poller_state = {}
+_slow_poller_state = {}
+_maintenance_active_prev = set()
+_LAST_POLLER_TICK = [0.0]
+
+target_poller = TargetPoller(
+    state=_poller_state,
+    slow_state=_slow_poller_state,
+    maintenance_active_prev=_maintenance_active_prev,
+    last_tick_ref=_LAST_POLLER_TICK,
+)
+
+
+def _seed_poller_state():
+    """Backward compatibility wrapper."""
+    target_poller.seed_state()
+
+
+def _reconcile_orphaned_alerts(monitored_instances):
+    """Backward compatibility wrapper."""
+    target_poller.reconcile_orphaned_alerts(monitored_instances)
+
+
+def _poll_targets_once():
+    """Backward compatibility wrapper."""
+    target_poller.poll_once()
+
 
 def start_alert_poller():
-    global _poller_thread_started
-    if _poller_thread_started:
-        return
-    _poller_thread_started = True
-    threading.Thread(target=_poller_loop, daemon=True).start()
-
-# ── Background Availability Aggregator ───────────────────────────────────────
-_AVAIL_AGGREGATOR_WORKER_ID = f"{os.getpid()}_{uuid.uuid4().hex[:8]}"
-AVAIL_AGGREGATE_INTERVAL_SECONDS = 60.0
-# Buckets older than this are pruned every aggregator cycle — the archive holds
-# nothing older, so no range query can return data past this horizon.
-AVAIL_BUCKET_RETENTION_SECONDS = 35 * 86400
-_avail_aggregator_started = False
-# Heartbeat for /health — set at the top of every aggregator cycle (leader or
-# not), so a wedged/crashed aggregator thread is visible instead of silently
-# stopping all bucket materialization (audit F5).
-_LAST_AGGREGATOR_TICK = [0.0]
-
-def _availability_aggregation_windows(now, latest_end):
-    """Time windows the aggregator should (re)aggregate this cycle.
-
-    Backfill (empty/stale store): 6h windows from an hour-aligned start
-    `floor(now/3600) - 7d` up to `now`. 21600 and 86400*7 are whole
-    multiples of 3600, so every interior boundary stays hour-aligned; only
-    the final window ends at the unaligned `now` to cover the in-progress
-    hour. An unaligned start would push every boundary mid-hour (06:16:14,
-    12:16:14, ...) and, since the per-window loop floors/ceils each window
-    to whole hours, two consecutive windows would then both touch the same
-    hourly bucket — each seeing only its own slice of that hour and
-    overwriting the other, leaving the rest of that hour unaggregated.
-
-    Steady state: just the last completed hour, plus the in-progress hour
-    once it is >= 30s old.
-    """
-    if latest_end is None or latest_end < (now - 86400 * 7):
-        windows = []
-        cur_t = math.floor(now / 3600.0) * 3600.0 - 86400 * 7
-        while cur_t < now:
-            next_t = min(cur_t + 21600, now)
-            windows.append((cur_t, next_t))
-            cur_t = next_t
-        return windows
-
-    hour_end = math.floor(now / 3600.0) * 3600.0
-    windows = [(hour_end - 3600.0, hour_end)]
-    if now - hour_end >= 30.0:
-        windows.append((hour_end, now))
-    return windows
-
-
-def _aggregate_availability_cycle():
-    """Incremental availability aggregation run executed only by the elected leader worker."""
-    c = _ctx()
-    _LAST_AGGREGATOR_TICK[0] = time.time()
-    is_leader = AggregationLeaseRepository.acquire_or_renew(
-        lease_name="avail_aggregator",
-        owner_id=_AVAIL_AGGREGATOR_WORKER_ID,
-        ttl_sec=AVAIL_AGGREGATE_INTERVAL_SECONDS * 2.5
-    )
-    if not is_leader:
-        return
-
-    now = time.time()
-    instance_job_map = c.get_instance_job_map('all')
-    monitored = sorted(instance_job_map.keys())
-    if not monitored:
-        return
-
-    latest_end = AvailabilityBucketRepository.get_latest_bucket_end('all')
-    windows_to_aggregate = _availability_aggregation_windows(now, latest_end)
-
-    for w_start, w_end in windows_to_aggregate:
-        w_minutes = max(1, int(round((w_end - w_start) / 60.0)))
-        step_sec = SCRAPE_INTERVAL_SECONDS
-        if w_minutes > 10080:
-            step_sec = 300.0
-        elif w_minutes > 1440:
-            step_sec = 30.0
-
-        at_suffix = f" @ {int(w_end)}"
-        queries = {
-            'probe_avail': f"avg_over_time(probe_success[{w_minutes}m]{at_suffix}) * 100",
-            'up_avail': f"avg_over_time(up[{w_minutes}m]{at_suffix}) * 100",
-            'probe_count': f"count_over_time(probe_success[{w_minutes}m]{at_suffix})",
-            'up_count': f"count_over_time(up[{w_minutes}m]{at_suffix})",
-            'probe_first_ts': f"min_over_time(timestamp(probe_success)[{w_minutes}m:]{at_suffix})",
-            'probe_last_ts': f"max_over_time(timestamp(probe_success)[{w_minutes}m:]{at_suffix})",
-            'up_first_ts': f"min_over_time(timestamp(up)[{w_minutes}m:]{at_suffix})",
-            'up_last_ts': f"max_over_time(timestamp(up)[{w_minutes}m:]{at_suffix})",
-            'duration': f"avg_over_time(probe_duration_seconds[{w_minutes}m]{at_suffix}) * 1000",
-            'probe_incidents': f"changes(probe_success[{w_minutes}m]{at_suffix})",
-            'up_incidents': f"changes(up[{w_minutes}m]{at_suffix})",
-        }
-
-        futures = {k: _SHARED_EXECUTOR.submit(c.fetch_prom_query_map, q, 10.0, 15.0) for k, q in queries.items()}
-        results = {}
-        for k, f in futures.items():
-            try:
-                results[k] = f.result()
-            except Exception:
-                results[k] = {}
-
-        # Raw 0/1 sample stream for the exact reconstruction engine. One range
-        # query for the whole fleet per window; per instance per hour it is
-        # sliced and fed to reconstruct_time_series_intervals(). Step is
-        # coarse enough to bound the payload (all instances at once) but fine
-        # enough for hour-level accounting — sub-`range_step` blips can be
-        # missed here; the live /api/availability path still re-queries fresh
-        # and /api/target-history uses a finer step. On any failure the maps
-        # come back empty and every instance falls back to the scalar
-        # avg_over_time approximation below.
-        range_step = 15.0 if w_minutes <= 180 else 30.0
-        try:
-            probe_range_map = c.fetch_prom_range_map("probe_success", w_start, w_end, range_step, cache_ttl=10.0, timeout=20.0)
-        except Exception:
-            probe_range_map = {}
-        try:
-            up_range_map = c.fetch_prom_range_map("up", w_start, w_end, range_step, cache_ttl=10.0, timeout=20.0)
-        except Exception:
-            up_range_map = {}
-
-        # Same classify-and-merge step as api_availability's materialize
-        # path, via derive_bucket_inputs() — see its docstring.
-        probe_results_raw = {
-            "avail": results.get('probe_avail', {}), "count": results.get('probe_count', {}),
-            "first_ts": results.get('probe_first_ts', {}), "last_ts": results.get('probe_last_ts', {}),
-            "incidents": results.get('probe_incidents', {}),
-        }
-        up_results_raw = {
-            "avail": results.get('up_avail', {}), "count": results.get('up_count', {}),
-            "first_ts": results.get('up_first_ts', {}), "last_ts": results.get('up_last_ts', {}),
-            "incidents": results.get('up_incidents', {}),
-        }
-        merged_maps = derive_bucket_inputs(monitored, probe_results_raw, up_results_raw)
-        avail_map = merged_maps["avail"]
-        count_map = merged_maps["count"]
-        first_ts_map = merged_maps["first_ts"]
-        last_ts_map = merged_maps["last_ts"]
-        incidents_map = merged_maps["incidents"]
-
-        duration_map = results.get('duration', {})
-
-        observed_cadences = []
-        for inst in monitored:
-            estimated = estimate_instance_cadence(inst, count_map, first_ts_map, last_ts_map)
-            if estimated is not None:
-                observed_cadences.append(estimated)
-        fleet_median_cadence = (
-            sorted(observed_cadences)[len(observed_cadences) // 2]
-            if observed_cadences else SCRAPE_INTERVAL_SECONDS
-        )
-
-        bucket_records = []
-        h_start = math.floor(w_start / 3600.0) * 3600.0
-        h_end = math.ceil(w_end / 3600.0) * 3600.0
-        num_hours = max(1, int(round((h_end - h_start) / 3600.0)))
-        w_duration_sec = float(w_end - w_start)
-
-        for inst in monitored:
-            raw_avail = avail_map.get(inst)
-            raw_count = count_map.get(inst)
-            raw_dur = duration_map.get(inst)
-            raw_inc = incidents_map.get(inst)
-
-            latency = 0.0
-            if raw_dur is not None:
-                try:
-                    latency = round(float(raw_dur), 1)
-                except (ValueError, TypeError):
-                    latency = 0.0
-
-            # Exact path: raw 0/1 samples for this instance (probe_success
-            # first, fall back to the `up` series for node/exporter targets).
-            samples = probe_range_map.get(inst) or up_range_map.get(inst)
-            if samples:
-                cad = (
-                    estimate_instance_cadence(inst, count_map, first_ts_map, last_ts_map)
-                    or (fleet_median_cadence if fleet_median_cadence > 0 else range_step)
-                )
-                cur_h = h_start
-                while cur_h < h_end:
-                    nxt_h = cur_h + 3600.0
-                    if cur_h >= now:
-                        break  # never materialize a bucket for an hour that has not started
-                    eff_end = min(nxt_h, now)
-                    rec = reconstruct_time_series_intervals(
-                        samples, window_start_ts=cur_h, window_end_ts=eff_end,
-                        expected_interval_sec=cad,
-                    )
-                    hour_pts = [v for ts, v in samples if cur_h <= ts < eff_end]
-                    bucket_records.append({
-                        "instance": inst,
-                        "job": instance_job_map.get(inst, "blackbox"),
-                        "bucket_start": cur_h,
-                        "bucket_end": nxt_h,
-                        "uptime_seconds": round(rec["uptime_seconds"], 2),
-                        "downtime_seconds": round(rec["downtime_seconds"], 2),
-                        "unknown_seconds": round(rec["unknown_seconds"], 2),
-                        "coverage_seconds": round(rec["coverage_seconds"], 2),
-                        "sample_count": len(hour_pts),
-                        "availability_pct": rec["availability_pct"],
-                        "incident_count": int(rec["incident_count"]),
-                        "avg_latency_ms": latency,
-                        "updated_at": now,
-                        # per-hour outages + still-in-outage-at-hour-start/end
-                        # flags: merge_hybrid_target_availability drops the
-                        # duplicate incident where one outage straddles the
-                        # boundary between two contiguous buckets. "i" carries
-                        # each outage's absolute [start, end] so the maintenance
-                        # carve-out can intersect the real outage, not the hour.
-                        "outage_json": {
-                            "d": [round(float(x), 1) for x in rec.get("outage_durations_sec", [])],
-                            "i": [[round(float(s), 1), round(float(e), 1)]
-                                  for s, e in rec.get("outage_intervals_sec", [])],
-                            "ongoing_start": bool(hour_pts and hour_pts[0] == 0),
-                            "ongoing_end": bool(rec.get("is_ongoing_outage")),
-                        },
-                    })
-                    cur_h = nxt_h
-                continue
-
-            # Fallback path: no raw samples (Prometheus range query failed, or
-            # short retention) — approximate from the avg_over_time / count /
-            # first-last-timestamp scalars, same as before this pass.
-            avail_pct = None
-            if raw_avail is not None:
-                try:
-                    avail_pct = round(max(0.0, min(100.0, float(raw_avail))), 2)
-                except (ValueError, TypeError):
-                    avail_pct = None
-
-            sample_count = 0
-            cov_sec = 0.0
-            f_ts = float(first_ts_map.get(inst, 0)) if first_ts_map else 0.0
-            l_ts = float(last_ts_map.get(inst, 0)) if last_ts_map else 0.0
-
-            if raw_count is not None:
-                try:
-                    sample_count = int(float(raw_count))
-                    if sample_count >= 2:
-                        span = l_ts - f_ts
-                        if f_ts > 0 and l_ts > 0 and span > 0:
-                            intv = span / (sample_count - 1)
-                            lead_in = min(intv, max(0.0, f_ts - w_start)) if (f_ts - w_start) <= intv * 1.5 else 0.0
-                            lead_out = min(intv, max(0.0, w_end - l_ts)) if (w_end - l_ts) <= intv * 1.5 else 0.0
-                            cov_sec = min(span + lead_in + lead_out, w_duration_sec)
-                        else:
-                            eff_cad = fleet_median_cadence if fleet_median_cadence > 0 else step_sec
-                            cov_sec = min(sample_count * eff_cad, w_duration_sec)
-                    elif sample_count == 1:
-                        eff_cad = fleet_median_cadence if fleet_median_cadence > 0 else step_sec
-                        cov_sec = min(eff_cad, w_duration_sec)
-                except (ValueError, TypeError):
-                    cov_sec = 0.0
-            elif avail_pct is not None:
-                cov_sec = w_duration_sec
-
-            if avail_pct is not None:
-                up_rate = min(1.0, max(0.0, float(avail_pct) / 100.0))
-                down_rate = round(1.0 - up_rate, 6)
-            else:
-                up_rate = 0.0
-                down_rate = 0.0
-            down_sec = round(cov_sec * down_rate, 2)
-
-            inc_count = 0
-            if raw_inc is not None:
-                try:
-                    inc_count = int(math.ceil(float(raw_inc) / 2.0))
-                except (ValueError, TypeError):
-                    inc_count = 0
-            if inc_count == 0 and down_sec > 0:
-                inc_count = 1
-
-            cur_h = h_start
-            while cur_h < h_end:
-                nxt_h = cur_h + 3600.0
-                if f_ts > 0 and l_ts > 0 and l_ts >= f_ts:
-                    overlap_start = max(cur_h, f_ts)
-                    overlap_end = min(nxt_h, l_ts)
-                    overlap_sec = max(0.0, overlap_end - overlap_start)
-                    if overlap_sec > 0:
-                        h_cov = min(3600.0, overlap_sec)
-                        h_down = round(h_cov * down_rate, 2)
-                        h_up = max(0.0, round(h_cov - h_down, 2))
-                        h_unk = max(0.0, round(3600.0 - h_cov, 2))
-                        h_avail = avail_pct
-                    else:
-                        h_cov = 0.0
-                        h_down = 0.0
-                        h_up = 0.0
-                        h_unk = 3600.0
-                        h_avail = None
-                elif avail_pct is not None or cov_sec > 0:
-                    h_cov = min(3600.0, cov_sec / num_hours)
-                    h_down = round(h_cov * down_rate, 2)
-                    h_up = max(0.0, round(h_cov - h_down, 2))
-                    h_unk = max(0.0, round(3600.0 - h_cov, 2))
-                    h_avail = avail_pct
-                else:
-                    h_cov = 0.0
-                    h_down = 0.0
-                    h_up = 0.0
-                    h_unk = 3600.0
-                    h_avail = None
-
-                bucket_records.append({
-                    "instance": inst,
-                    "job": instance_job_map.get(inst, "blackbox"),
-                    "bucket_start": cur_h,
-                    "bucket_end": nxt_h,
-                    "uptime_seconds": round(h_up, 2),
-                    "downtime_seconds": round(h_down, 2),
-                    "unknown_seconds": round(h_unk, 2),
-                    "coverage_seconds": round(h_cov, 2),
-                    "sample_count": sample_count // num_hours,
-                    "availability_pct": h_avail,
-                    "incident_count": inc_count if cur_h == h_start else 0,
-                    "avg_latency_ms": latency,
-                    "updated_at": now
-                })
-                cur_h = nxt_h
-
-        if bucket_records:
-            try:
-                AvailabilityBucketRepository.save_buckets(bucket_records)
-            except Exception:
-                # Was silently swallowed (audit F5) — a persistently failing
-                # write silently stops all bucket materialization.
-                logger.exception("availability aggregator: save_buckets failed for %d record(s)", len(bucket_records))
-
-    try:
-        AvailabilityBucketRepository.prune_old_buckets(AVAIL_BUCKET_RETENTION_SECONDS)
-    except Exception:
-        logger.exception("availability aggregator: prune_old_buckets failed")
-
-
-def _availability_aggregator_loop():
-    while True:
-        try:
-            _aggregate_availability_cycle()
-        except Exception as e:
-            logger.error(f"Availability aggregator error: {e}", exc_info=True)
-        time.sleep(AVAIL_AGGREGATE_INTERVAL_SECONDS)
-
-
-def start_availability_aggregator():
-    global _avail_aggregator_started
-    if _avail_aggregator_started:
-        return
-    _avail_aggregator_started = True
-    threading.Thread(target=_availability_aggregator_loop, daemon=True, name="avail-aggregator").start()
+    """Backward compatibility entry point."""
+    return target_poller.start()
 
 
 def _reconcile_status_json_into_sqlite():
@@ -765,10 +564,14 @@ def _reconcile_status_json_into_sqlite():
             if key in active_keys:
                 continue
             IncidentRepository.record_alert_event(
-                name=a.get("name", "Unknown"), severity=a.get("severity", "critical"),
-                instance=a.get("instance", "-"), summary=a.get("summary", ""),
-                job=a.get("job", ""), event_time=float(a.get("time", time.time())),
-                is_now_firing=True, key=key,
+                name=a.get("name", "Unknown"),
+                severity=a.get("severity", "critical"),
+                instance=a.get("instance", "-"),
+                summary=a.get("summary", ""),
+                job=a.get("job", ""),
+                event_time=float(a.get("time", time.time())),
+                is_now_firing=True,
+                key=key,
             )
             imported += 1
         if imported:

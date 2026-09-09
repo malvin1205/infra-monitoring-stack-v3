@@ -18,11 +18,6 @@ __pycache__
 *.db
 *.db-*
 telegram_config.json
-targets/websites.yml
-targets/websites.yml.bak
-targets/websites.yml.tmp
-targets/websites.yml.lock
-!targets/websites.yml.example
 history.json
 history_archive.json
 logs.json

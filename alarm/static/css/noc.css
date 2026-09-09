@@ -1495,8 +1495,8 @@ html, body {
   color: #ffffff;
 }
 
-/* No data -> Prometheus has no probe sample for this target (e.g. an
-   un-scraped websites.yml entry). Neutral grey — NOT an outage, no alarm. */
+/* No data -> Prometheus has no probe sample for this target.
+   Neutral grey — NOT an outage, no alarm. */
 .host-card.hc-nodata {
   background: linear-gradient(180deg, #3f4652 0%, #2b303a 100%);
   border-color: rgba(255, 255, 255, 0.12);

@@ -34,9 +34,9 @@ def alert_key(a, labels):
 
 
 # Minimal shape check for the Add Target form — not full RFC validation, just
-# enough to reject obvious garbage (e.g. a bare number) before it's written to
-# websites.yml. Bare Docker/internal hostnames without a dot (e.g. "webapp")
-# are intentionally allowed — that's a real, valid target shape here.
+# enough to reject obvious garbage (e.g. a bare number). Bare Docker/internal
+# hostnames without a dot (e.g. "webapp") are intentionally allowed — that's
+# a real, valid target shape here.
 TARGET_HOST_RE = re.compile(r'^[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?)*$')
 
 # Cloud metadata endpoints are never a legitimate monitoring target (unlike

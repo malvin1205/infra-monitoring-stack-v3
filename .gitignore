@@ -10,10 +10,14 @@ pytest.ini
 
 # Agent / IDE / OS config
 .agent/
+.agents/
+agent/
 .claude/
 .gemini/
 .vscode/
 .idea/
+skills-lock.json
+CONTEXT.md
 *.sublime-project
 *.sublime-workspace
 .DS_Store
@@ -40,13 +44,6 @@ env/
 alarm/data/*
 !alarm/data/.gitkeep
 !alarm/data/*.example
-
-# Targets curation
-alarm/targets/websites.yml
-alarm/targets/websites.yml.bak
-alarm/targets/websites.yml.tmp
-alarm/targets/websites.yml.lock
-!alarm/targets/websites.yml.example
 
 # Legacy secrets and local configurations fallback
 alarm/telegram_config.json

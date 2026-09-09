@@ -99,7 +99,7 @@ _CACHE_LAST_PRUNE = [0.0]
 _CACHE_PRUNE_INTERVAL = 30.0
 _CACHE_MAX_AGE = 120.0
 
-# Availability result cache & single-flight coalescing
+# Backward compatibility shims for availability cache (now encapsulated in core.availability)
 _AVAILABILITY_CACHE = {}
 _AVAILABILITY_CACHE_LOCK = threading.Lock()
 _AVAILABILITY_FLIGHT_LOCKS = {}
@@ -114,18 +114,17 @@ def _fetch_lock_for(key):
         return lock
 
 def _avail_flight_lock_for(key):
-    with _AVAILABILITY_FLIGHT_LOCKS_GUARD:
-        lock = _AVAILABILITY_FLIGHT_LOCKS.get(key)
-        if lock is None:
-            lock = threading.Lock()
-            _AVAILABILITY_FLIGHT_LOCKS[key] = lock
-        return lock
+    return _fetch_lock_for(key)
 
 def clear_availability_cache(clear_db=True):
-    with _AVAILABILITY_CACHE_LOCK:
-        _AVAILABILITY_CACHE.clear()
-    with _AVAILABILITY_FLIGHT_LOCKS_GUARD:
-        _AVAILABILITY_FLIGHT_LOCKS.clear()
+    try:
+        from core.availability import availability_engine
+    except (ImportError, ValueError):
+        from alarm.core.availability import availability_engine
+    try:
+        availability_engine.invalidate_cache()
+    except Exception:
+        pass
     if clear_db:
         try:
             AvailabilityBucketRepository.clear_all_buckets()
@@ -147,17 +146,6 @@ def _maybe_prune_cache(now):
             unlocked = [k for k, lock in list(_FETCH_LOCKS.items()) if not lock.locked() and k not in PROMETHEUS_CACHE]
             for k in unlocked:
                 _FETCH_LOCKS.pop(k, None)
-    with _AVAILABILITY_CACHE_LOCK:
-        stale_avail = [k for k, (ts, _d) in _AVAILABILITY_CACHE.items() if now - ts > _CACHE_MAX_AGE]
-        for k in stale_avail:
-            _AVAILABILITY_CACHE.pop(k, None)
-    with _AVAILABILITY_FLIGHT_LOCKS_GUARD:
-        for k in stale_avail:
-            _AVAILABILITY_FLIGHT_LOCKS.pop(k, None)
-        if len(_AVAILABILITY_FLIGHT_LOCKS) > 500:
-            unlocked_avail = [k for k, lock in list(_AVAILABILITY_FLIGHT_LOCKS.items()) if not lock.locked() and k not in _AVAILABILITY_CACHE]
-            for k in unlocked_avail:
-                _AVAILABILITY_FLIGHT_LOCKS.pop(k, None)
 
 # is_safe_endpoint_url() does a real (blocking) DNS resolution — fine once,
 # at /api/endpoints registration time, but fetch_prometheus_json is called
