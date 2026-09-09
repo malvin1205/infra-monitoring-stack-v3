@@ -12,6 +12,7 @@
  */
 
 import './ui/dialog.js'; // window.trapModalFocus, window.showConfirmDialog
+import { escapeHtml, slowThresholdMs } from './ui/format.js';
 
 const JOB_DEFAULT_LS_KEY = 'infrawatch.defaultJob';
 
@@ -35,12 +36,6 @@ function setDefaultJob(endpointUrl, job) {
   if (job && job !== 'all') map[endpointUrl] = job;
   else delete map[endpointUrl];
   try { localStorage.setItem(JOB_DEFAULT_LS_KEY, JSON.stringify(map)); } catch (e) { }
-}
-
-function escapeHtml(str) {
-  return String(str ?? '').replace(/[&<>"']/g, c => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
-  }[c]));
 }
 
 // ── Session Authentication & Current User State ─────────────────────────────
@@ -300,25 +295,6 @@ function updateUserUI(user) {
 // timestamp and log row. 'id-ID' renders 24h "HH.MM" and "DD Mmm"; switch to
 // e.g. 'en-GB' for "HH:MM" if the wallboard audience is non-Indonesian.
 const DATE_LOCALE = 'id-ID';
-
-// Single HTML-escaper for all innerHTML string building. Each page class
-// exposes it as this._esc() for call-site brevity; this is the one impl.
-function htmlEscape(s) {
-  return String(s)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
-}
-
-// Effective "slow" latency threshold (ms) for a target. The backend now sends
-// a per-instance slowThresholdMs on every /instances row (honouring
-// SlowThresholdRepository overrides); fall back to 500 for an older payload.
-// Note `!= null` not `||` — an override of 0 ("always slow") is valid.
-function slowThresholdMs(t) {
-  return (t && t.slowThresholdMs != null) ? t.slowThresholdMs : 500;
-}
 
 // Global API Fetch helper using secure session cookie and CSRF protection
 async function apiFetch(url, options = {}) {
@@ -5204,7 +5180,7 @@ class InstancesPage {
     } catch { return '—'; }
   }
 
-  _esc(s) { return htmlEscape(s); }
+  _esc(s) { return escapeHtml(s); }
 }
 
 
@@ -5419,7 +5395,7 @@ class LogsPage {
     return `${(s / 3600).toFixed(1)}h`;
   }
 
-  _esc(s) { return htmlEscape(s); }
+  _esc(s) { return escapeHtml(s); }
 }
 
 
@@ -5957,7 +5933,7 @@ class HistoryPage {
     URL.revokeObjectURL(a.href);
   }
 
-  _esc(s) { return htmlEscape(s); }
+  _esc(s) { return escapeHtml(s); }
 }
 
 HistoryPage.PAGE_SIZE = 40;
@@ -6247,7 +6223,7 @@ class ServerMonitor {
             row.style.cssText = 'display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px; padding:8px 10px; background:var(--surface); border:1px solid var(--border); border-radius:var(--r-sm); font-size:12px; margin-bottom:6px;';
             const statusDot = ep.online ? '<span style="color:#22C55E; margin-right:6px;">● Online</span>' : '<span style="color:#EF4444; margin-right:6px;">● Offline</span>';
             const activeBadge = ep.active ? '<span style="background:var(--accent-bg); color:var(--accent); padding:2px 6px; border-radius:4px; font-size:10px; font-weight:600; margin-left:6px;">ACTIVE</span>' : '';
-            const safeUrl = htmlEscape(ep.url);
+            const safeUrl = escapeHtml(ep.url);
 
             row.innerHTML = `
               <div style="display:flex; align-items:center; overflow:hidden; flex:1; min-width:0;">
@@ -6519,7 +6495,7 @@ class ServerMonitor {
   }
 
   /* ── Escape HTML ───────────────────────────────── */
-  _esc(str) { return htmlEscape(str); }
+  _esc(str) { return escapeHtml(str); }
 
   /* ── Cleanup ───────────────────────────────────── */
   destroy() {
