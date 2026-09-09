@@ -57,7 +57,7 @@ function closeLoginModal() {
 
 // 'owner' (the founding account) and 'admin' share the same UI privileges;
 // what only the owner can do is enforced server-side in the user-mgmt routes.
-export export function isAdminLike(u) {
+export function isAdminLike(u) {
   return !!u && (u.role === 'admin' || u.role === 'owner');
 }
 
