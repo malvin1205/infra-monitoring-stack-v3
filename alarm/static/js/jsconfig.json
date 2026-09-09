@@ -1,0 +1,13 @@
+{
+  "//": "Editor-level project config for the vanilla ES-module frontend. No build, no npm — this only drives IntelliSense, go-to-definition and import resolution across the module graph. Turning on checkJs is a follow-up: it needs a one-time pass over the errors it surfaces in dashboard.js / app-shell.js.",
+  "compilerOptions": {
+    "module": "esnext",
+    "target": "es2022",
+    "moduleResolution": "bundler",
+    "lib": ["dom", "dom.iterable", "es2022"],
+    "checkJs": false,
+    "allowJs": true,
+    "baseUrl": "."
+  },
+  "include": ["**/*.js"]
+}
