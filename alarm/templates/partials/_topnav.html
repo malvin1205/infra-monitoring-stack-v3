@@ -1,0 +1,152 @@
+  <!-- ── Top Navigation ─────────────────────────────────── -->
+  <nav class="topnav" role="navigation" aria-label="Main navigation">
+    <div class="topnav-brand">
+      <!-- Logo mark -->
+      <div class="brand-mark" aria-hidden="true">
+        <svg aria-hidden="true" focusable="false" width="22" height="22" viewBox="0 0 22 22" fill="none">
+          <rect x="2" y="2" width="7" height="7" rx="2" fill="var(--accent)"/>
+          <rect x="13" y="2" width="7" height="7" rx="2" fill="var(--accent)" opacity="0.5"/>
+          <rect x="2" y="13" width="7" height="7" rx="2" fill="var(--accent)" opacity="0.5"/>
+          <rect x="13" y="13" width="7" height="7" rx="2" fill="var(--accent)" opacity="0.7"/>
+        </svg>
+      </div>
+      <span class="brand-name">InfraWatch</span>
+      <span class="brand-divider" aria-hidden="true">/</span>
+      <span class="brand-sub">Internal Network</span>
+    </div>
+
+    <div class="topnav-center">
+      <div class="live-pill">
+        <span class="live-dot" id="liveDot" aria-label="Live data"></span>
+        <span class="live-label">Live</span>
+      </div>
+    </div>
+
+    <div class="topnav-actions">
+      <div id="globalHealthBadge" class="status-pill pill-healthy">
+        <span class="pill-dot"></span>
+        <span class="pill-label">Healthy</span>
+      </div>
+
+      <!-- Acknowledge Alarm Button (Only visible when target is down/warning) -->
+      <button id="ackAlarmBtn" class="ack-alarm-btn hidden" type="button" title="Acknowledge and silence current alarm">
+        <svg aria-hidden="true" focusable="false" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="20 6 9 17 4 12"/>
+        </svg>
+        <span id="ackBtnLabel">Acknowledge Alarm</span>
+      </button>
+
+      <!-- Alert Logs / Incident History -->
+      <button class="icon-action" id="openLogsModalBtn" type="button" title="Alert Logs & Incident History" aria-label="Alert Logs & Incident History" aria-haspopup="dialog" aria-controls="logsModal" style="position: relative;">
+        <svg aria-hidden="true" focusable="false" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 22V6a2 2 0 012-2h12a2 2 0 012 2v16"/>
+          <path d="M2 22h20M8 10h8M8 14h5"/>
+        </svg>
+        <span id="logsBadge" class="nav-badge hidden"></span>
+      </button>
+
+
+      <span class="last-updated-text" id="statusMeta">Checking…</span>
+      <span class="last-probe-text" id="lastProbeTime" style="display:none"></span>
+
+      <!-- Endpoint Selector Dropdown & Manage Button -->
+      <div class="filter-select-wrap">
+        <select id="endpointSelect" class="filter-select" title="Select Active Prometheus Endpoint" aria-label="Prometheus Endpoint">
+          <option value="">Select Endpoint...</option>
+        </select>
+      </div>
+
+      <button class="icon-action" id="openEndpointModalBtn" title="Manage / Add Prometheus Endpoint" aria-label="Manage Endpoint">
+        <svg aria-hidden="true" focusable="false" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="3"/>
+          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+        </svg>
+      </button>
+
+      <select id="scrapeIntervalSelect" class="interval-select" aria-label="Refresh interval">
+        <option value="2000">2s (Fast)</option>
+        <option value="5000" selected>5s (Default)</option>
+        <option value="10000">10s</option>
+        <option value="30000">30s</option>
+      </select>
+
+      <button class="icon-action" id="refreshInstances" title="Refresh now" aria-label="Refresh data">
+        <svg aria-hidden="true" focusable="false" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 12a9 9 0 11-6.219-8.56"/>
+        </svg>
+      </button>
+
+      <button class="icon-action" id="soundToggleBtn" title="Toggle sound alarm" aria-label="Toggle sound alarm">
+        <svg aria-hidden="true" focusable="false" id="soundIconOn" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+          <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"/>
+        </svg>
+        <svg aria-hidden="true" focusable="false" id="soundIconOff" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none">
+          <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+          <line x1="23" y1="9" x2="17" y2="15"/>
+          <line x1="17" y1="9" x2="23" y2="15"/>
+        </svg>
+      </button>
+
+      <!-- Self-Monitoring (Phase 13) — reuses /health -->
+      <button class="icon-action" id="selfHealthBtn" title="Checking InfraWatch self-status…" aria-label="InfraWatch self-status" style="position: relative;">
+        <svg aria-hidden="true" focusable="false" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M22 12h-4l-3 9L9 3l-3 9H2"/>
+        </svg>
+        <span id="selfHealthDot" style="position:absolute; top:5px; right:5px; width:7px; height:7px; border-radius:50%; background: var(--success);"></span>
+      </button>
+
+      <!-- User / Auth Badge & Actions -->
+      <div id="userAuthWrap" class="user-auth-wrap" style="position: relative;">
+        <button id="userMenuBtn" class="user-menu-btn" type="button" title="User account" aria-haspopup="true" aria-expanded="false">
+          <span class="user-avatar" id="userAvatar">G</span>
+          <span class="user-name" id="userNameLabel">Guest</span>
+          <span class="user-role-pill" id="userRolePill">Viewer</span>
+        </button>
+        <div id="userDropdown" class="user-dropdown hidden">
+          <div class="user-dropdown-header">
+            <div class="user-dropdown-name" id="dropdownUserName">Guest User</div>
+            <div class="user-dropdown-role" id="dropdownUserRole">Read-Only Viewer</div>
+          </div>
+          <div class="user-dropdown-divider"></div>
+          <button id="headerManageUsersBtn" class="dropdown-item hidden" type="button">
+            <svg aria-hidden="true" focusable="false" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right: 8px; flex-shrink: 0;">
+              <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
+              <circle cx="9" cy="7" r="4"/>
+              <path d="M23 21v-2a4 4 0 0 0-3-3.87"/>
+              <path d="M16 3.13a4 4 0 0 1 0 7.75"/>
+            </svg>
+            Manage Users
+          </button>
+          <button id="headerLoginBtn" class="dropdown-item" type="button">
+            <svg aria-hidden="true" focusable="false" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right: 8px; flex-shrink: 0;">
+              <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/>
+              <polyline points="10 17 15 12 10 7"/>
+              <line x1="15" y1="12" x2="3" y2="12"/>
+            </svg>
+            Log In
+          </button>
+          <button id="headerLogoutBtn" class="dropdown-item hidden" type="button">
+            <svg aria-hidden="true" focusable="false" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right: 8px; flex-shrink: 0;">
+              <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+              <polyline points="16 17 21 12 16 7"/>
+              <line x1="21" y1="12" x2="9" y2="12"/>
+            </svg>
+            Log Out
+          </button>
+        </div>
+      </div>
+
+      <button class="icon-action" id="themeToggleBtn" aria-label="Toggle theme">
+        <svg aria-hidden="true" focusable="false" id="themeIconDark" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+          <path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/>
+        </svg>
+        <svg aria-hidden="true" focusable="false" id="themeIconLight" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none">
+          <circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/>
+          <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/>
+          <line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/>
+          <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
+        </svg>
+      </button>
+    </div>
+  </nav>

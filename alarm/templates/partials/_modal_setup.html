@@ -1,0 +1,41 @@
+  <!-- First-Run Administrator Setup Modal -->
+  <div id="setupModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="setupModalTitle">
+    <div class="modal-card">
+      <div class="modal-header">
+        <div class="modal-title-group">
+          <div class="modal-icon-badge">
+            <svg aria-hidden="true" focusable="false" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+            </svg>
+          </div>
+          <div>
+            <h3 class="modal-title" id="setupModalTitle">Initial System Setup</h3>
+            <div class="modal-subtitle">Create Administrator Account</div>
+          </div>
+        </div>
+      </div>
+      <form id="setupForm" class="modal-form">
+        <p style="font-size: 13px; color: var(--text-secondary); line-height: 1.5;">
+          Welcome to InfraWatch! Create the primary administrator account to secure monitoring operations.
+        </p>
+        <div class="form-group">
+          <label for="setupDisplayNameInput" class="form-label">Full / Display Name</label>
+          <input type="text" id="setupDisplayNameInput" class="form-input" style="width: 100%;" placeholder="System Administrator" autocomplete="name">
+        </div>
+        <div class="form-group">
+          <label for="setupUsernameInput" class="form-label">Admin Username *</label>
+          <input type="text" id="setupUsernameInput" class="form-input" style="width: 100%;" placeholder="admin" required autocomplete="username">
+        </div>
+        <div class="form-group">
+          <label for="setupPasswordInput" class="form-label">Password (min. 12 chars) *</label>
+          <input type="password" id="setupPasswordInput" class="form-input" style="width: 100%;" placeholder="••••••••••••" required minlength="12" autocomplete="new-password">
+        </div>
+        <div class="form-group">
+          <label for="setupConfirmPasswordInput" class="form-label">Confirm Password *</label>
+          <input type="password" id="setupConfirmPasswordInput" class="form-input" style="width: 100%;" placeholder="••••••••••••" required minlength="12" autocomplete="new-password">
+        </div>
+        <div id="setupError" class="form-error hidden"></div>
+        <button type="submit" id="setupSubmitBtn" class="btn btn-primary btn-block">Initialize & Log In</button>
+      </form>
+    </div>
+  </div>

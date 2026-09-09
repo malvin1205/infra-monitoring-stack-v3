@@ -1,0 +1,34 @@
+  <!-- ── Audio Consent & Welcome Splash Screen ────────────── -->
+  <div id="splashOverlay" class="splash-overlay">
+    <div class="splash-card">
+      <div class="splash-brand-icon">
+        <svg aria-hidden="true" focusable="false" width="40" height="40" viewBox="0 0 22 22" fill="none">
+          <rect x="2" y="2" width="7" height="7" rx="2" fill="var(--accent)"/>
+          <rect x="13" y="2" width="7" height="7" rx="2" fill="var(--accent)" opacity="0.5"/>
+          <rect x="2" y="13" width="7" height="7" rx="2" fill="var(--accent)" opacity="0.5"/>
+          <rect x="13" y="13" width="7" height="7" rx="2" fill="var(--accent)" opacity="0.7"/>
+        </svg>
+      </div>
+      <p class="splash-title" role="presentation">InfraWatch NOC Dashboard</p>
+      <p class="splash-desc">
+        Click the button below to enter the network monitoring dashboard and enable <strong>MP3 audio alarm permissions</strong>.
+      </p>
+
+      <div class="splash-audio-badge">
+        <svg aria-hidden="true" focusable="false" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+          <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"/>
+        </svg>
+        <span>Audio Alarm Auto-Play Permission Required</span>
+      </div>
+
+      <button id="enterDashboardBtn" class="splash-btn" type="button">
+        <svg aria-hidden="true" focusable="false" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <polygon points="5 3 19 12 5 21 5 3"/>
+        </svg>
+        <span>Enter & Enable Audio Alarm</span>
+      </button>
+
+      <span class="splash-subnote">The browser requires a one-time user interaction to permit automated MP3 alarm playback during Critical status.</span>
+    </div>
+  </div>

@@ -1,0 +1,125 @@
+  <!-- Alert Logs / Incident History Modal -->
+  <div id="logsModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="logsModalTitle">
+    <div class="modal-card logs-modal-card">
+      <div class="modal-header">
+        <h3 class="modal-title" id="logsModalTitle">Alert Logs & Incident History</h3>
+        <button id="closeLogsModal" class="modal-close" type="button" aria-label="Close modal">&times;</button>
+      </div>
+
+      <div class="modal-body">
+        <div class="logs-tabs" role="tablist" aria-label="Logs view">
+          <button class="chip chip-active" id="logsTabBtn" data-logs-tab="logs" type="button" role="tab" aria-selected="true">Live Alert Log</button>
+          <button class="chip" id="historyTabBtn" data-logs-tab="history" type="button" role="tab" aria-selected="false">Incident History</button>
+          <button class="chip" id="maintenanceTabBtn" data-logs-tab="maintenance" type="button" role="tab" aria-selected="false">Maintenance <span id="maintenanceNavBadge" class="nav-badge nav-badge-inline hidden"></span></button>
+        </div>
+
+        <!-- Live Alert Log panel -->
+        <div id="logsTabPanel" class="logs-tab-panel">
+          <div class="logs-toolbar">
+            <input type="text" id="logSearch" class="search-input" placeholder="Search alert / host…" autocomplete="off" aria-label="Search alert logs">
+            <div class="logs-filter-group">
+              <button class="chip chip-active" data-log-filter="all" type="button">All</button>
+              <button class="chip" data-log-filter="firing" type="button">Firing</button>
+              <button class="chip" data-log-filter="resolved" type="button">Resolved</button>
+            </div>
+            <label class="logs-live-toggle">
+              <input type="checkbox" id="logLiveToggle" checked>
+              <span>Live</span>
+            </label>
+            <button id="clearLogs" class="btn btn-secondary btn-sm" type="button" title="Hide entries older than now — this browser only; does not delete server-side data">Hide older</button>
+          </div>
+          <div class="data-table">
+            <div class="al-meta-bar">
+              <span class="al-meta-count" id="logStreamMeta">—</span>
+              <div class="al-legend">
+                <span class="al-legend-item"><span class="al-dot al-dot-firing" style="width:7px;height:7px;"></span>firing now</span>
+                <span class="al-legend-item"><span class="al-dot al-dot-resolved" style="width:7px;height:7px;"></span>resolved</span>
+              </div>
+            </div>
+            <div class="log-stream" id="logStream"></div>
+          </div>
+        </div>
+
+        <!-- Incident History panel -->
+        <div id="historyTabPanel" class="logs-tab-panel hidden">
+          <div class="hist-stat-row">
+            <div class="hist-stat-card">
+              <span class="hist-stat-value" id="histTotal">—</span>
+              <span class="hist-stat-label">Total Incidents</span>
+            </div>
+            <div class="hist-stat-card">
+              <span class="hist-stat-value" id="histThisMonth">—</span>
+              <span class="hist-stat-label">This Month</span>
+            </div>
+            <div class="hist-stat-card hist-stat-critical">
+              <span class="hist-stat-value" id="histCritical">—</span>
+              <span class="hist-stat-label">Critical</span>
+            </div>
+            <div class="hist-stat-card hist-stat-warning">
+              <span class="hist-stat-value" id="histWarning">—</span>
+              <span class="hist-stat-label">Warning</span>
+            </div>
+          </div>
+
+          <div class="logs-toolbar">
+            <input type="text" id="historySearch" class="search-input" placeholder="Search alert / host…" autocomplete="off" aria-label="Search incident history">
+            <div class="logs-filter-group">
+              <button class="chip chip-active" data-hist-filter="all" type="button">All</button>
+              <button class="chip" data-hist-filter="critical" type="button">Critical</button>
+              <button class="chip" data-hist-filter="warning" type="button">Warning</button>
+            </div>
+            <div class="logs-filter-group">
+              <button class="chip chip-active" data-hist-status="all" type="button">All</button>
+              <button class="chip" data-hist-status="ongoing" type="button">Ongoing</button>
+              <button class="chip" data-hist-status="resolved" type="button">Resolved</button>
+            </div>
+            <select id="historySortSelect" class="avail-range-select" aria-label="Sort incident history">
+              <option value="last_seen" selected>Sort: Last Seen</option>
+              <option value="total_down">Sort: Total Down</option>
+              <option value="occurrences">Sort: Occurrences</option>
+            </select>
+            <button id="exportHistory" class="btn btn-secondary btn-sm" type="button">Export CSV</button>
+            <button id="clearHistory" class="btn btn-secondary btn-sm" type="button" title="Hide entries older than now — this browser only; does not delete server-side data">Hide older</button>
+          </div>
+          <div class="history-meta-row">
+            <span id="historyMeta">0 incidents (filtered)</span>
+            <div class="history-meta-filters">
+              <select id="historyJobFilter" class="avail-range-select" aria-label="Filter by job">
+                <option value="all" selected>All Jobs</option>
+              </select>
+              <select id="historyRangeSelect" class="avail-range-select" aria-label="Select date range">
+                <option value="month" selected>This Month</option>
+                <option value="7d">Last 7 Days</option>
+                <option value="30d">Last 30 Days</option>
+                <option value="all">All Time</option>
+              </select>
+              <span id="historyBadge" class="host-count-badge">0</span>
+            </div>
+          </div>
+          <div class="data-table">
+            <div class="data-table-head hist-grid" aria-hidden="true">
+              <span>Host / Alert</span><span>Status</span><span>Severity</span><span>Occurrences</span><span>First Seen</span><span style="text-align:right;">Total Down</span><span style="text-align:right;">Last Seen</span>
+            </div>
+            <div class="history-full-table" id="historyFullTable"></div>
+            <div class="history-pager" id="historyPager" hidden>
+              <button id="historyLoadMore" class="btn btn-secondary btn-sm" type="button">Show more</button>
+              <span id="historyPagerLabel" class="history-pager-label"></span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Maintenance Manager panel (Phase 9 Revise 1) -->
+        <div id="maintenanceTabPanel" class="logs-tab-panel hidden">
+          <div class="history-meta-row">
+            <span id="maintManagerMeta">0 active, 0 upcoming</span>
+          </div>
+          <div class="data-table">
+            <div class="data-table-head maint-grid" aria-hidden="true">
+              <span>Target</span><span>Reason</span><span>Window</span><span>Action</span>
+            </div>
+            <div class="history-full-table" id="maintManagerTable"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>

@@ -1,0 +1,25 @@
+  <!-- Add Target Modal -->
+  <div id="addTargetModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3 class="modal-title" id="modalTitle">Add Monitoring Target</h3>
+        <button id="closeAddTargetModal" class="modal-close" type="button" aria-label="Close modal">&times;</button>
+      </div>
+      <form id="addTargetForm" class="modal-form">
+        <div class="form-group">
+          <label for="targetUrlSelect" class="form-label">Select Target from Prometheus</label>
+          <select id="targetUrlSelect" class="form-select" required>
+            <option value="" disabled selected>Loading Prometheus target list...</option>
+          </select>
+          <span class="form-help">Select a target from the Prometheus discovered target list to enable for monitoring.</span>
+        </div>
+        <div id="addTargetError" class="form-error hidden"></div>
+        <div class="modal-actions">
+          <button type="button" id="cancelAddTargetBtn" class="btn btn-secondary">Cancel</button>
+          <button type="submit" id="submitAddTargetBtn" class="btn btn-primary">
+            <span>Save Target</span>
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>

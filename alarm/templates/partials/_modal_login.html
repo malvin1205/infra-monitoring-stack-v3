@@ -1,0 +1,33 @@
+  <!-- User Login Modal -->
+  <div id="loginModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="loginModalTitle">
+    <div class="modal-card modal-card-narrow">
+      <div class="modal-header">
+        <div class="modal-title-group">
+          <div class="modal-icon-badge">
+            <svg aria-hidden="true" focusable="false" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/>
+              <polyline points="10 17 15 12 10 7"/>
+              <line x1="15" y1="12" x2="3" y2="12"/>
+            </svg>
+          </div>
+          <h3 class="modal-title" id="loginModalTitle">Operator Login</h3>
+        </div>
+        <button id="closeLoginModalBtn" class="modal-close" type="button" aria-label="Close modal">&times;</button>
+      </div>
+      <form id="loginForm" class="modal-form">
+        <div class="form-group">
+          <label for="loginUsernameInput" class="form-label">Username</label>
+          <input type="text" id="loginUsernameInput" class="form-input" style="width: 100%;" placeholder="Username" required autocomplete="username">
+        </div>
+        <div class="form-group">
+          <label for="loginPasswordInput" class="form-label">Password</label>
+          <input type="password" id="loginPasswordInput" class="form-input" style="width: 100%;" placeholder="••••••••••••" required autocomplete="current-password">
+        </div>
+        <div id="loginError" class="form-error hidden"></div>
+        <div class="modal-actions">
+          <button id="cancelLoginBtn" class="btn btn-secondary" type="button">Cancel</button>
+          <button type="submit" id="loginSubmitBtn" class="btn btn-primary">Log In</button>
+        </div>
+      </form>
+    </div>
+  </div>

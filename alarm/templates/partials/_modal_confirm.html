@@ -1,0 +1,29 @@
+  <!-- Modern Confirmation Dialog Modal -->
+  <div id="confirmModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="confirmModalTitle">
+    <div class="modal-card modal-card-danger">
+      <div class="modal-header">
+        <div class="modal-title-group">
+          <div class="modal-icon-badge modal-icon-badge-danger">
+            <svg aria-hidden="true" focusable="false" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+              <line x1="12" y1="9" x2="12" y2="13"/>
+              <line x1="12" y1="17" x2="12.01" y2="17"/>
+            </svg>
+          </div>
+          <h3 class="modal-title" id="confirmModalTitle">Delete Target</h3>
+        </div>
+        <button id="closeConfirmModalBtn" class="modal-close" type="button" aria-label="Close modal">&times;</button>
+      </div>
+
+      <div class="modal-body">
+        <p id="confirmModalMessage" style="font-size: 13px; color: var(--text-secondary); line-height: 1.5; margin-bottom: 20px;">
+          Are you sure you want to remove this target from monitoring?
+        </p>
+
+        <div class="modal-actions">
+          <button id="confirmCancelBtn" class="btn btn-secondary" type="button">Cancel</button>
+          <button id="confirmActionBtn" class="btn btn-danger" type="button">Yes, Delete</button>
+        </div>
+      </div>
+    </div>
+  </div>

@@ -1,0 +1,384 @@
+  <!-- ── Side Drawer / Semi-Fullscreen Target Detail Modal ──────────────────── -->
+  <div class="drawer-backdrop hidden" id="sideDrawerOverlay" aria-hidden="true"></div>
+  <aside class="side-drawer" id="sideDrawer" role="dialog" aria-modal="true" aria-label="Target Details Modal">
+
+    <!-- Modal Header -->
+    <div class="drawer-header">
+      <div class="drawer-host-info">
+        <span class="drawer-dot" id="drawerStatusDot"></span>
+        <div class="drawer-title-group">
+          <h3 class="drawer-ip" id="drawerTargetTitle">—</h3>
+          <span class="drawer-job-text" id="drawerJobBadge">—</span>
+          <span class="drawer-status-pill" id="drawerStatusPill">—</span>
+        </div>
+      </div>
+
+      <div class="drawer-actions-top">
+        <button class="btn btn-sm btn-secondary" id="drawerRefreshBtn" type="button" title="Refresh Target Data">
+          <svg aria-hidden="true" focusable="false" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg>
+          <span>Refresh</span>
+        </button>
+        <button class="drawer-close" id="closeDrawerBtn" aria-label="Close details">
+          <svg aria-hidden="true" focusable="false" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+        </button>
+      </div>
+    </div>
+
+    <!-- Modal Tabs Navigation -->
+    <div class="modal-nav-tabs" id="modalTabsNav" role="tablist">
+      <button class="modal-nav-tab active" data-tab="overview" type="button" role="tab" aria-selected="true">
+        <svg aria-hidden="true" focusable="false" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+        <span>Overview</span>
+      </button>
+      <button class="modal-nav-tab" data-tab="history" type="button" role="tab" aria-selected="false">
+        <svg aria-hidden="true" focusable="false" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+        <span>History</span>
+      </button>
+      <button class="modal-nav-tab" data-tab="events" type="button" role="tab" aria-selected="false">
+        <svg aria-hidden="true" focusable="false" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
+        <span>Events</span>
+      </button>
+      <button class="modal-nav-tab" data-tab="maintenance" type="button" role="tab" aria-selected="false">
+        <svg aria-hidden="true" focusable="false" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>
+        <span>Maintenance</span>
+      </button>
+      <button class="modal-nav-tab" data-tab="raw" type="button" role="tab" aria-selected="false">
+        <svg aria-hidden="true" focusable="false" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>
+        <span>Settings</span>
+      </button>
+    </div>
+
+    <!-- Modal Body Content -->
+    <div class="drawer-body">
+
+      <div class="drawer-error-row hidden" id="drawerErrorRow"></div>
+
+      <!-- ── TAB PANE 1: OVERVIEW ───────────────────────── -->
+      <div class="modal-tab-pane" id="tabPaneOverview">
+        
+        <!-- Row 1: Key Metrics Grid -->
+        <div class="drawer-metrics-grid">
+          <div class="dm-card">
+            <span class="dm-label">Status</span>
+            <div style="display: flex; align-items: center; gap: 8px; margin-top: 4px;">
+              <span class="dm-value" id="drawerStatusText">—</span>
+            </div>
+            <span class="dm-meta">Last check: <span id="drawerLastCheck">—</span></span>
+          </div>
+
+          <div class="dm-card">
+            <span class="dm-label">Latency</span>
+            <div class="dm-value" id="drawerLatency" style="margin-top: 4px;">—</div>
+            <span class="dm-meta">Probe: <strong id="drawerHttpCode">—</strong></span>
+          </div>
+
+          <div class="dm-card">
+            <span class="dm-label">Probe State</span>
+            <div class="dm-value" id="drawerProbeState" style="margin-top: 4px;">—</div>
+            <span class="dm-meta" id="drawerProbeDetail">—</span>
+          </div>
+
+          <div class="dm-card">
+            <span class="dm-label" id="drawerUptimeLabel">Uptime (Realtime)</span>
+            <div class="dm-value" id="drawerUptimeVal" style="color: var(--success); margin-top: 4px;">—</div>
+            <span class="dm-meta" id="drawerUptimeSince">—</span>
+          </div>
+        </div>
+
+        <!-- Row 2: Charts Grid (Response Time Trend + Availability 24h) -->
+        <div class="drawer-charts-grid">
+          <!-- Response Time Trend -->
+          <div class="drawer-section-card">
+            <div class="drawer-section-title-wrap">
+              <div class="drawer-section-title" id="drawerSparklineTitle">RESPONSE TIME TREND <span id="drawerSparklineRange" class="modal-title-sub">(24h)</span></div>
+              <span class="sparkline-badge" id="drawerSparklineBadge" style="font-size: 11px; padding: 2px 8px; border-radius: 12px; background: rgba(34,197,94,0.15); color: #22C55E; font-weight: 600; display: none;">Normal</span>
+            </div>
+
+            <!-- Response Time Trend Toolbar (Range Selectors + Reset Zoom) -->
+            <div class="sp-toolbar">
+              <div class="sp-range-group" id="spRangeGroup">
+                <button class="sp-range-btn" data-range="5m" type="button">5m</button>
+                <button class="sp-range-btn" data-range="15m" type="button">15m</button>
+                <button class="sp-range-btn" data-range="1h" type="button">1h</button>
+                <button class="sp-range-btn" data-range="6h" type="button">6h</button>
+                <button class="sp-range-btn active" data-range="24h" type="button">24h</button>
+                <button class="sp-range-btn" data-range="7d" type="button">7d</button>
+              </div>
+              <button id="sparklineResetZoomBtn" class="sp-reset-zoom-btn" type="button" style="display: none;">
+                <svg aria-hidden="true" focusable="false" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
+                <span>Reset Zoom</span>
+              </button>
+            </div>
+
+            <!-- Summary Stats Header Bar -->
+            <div class="sparkline-stats-grid" id="drawerSparklineStatsBar">
+              <div class="sp-stat-card">
+                <div class="sp-stat-card-label">Current</div>
+                <div class="sp-stat-card-val" id="spStatNow">—</div>
+              </div>
+              <div class="sp-stat-card">
+                <div class="sp-stat-card-label">Avg</div>
+                <div class="sp-stat-card-val" id="spStatAvg">—</div>
+              </div>
+              <div class="sp-stat-card">
+                <div class="sp-stat-card-label">p95</div>
+                <div class="sp-stat-card-val" style="color: var(--accent);" id="spStatP95">—</div>
+              </div>
+              <div class="sp-stat-card">
+                <div class="sp-stat-card-label">Max</div>
+                <div class="sp-stat-card-val" style="color: var(--critical);" id="spStatMax">—</div>
+              </div>
+            </div>
+
+            <!-- Interactive Sparkline Container -->
+            <div class="sparkline-wrap" id="drawerSparkline">
+              <div class="de-empty">Loading response time trend data...</div>
+            </div>
+          </div>
+
+          <!-- Availability (Last 24 Hours) Bar Chart -->
+          <div class="drawer-section-card" style="justify-content: space-between;">
+            <div>
+              <div class="drawer-section-title">AVAILABILITY (LAST 24 HOURS)</div>
+              <div id="drawerAvailabilityBars" class="drawer-avail-bars-wrap">
+                <!-- Rendered via JS -->
+              </div>
+              <div id="drawerAvailabilityTimeLabels" class="drawer-avail-labels">
+                <span>-24h</span>
+                <span>-18h</span>
+                <span>-12h</span>
+                <span>-6h</span>
+                <span>Now</span>
+              </div>
+            </div>
+            <div class="drawer-avail-legend">
+              <span class="drawer-avail-legend-item"><span style="width: 8px; height: 8px; border-radius: 2px; background: var(--success);"></span> Up</span>
+              <span class="drawer-avail-legend-item"><span style="width: 8px; height: 8px; border-radius: 2px; background: var(--critical);"></span> Down</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Row 3: Details Bottom Grid (Target Info, Recent Events, Probe Summary) -->
+        <div class="drawer-details-grid">
+          
+          <!-- Target Info -->
+          <div class="drawer-section-card">
+            <div class="drawer-section-title">TARGET INFO</div>
+            <div class="drawer-info-list">
+              <div class="dil-row">
+                <span class="dil-label">IP Address</span>
+                <span class="dil-value" id="drawerInfoIp">—</span>
+              </div>
+              <div class="dil-row">
+                <span class="dil-label">Job</span>
+                <span class="dil-value" id="drawerInfoJob">—</span>
+              </div>
+              <div class="dil-row">
+                <span class="dil-label">Protocol</span>
+                <span class="dil-value" id="drawerInfoProtocol">—</span>
+              </div>
+              <div class="dil-row">
+                <span class="dil-label">Module</span>
+                <span class="dil-value" id="drawerInfoModule">—</span>
+              </div>
+              <div class="dil-row">
+                <span class="dil-label">Scrape URL</span>
+                <a id="drawerTargetUrlLink" href="#" target="_blank" rel="noopener" class="dil-link">—</a>
+              </div>
+              <div class="dil-row">
+                <span class="dil-label">Last Scrape</span>
+                <span class="dil-value" id="drawerLastScrape">—</span>
+              </div>
+              <div class="dil-row">
+                <span class="dil-label">Next Scrape</span>
+                <span class="dil-value" id="drawerNextScrape">—</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Recent Events -->
+          <div class="drawer-section-card" style="justify-content: space-between;">
+            <div>
+              <div class="drawer-section-title">RECENT EVENTS</div>
+              <div id="drawerRecentEventsList" style="display: flex; flex-direction: column; gap: 6px; margin-top: 4px;">
+                <div class="de-empty">Loading event logs...</div>
+              </div>
+            </div>
+            <button class="btn btn-sm btn-link" id="btnViewAllEvents" type="button" style="align-self: flex-start; margin-top: 10px; font-size: 11px; color: var(--accent); padding: 0; background: none; border: none; cursor: pointer;">
+              View all events &rarr;
+            </button>
+          </div>
+
+          <!-- Probe Summary -->
+          <div class="drawer-section-card">
+            <div class="drawer-section-title">PROBE SUMMARY <span id="spSummaryRangeLabel" style="font-weight: 400; color: var(--text-muted); text-transform: none;">(24h)</span></div>
+            <div class="dil-row" style="padding: 0 0 6px;">
+              <span class="dil-label">Historical SLA</span>
+              <span class="sla-badge" id="spSummarySlaBadge">—</span>
+            </div>
+            <div class="drawer-info-list">
+              <div class="dil-row">
+                <span class="dil-label">Observed Coverage</span>
+                <span class="dil-value" id="spSummaryTotalProbes" style="font-weight: 700;">—</span>
+              </div>
+              <div class="dil-row">
+                <span class="dil-label">Successful</span>
+                <span class="dil-value" id="spSummarySuccess" style="color: var(--success); font-weight: 700;">—</span>
+              </div>
+              <div class="dil-row">
+                <span class="dil-label">Failed</span>
+                <span class="dil-value" id="spSummaryFailed" style="color: var(--critical); font-weight: 700;">—</span>
+              </div>
+              <div class="dil-row">
+                <span class="dil-label">MTTR (24h)</span>
+                <span class="dil-value" id="spSummaryMttr">—</span>
+              </div>
+              <div class="dil-row">
+                <span class="dil-label">Longest Outage</span>
+                <span class="dil-value" id="spSummaryLongestOutage">—</span>
+              </div>
+              <div class="dil-row">
+                <span class="dil-label">Last Outage</span>
+                <span class="dil-value" id="spSummaryLastOutage">None</span>
+              </div>
+            </div>
+          </div>
+
+        </div>
+
+      </div>
+
+      <!-- ── TAB PANE 2: HISTORY ────────────────────────── -->
+      <div class="modal-tab-pane hidden" id="tabPaneHistory">
+        <div class="drawer-section-card">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+            <div>
+              <div class="drawer-section-title" style="margin: 0;">Target Response Time History & Performance</div>
+              <div style="font-size: 11px; color: var(--text-secondary); margin-top: 2px;">Latency and availability history datapoints for the active range.</div>
+            </div>
+            <div id="historyRangeTag" style="font-size: 11px; padding: 3px 10px; background: var(--accent-bg); color: var(--accent); border-radius: 12px; font-weight: 600; border: 1px solid rgba(56,189,248,0.2);">History (24h)</div>
+          </div>
+
+          <!-- History Interactive Full Chart Container -->
+          <div class="sparkline-wrap" id="drawerHistoryChart" style="margin-bottom: 14px;">
+            <div class="de-empty" style="padding: 25px; text-align: center;">Loading latency history chart...</div>
+          </div>
+
+          <!-- History Summary Grid -->
+          <div class="history-stats-grid">
+            <div class="history-stat-card">
+              <div class="history-stat-label">Minimum Latency</div>
+              <div class="history-stat-value" style="color: var(--success);" id="histMinVal">—</div>
+            </div>
+            <div class="history-stat-card">
+              <div class="history-stat-label">Average Latency</div>
+              <div class="history-stat-value" id="histAvgVal">—</div>
+            </div>
+            <div class="history-stat-card">
+              <div class="history-stat-label">95th Percentile</div>
+              <div class="history-stat-value" style="color: var(--accent);" id="histP95Val">—</div>
+            </div>
+            <div class="history-stat-card">
+              <div class="history-stat-label">Maximum Spike</div>
+              <div class="history-stat-value" style="color: var(--critical);" id="histMaxVal">—</div>
+            </div>
+          </div>
+
+          <!-- History Datapoints List -->
+          <div>
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+              <div style="font-size: 12px; font-weight: 700; color: var(--text-primary);">Detailed Datapoints Log</div>
+              <div id="histPointsCountBadge" style="font-size: 11px; color: var(--text-secondary); font-family: var(--font-mono);">—</div>
+            </div>
+            <div id="drawerHistoryDatapointsList" class="history-datapoints-list">
+              <div class="de-empty" style="padding: 10px; font-size: 12px;">Loading detailed datapoints...</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── TAB PANE 3: EVENTS ─────────────────────────── -->
+      <div class="modal-tab-pane hidden" id="tabPaneEvents">
+        <div class="drawer-section-card">
+          <div class="drawer-section-title" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+            <span>Uptime & Downtime Log</span>
+            <span id="eventsCountBadge" style="font-size: 11px; padding: 2px 8px; background: var(--surface-raised); border-radius: 10px; font-weight: 400; color: var(--text-secondary); border: 1px solid var(--border);">0 events</span>
+          </div>
+          <div class="drawer-events" id="drawerLogsList">
+            <div class="de-empty">Loading event history log...</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── TAB PANE 4: MAINTENANCE ────────────────────── -->
+      <div class="modal-tab-pane hidden" id="tabPaneMaintenance">
+        <div class="drawer-section-card" id="drawerMaintenanceSection">
+          <div class="drawer-section-title" style="margin-bottom: 8px;">Maintenance Mode</div>
+
+          <div id="drawerMaintenanceActive" class="hidden" style="display:flex; flex-direction:column; gap:8px; background: var(--surface-raised); border:1px solid var(--border-strong); border-radius: var(--r-md); padding: 12px 14px;">
+            <div style="display:flex; justify-content:space-between; align-items:center; gap:8px;">
+              <span style="font-size:12px; font-weight:600; color: var(--text-secondary);">Ends in <span id="drawerMaintCountdown" style="font-family: var(--font-mono); color: var(--text-primary);">—</span></span>
+              <button id="drawerMaintEndBtn" class="btn btn-sm btn-secondary" type="button">End Early</button>
+            </div>
+            <div id="drawerMaintReason" style="font-size:12px; color: var(--text-muted);"></div>
+          </div>
+
+          <form id="drawerMaintenanceForm" style="display:flex; flex-direction:column; gap:10px;">
+            <div class="form-group">
+              <label class="form-label" for="drawerMaintDuration">Duration</label>
+              <select id="drawerMaintDuration" class="form-select">
+                <option value="30">30 minutes</option>
+                <option value="60" selected>1 hour</option>
+                <option value="120">2 hours</option>
+                <option value="240">4 hours</option>
+                <option value="480">8 hours</option>
+                <option value="1440">24 hours</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label class="form-label" for="drawerMaintReasonInput">Reason (optional)</label>
+              <input type="text" id="drawerMaintReasonInput" class="form-input" placeholder="Scheduled reboot, firmware update, ...">
+            </div>
+            <button id="drawerMaintStartBtn" type="submit" class="btn btn-primary btn-sm btn-block">Start Maintenance</button>
+          </form>
+        </div>
+      </div>
+
+      <!-- ── TAB PANE 5: RAW METRICS ────────────────────── -->
+      <div class="modal-tab-pane hidden" id="tabPaneRaw">
+        <div class="drawer-section-card" id="drawerDependencySection">
+          <div class="drawer-section-title" style="margin-bottom: 8px;">Depends On <em style="font-weight:400; text-transform:none; letter-spacing:normal;">(alert correlation)</em></div>
+
+          <div id="drawerDependencyActive" class="hidden" style="display:flex; justify-content:space-between; align-items:center; gap:8px; background: var(--surface-raised); border:1px solid var(--border-strong); border-radius: var(--r-md); padding: 10px 14px; font-size:12px;">
+            <span>Depends on <strong id="drawerDependencyParent" style="font-family: var(--font-mono); color: var(--text-primary);">—</strong></span>
+            <button id="drawerDependencyRemoveBtn" class="btn btn-sm btn-secondary" type="button">Remove</button>
+          </div>
+
+          <form id="drawerDependencyForm" style="display:flex; gap:8px;">
+            <select id="drawerDependencyParentSelect" class="form-select" style="flex:1;">
+              <option value="">Select parent host…</option>
+            </select>
+            <button type="submit" class="btn btn-primary btn-sm">Link</button>
+          </form>
+          <span class="form-help" style="margin-top:6px; display:block;">When both this host and its parent are down, this host is de-emphasized instead of pulsing — its alert still fires and is logged normally.</span>
+        </div>
+
+        <div class="drawer-section-card drawer-danger-section">
+          <div class="drawer-section-title" style="color: var(--critical); margin-bottom: 8px;">Target Management</div>
+          <button id="drawerDeleteBtn" class="drawer-del-btn" style="width: 100%; justify-content: center; padding: 10px; background: var(--critical-bg); color: var(--critical); border: 1px solid var(--critical-border); border-radius: var(--r-sm); font-size: 13px; font-weight: 500; cursor: pointer; display: flex; align-items: center; gap: 6px;" title="Remove this target from monitoring">
+            <svg aria-hidden="true" focusable="false" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
+            <span>Remove Target from Monitoring</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Modal Bottom Center Close Button -->
+      <div class="modal-close-bottom-wrap">
+        <button id="modalCloseBottomBtn" type="button" class="modal-close-bottom-btn">
+          <svg aria-hidden="true" focusable="false" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+          <span>Close</span>
+        </button>
+      </div>
+
+    </div>
+  </aside>

@@ -1,0 +1,224 @@
+  <!-- ── Main Wrapper ───────────────────────────────────── -->
+  <main class="main-wrap" id="dashboard">
+    <h1 class="sr-only">InfraWatch NOC Dashboard</h1>
+
+    <!-- ── Summary Cards ────────────────────────────────── -->
+    <section class="summary-row" aria-label="Summary metrics">
+      <div class="summary-card">
+        <div class="sc-icon-box">
+          <svg aria-hidden="true" focusable="false" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="2" y="2" width="20" height="8" rx="2" ry="2"/>
+            <rect x="2" y="14" width="20" height="8" rx="2" ry="2"/>
+            <line x1="6" y1="6" x2="6.01" y2="6"/>
+            <line x1="6" y1="18" x2="6.01" y2="18"/>
+          </svg>
+        </div>
+        <div class="sc-content">
+          <span class="sc-value" id="instTotal">—</span>
+          <span class="sc-label">Total Hosts</span>
+        </div>
+      </div>
+      <div class="summary-card">
+        <div class="sc-icon-box">
+          <svg aria-hidden="true" focusable="false" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M5 12.55a11 11 0 0 1 14.08 0"/>
+            <path d="M1.42 9a16 16 0 0 1 21.16 0"/>
+            <path d="M8.53 16.11a6 6 0 0 1 6.95 0"/>
+            <line x1="12" y1="20" x2="12.01" y2="20"/>
+          </svg>
+        </div>
+        <div class="sc-content">
+          <span class="sc-value color-success" id="instUp">—</span>
+          <span class="sc-label">Online</span>
+        </div>
+      </div>
+      <div class="summary-card">
+        <div class="sc-icon-box">
+          <svg aria-hidden="true" focusable="false" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+            <line x1="12" y1="9" x2="12" y2="13"/>
+            <line x1="12" y1="17" x2="12.01" y2="17"/>
+          </svg>
+        </div>
+        <div class="sc-content">
+          <span class="sc-value color-warning" id="instSlow">—</span>
+          <span class="sc-label">Warning</span>
+        </div>
+      </div>
+      <div class="summary-card">
+        <div class="sc-icon-box">
+          <svg aria-hidden="true" focusable="false" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="10"/>
+            <line x1="8" y1="12" x2="16" y2="12"/>
+          </svg>
+        </div>
+        <div class="sc-content">
+          <span class="sc-value color-critical" id="instDown">—</span>
+          <span class="sc-label">Offline</span>
+        </div>
+      </div>
+      <div class="summary-card sc-availability">
+        <button id="availabilityDetailBtn" class="sc-detail-btn" type="button" title="View availability metrics breakdown" aria-haspopup="dialog" aria-controls="availabilityBreakdownModal">
+          <svg aria-hidden="true" focusable="false" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+          <span>Detail</span>
+        </button>
+        <div class="sc-icon-box">
+          <svg aria-hidden="true" focusable="false" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
+          </svg>
+        </div>
+        <div class="sc-content">
+          <span class="sc-value color-accent" id="instOverallUptime">—</span>
+          <span class="sc-label" id="availabilityLabel">Availability (24h)</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── Host Grid Section ─────────────────────────────── -->
+    <section class="hosts-section">
+
+      <!-- Toolbar -->
+      <div class="hosts-toolbar">
+        <h2 class="section-title">Internal Hosts</h2>
+        <div class="toolbar-right">
+          <!-- Period / range selector (drives summary card metrics) -->
+          <div class="range-select-wrap">
+            <div class="filter-chips range-chips" id="rangeFilterChips" role="group" aria-label="Filter by time range">
+              <button class="chip" data-range="realtime" id="rangePresetRealtime">Realtime</button>
+              <button class="chip chip-active" data-range="24h" id="rangePreset24h">24h</button>
+              <button class="chip" data-range="7d" id="rangePreset7d">7d</button>
+              <button class="chip" data-range="30d" id="rangePreset30d">30d</button>
+              <button class="chip" data-range="mtd" id="rangePresetMtd" title="From 00:00 UTC on the 1st of this month → now (calendar SLA period)">Month to date</button>
+              <button class="chip" data-range="custom" id="rangePresetCustom">Custom Range</button>
+            </div>
+
+            <!-- Custom range popover -->
+            <div class="custom-range-popover hidden" id="customRangePopover" role="dialog" aria-label="Custom time range">
+              <div class="crp-row">
+                <label class="crp-label" for="customRangeFrom">From</label>
+                <input type="datetime-local" id="customRangeFrom" class="crp-input">
+              </div>
+              <div class="crp-row">
+                <label class="crp-label" for="customRangeTo">To</label>
+                <input type="datetime-local" id="customRangeTo" class="crp-input">
+              </div>
+              <div id="customRangeError" class="crp-error hidden"></div>
+              <div class="crp-actions">
+                <button type="button" class="btn btn-secondary btn-sm" id="customRangeCancelBtn">Cancel</button>
+                <button type="button" class="btn btn-primary btn-sm" id="customRangeApplyBtn">Apply</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Sort Filter — skinned into a custom dropdown at runtime by
+               _enhanceSelect() (same .job-dd-* look as the Job filter). -->
+          <div class="filter-select-wrap">
+            <select id="sortSelect" class="filter-select filter-select--toolbar" aria-label="Sort targets">
+              <option value="default">Sort: Priority (Down First)</option>
+              <option value="name_asc">Sort: Host Name (A-Z)</option>
+              <option value="name_desc">Sort: Host Name (Z-A)</option>
+              <option value="job_asc">Sort: Job (A-Z)</option>
+              <option value="job_desc">Sort: Job (Z-A)</option>
+              <option value="latency_desc">Sort: Latency (High to Low)</option>
+              <option value="latency_asc">Sort: Latency (Low to High)</option>
+            </select>
+          </div>
+
+          <!-- Job Filter — custom dropdown. #jobSelect stays in the DOM as the
+               hidden state holder so every existing load()/loadAvailability()/
+               localStorage code path (which reads jobSelect.value/.options and
+               dispatches 'change' on it) keeps working unmodified. -->
+          <div class="filter-select-wrap job-select-wrap" id="jobSelectWrap">
+            <select id="jobSelect" class="job-select-native" aria-hidden="true" tabindex="-1">
+              <option value="all">All Jobs</option>
+            </select>
+
+            <div class="job-dd" id="jobDd">
+              <button type="button" class="job-dd-trigger" id="jobDdTrigger" aria-haspopup="listbox" aria-expanded="false" aria-controls="jobDdMenu" aria-label="Filter by Job">
+                <span class="job-dd-label" id="jobDdLabel">All Jobs</span>
+                <span class="job-default-badge hidden" id="jobDefaultBadge" title="This is your default Job">Default</span>
+                <svg aria-hidden="true" focusable="false" class="job-dd-caret" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+              </button>
+
+              <button class="icon-action job-settings-btn" id="jobDefaultSettingsBtn" type="button" title="Default Job settings" aria-label="Default Job settings" aria-haspopup="dialog" aria-controls="jobDefaultPopover" aria-expanded="false">
+                <svg aria-hidden="true" focusable="false" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="12" cy="12" r="3"/>
+                  <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+                </svg>
+              </button>
+
+              <ul class="job-dd-menu hidden" id="jobDdMenu" role="listbox" tabindex="-1" aria-label="Filter by Job">
+                <li role="option" data-value="all" class="job-dd-option" aria-selected="true">All Jobs</li>
+              </ul>
+
+              <div class="job-default-popover hidden" id="jobDefaultPopover" role="dialog" aria-label="Default Job settings">
+                <div class="jdp-title">Default Job</div>
+                <label class="crp-row crp-row-checkbox" id="jdpSetRow">
+                  <input type="checkbox" id="jdpSetCheckbox">
+                  <span>Set current Job as Default</span>
+                </label>
+                <button type="button" class="jdp-reset-btn" id="jdpResetBtn">
+                  <svg aria-hidden="true" focusable="false" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 11-6.219-8.56"/></svg>
+                  <span>Reset to "All Jobs"</span>
+                </button>
+                <div class="jdp-help">This preference is stored only in this browser.</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Search -->
+          <div class="search-wrap">
+            <svg aria-hidden="true" focusable="false" class="search-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
+            <input type="text" id="instanceSearch" class="search-input" placeholder="Search IP / Host / Job…" autocomplete="off" aria-label="Search hosts">
+            <button id="clearSearchBtn" class="search-clear-btn hidden" type="button" aria-label="Clear search">&times;</button>
+          </div>
+
+          <!-- Filter chips -->
+          <div class="filter-chips" id="statusFilterChips" role="group" aria-label="Filter by status">
+            <button class="chip chip-active" data-status="all" id="filterAll">All</button>
+            <button class="chip" data-status="up" id="filterOnline">Online</button>
+            <button class="chip" data-status="down" id="filterOffline">Offline</button>
+            <button class="chip" data-status="slow" id="filterSlow">Slow (>500ms)</button>
+          </div>
+
+          <button id="openAddTargetModalBtn" class="add-target-btn" type="button">
+            <svg aria-hidden="true" focusable="false" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+            <span>Add Target</span>
+          </button>
+
+          <span class="host-count-badge" id="instanceCount">—</span>
+        </div>
+      </div>
+
+      <!-- Grid -->
+      <div class="host-grid" id="instancesBody" role="list" aria-label="Host list">
+        <!-- Skeleton -->
+        <div class="host-skeleton" aria-hidden="true"></div>
+        <div class="host-skeleton" aria-hidden="true"></div>
+        <div class="host-skeleton" aria-hidden="true"></div>
+        <div class="host-skeleton" aria-hidden="true"></div>
+        <div class="host-skeleton" aria-hidden="true"></div>
+        <div class="host-skeleton" aria-hidden="true"></div>
+        <div class="host-skeleton" aria-hidden="true"></div>
+        <div class="host-skeleton" aria-hidden="true"></div>
+      </div>
+
+      <!-- Pagination (TV wallboard — adaptive cards/page, see calculateGridCapacity in alarm.js) -->
+      <div class="host-pagination hidden" id="hostPagination">
+        <span class="hp-info" id="hpInfo">Showing 0 of 0 hosts</span>
+        <div class="hp-controls">
+          <button class="hp-autorotate" id="hpAutoRotateBtn" type="button" aria-pressed="false">Auto Rotate: OFF</button>
+          <button class="hp-nav" id="hpPrevBtn" type="button" aria-label="Previous page">◀ Prev</button>
+          <div class="hp-pages" id="hpPages"></div>
+          <button class="hp-nav" id="hpNextBtn" type="button" aria-label="Next page">Next ▶</button>
+        </div>
+      </div>
+
+      <!-- Error state -->
+      <div class="error-state hidden" id="instancesError" role="alert">
+        <svg aria-hidden="true" focusable="false" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+        <span id="instancesErrorMsg">Cannot reach Prometheus scrape engine</span>
+      </div>
+
+    </section>
+  </main>
