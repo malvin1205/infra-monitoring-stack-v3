@@ -944,6 +944,31 @@ class AvailabilityEngine:
             "source": "nodata",
         }
 
+    @staticmethod
+    def _is_under_materialized(
+        span: Optional[Tuple[float, int]], hour_end: float, floor_start: float
+    ) -> bool:
+        """Does this instance's bucket history still need backfilling?
+
+        Two ways it can: the history doesn't reach the retention floor, or it
+        has holes inside the span it does cover. The hole test is what catches
+        an aggregator outage — the forward pass only ever repairs the trailing
+        hours, so a gap in the middle is otherwise invisible and permanent.
+        """
+        if not span:
+            return True
+        min_start, hours = span
+        # The walk stops once the cursor crosses the floor, so the earliest
+        # bucket legitimately sits up to one chunk above it — and retention
+        # pruning keeps nudging it further as time passes. Anything inside that
+        # margin is "as deep as it gets", not shallow.
+        if min_start > floor_start + AVAIL_BACKFILL_CHUNK_SECONDS + 3600.0:
+            return True
+        expected_hours = max(1.0, (hour_end - min_start) / 3600.0)
+        # 5% slack: the newest hour is still filling, and a target legitimately
+        # absent from Prometheus for a scrape or two shouldn't read as a hole.
+        return hours < expected_hours * 0.95
+
     def _next_depth_backfill_window(
         self, monitored: List[str], now: float
     ) -> Optional[Tuple[float, float]]:
@@ -952,8 +977,9 @@ class AvailabilityEngine:
         The incremental path only ever aggregates the trailing hour, so history
         older than the aggregator's first run is never materialized — which is
         why a fleet that Prometheus holds 30d of telemetry for rendered as "only
-        1.7% of this window observed". This walks backwards from the shallowest
-        monitored instance to the retention floor, one chunk per cycle.
+        1.7% of this window observed". This sweeps backwards to the retention
+        floor, one chunk per cycle, whenever any monitored instance is missing
+        depth or has a hole.
 
         Idempotent by construction (bucket writes are upserts), so re-walking a
         span that is already materialized is wasted work but never wrong.
@@ -962,25 +988,25 @@ class AvailabilityEngine:
         floor_start = hour_end - AVAIL_BACKFILL_SECONDS
 
         try:
-            starts = self.bucket_repo.get_instance_bucket_starts(monitored)
+            coverage = self.bucket_repo.get_instance_bucket_coverage(monitored)
         except Exception:
-            logger.exception("Availability depth backfill: bucket start lookup failed")
+            logger.exception("Availability depth backfill: bucket coverage lookup failed")
             return None
 
-        # Restart the walk whenever the monitored set changes — a target added
-        # after the first pass has no old buckets even though the fleet does.
-        key = (len(monitored), len(starts))
-        if key != self._deep_cursor_key:
-            self._deep_cursor_key = key
-            # Shallowest = the *latest* earliest-bucket, i.e. the instance whose
-            # history is thinnest; an instance with no buckets at all is
-            # thinnest of all. Starting from the deepest instance instead would
-            # skip straight past the span the thin ones are actually missing.
-            if not starts or len(starts) < len(monitored):
-                shallowest = hour_end
-            else:
-                shallowest = max(starts.values())
-            self._deep_cursor = min(hour_end, shallowest)
+        # Restart the walk whenever the set of under-materialized instances
+        # changes. Keyed on identity, not on counts: a same-size swap (one
+        # target removed, another added) leaves every count unchanged, and
+        # keying on lengths let the incoming target's history go unfilled.
+        stale = frozenset(
+            i for i in monitored
+            if self._is_under_materialized(coverage.get(i), hour_end, floor_start)
+        )
+        if stale != self._deep_cursor_key:
+            self._deep_cursor_key = stale
+            # Sweep from the top of the window, not from the thinnest instance's
+            # earliest bucket: a *hole* (aggregator down for a stretch) sits
+            # above that point, so starting there would walk straight past it.
+            self._deep_cursor = hour_end if stale else None
 
         cursor = self._deep_cursor
         if cursor is None or cursor <= floor_start:

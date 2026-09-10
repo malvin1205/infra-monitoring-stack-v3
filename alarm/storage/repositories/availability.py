@@ -3,7 +3,7 @@
 import time
 import json
 import sqlite3
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 try:
     from ..connection import db_read, db_transaction
@@ -221,22 +221,29 @@ class AvailabilityBucketRepository:
             return float(row["max_end"]) if row and row["max_end"] is not None else None
 
     @staticmethod
-    def get_instance_bucket_starts(
+    def get_instance_bucket_coverage(
         instances: Optional[List[str]] = None, db_path: Optional[str] = None
-    ) -> Dict[str, float]:
-        """Earliest bucket_start per instance — how deep that instance's
-        materialized history actually goes.
+    ) -> Dict[str, Tuple[float, int]]:
+        """`{instance: (earliest_bucket_start, distinct_hours_materialized)}`.
 
-        An instance absent from the returned map has no buckets at all. The
-        depth backfill walks back from the shallowest entry; a fleet-wide MIN
-        would let one long-lived target hide every newer target's missing
-        history.
+        The pair is what the depth backfill needs to spot both ways history can
+        be incomplete: a start that doesn't reach the retention floor (shallow),
+        and an hour count short of the span it claims to cover (holes, e.g. the
+        aggregator was down for a stretch).
+
+        Hours are counted DISTINCT so an instance scraped by two jobs isn't
+        credited twice. An instance absent from the map has no buckets at all.
+        A fleet-wide aggregate would let one long-lived target hide every newer
+        target's missing history, so this is deliberately per-instance.
         """
         # Past ~900 placeholders SQLite starts refusing the IN list, so filter
         # in Python instead of binding one parameter per instance.
         inline = bool(instances) and len(instances) <= 900
         with db_read(db_path) as conn:
-            query = "SELECT instance, MIN(bucket_start) AS min_start FROM availability_buckets"
+            query = (
+                "SELECT instance, MIN(bucket_start) AS min_start, "
+                "COUNT(DISTINCT bucket_start) AS hours FROM availability_buckets"
+            )
             params: List[Any] = []
             if inline:
                 query += " WHERE instance IN (%s)" % ",".join("?" for _ in instances)
@@ -246,7 +253,7 @@ class AvailabilityBucketRepository:
 
         wanted = None if inline or not instances else set(instances)
         return {
-            r["instance"]: float(r["min_start"])
+            r["instance"]: (float(r["min_start"]), int(r["hours"]))
             for r in rows
             if r["min_start"] is not None and (wanted is None or r["instance"] in wanted)
         }

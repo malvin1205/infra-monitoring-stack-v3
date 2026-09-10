@@ -21,20 +21,27 @@ DEPTH = 35 * DAY
 
 
 class FakeRepo:
-    def __init__(self, starts):
-        self.starts = dict(starts)
+    def __init__(self, coverage):
+        self.coverage = dict(coverage)
 
-    def get_instance_bucket_starts(self, instances=None):
+    def get_instance_bucket_coverage(self, instances=None):
         if not instances:
-            return dict(self.starts)
-        return {k: v for k, v in self.starts.items() if k in set(instances)}
+            return dict(self.coverage)
+        return {k: v for k, v in self.coverage.items() if k in set(instances)}
 
     def get_latest_bucket_end(self, job="all"):
         return None
 
 
-def _engine(starts):
-    return AvailabilityEngine(bucket_repo=FakeRepo(starts))
+def _full(min_start, now=None):
+    """A (min_start, hours) span with no holes between min_start and now."""
+    now = now or time.time()
+    hour_end = math.floor(now / HOUR) * HOUR
+    return (min_start, int(round((hour_end - min_start) / HOUR)))
+
+
+def _engine(coverage):
+    return AvailabilityEngine(bucket_repo=FakeRepo(coverage))
 
 
 def _walk(eng, insts, now, limit=500):
@@ -53,38 +60,73 @@ def test_depth_walk_reaches_retention_floor():
     now = time.time()
     hour_end = math.floor(now / HOUR) * HOUR
     insts = ["host-a", "host-b"]
-    eng = _engine({i: hour_end - 3 * HOUR for i in insts})
+    eng = _engine({i: _full(hour_end - 3 * HOUR, now) for i in insts})
 
     wins = _walk(eng, insts, now)
     assert wins, "shallow history must trigger a depth walk"
-    assert wins[0][1] == hour_end - 3 * HOUR, "walk starts at the shallowest instance"
+    assert wins[0][1] == hour_end, "sweep starts at the top of the window"
     assert wins[-1][0] <= hour_end - DEPTH + 1.0, "walk must reach the retention floor"
     # Each chunk ends exactly where the previous one started: backwards, no gaps.
     for (start, _), (_, next_end) in zip(wins, wins[1:]):
         assert next_end == start, "chunks must tile backwards without gaps"
 
 
-def test_depth_walk_starts_at_the_thinnest_instance():
-    """Mixed depths: 13 hosts have 7d, the rest have 3h. Starting from the deep
-    ones would skip the 3h..7d span the thin ones are missing."""
+def test_depth_walk_covers_the_thinnest_instance():
+    """Mixed depths: one host has 7d, another 3h. The sweep must cover the
+    3h..7d span the thin one is missing, not just the deep one's floor."""
     now = time.time()
     hour_end = math.floor(now / HOUR) * HOUR
     insts = ["deep", "thin"]
-    eng = _engine({"deep": hour_end - 7 * DAY, "thin": hour_end - 3 * HOUR})
+    eng = _engine({
+        "deep": _full(hour_end - 7 * DAY, now),
+        "thin": _full(hour_end - 3 * HOUR, now),
+    })
 
     wins = _walk(eng, insts, now)
-    assert wins[0][1] == hour_end - 3 * HOUR, "walk must start at the thinnest history"
     covered_from = min(s for s, _ in wins)
     covered_to = max(e for _, e in wins)
     assert covered_to >= hour_end - 3 * HOUR
     assert covered_from <= hour_end - DEPTH + 1.0
 
 
+def test_hole_in_the_middle_is_swept():
+    """An aggregator outage leaves a gap the forward pass never revisits: the
+    instance's history still reaches the floor, but it is missing hours. The
+    sweep must start above the hole, not at the (already deep) earliest bucket."""
+    now = time.time()
+    hour_end = math.floor(now / HOUR) * HOUR
+    deep_start = hour_end - DEPTH - DAY
+    complete = _full(deep_start, now)
+    holed = (deep_start, complete[1] - 48)  # 48 hours missing somewhere inside
+
+    eng = _engine({"host-a": complete, "host-b": holed})
+    wins = _walk(eng, ["host-a", "host-b"], now)
+    assert wins, "a hole must trigger a sweep even when depth reaches the floor"
+    assert wins[0][1] == hour_end, "sweep must start above the hole"
+
+    # The same fleet with no hole does nothing at all.
+    quiet = _engine({"host-a": complete, "host-b": complete})
+    assert quiet._next_depth_backfill_window(["host-a", "host-b"], now) is None
+
+
+def test_same_size_target_swap_restarts_the_walk():
+    """One target removed, another added: every count is unchanged, so keying
+    the restart on lengths left the incoming target's history unfilled."""
+    now = time.time()
+    hour_end = math.floor(now / HOUR) * HOUR
+    deep = _full(hour_end - DEPTH - DAY, now)
+    eng = _engine({"host-a": deep, "host-b": deep, "host-new": _full(hour_end - HOUR, now)})
+
+    assert eng._next_depth_backfill_window(["host-a", "host-b"], now) is None
+    swapped = eng._next_depth_backfill_window(["host-a", "host-new"], now)
+    assert swapped is not None, "a same-size swap must restart the walk"
+
+
 def test_depth_walk_is_one_chunk_per_cycle():
     now = time.time()
     hour_end = math.floor(now / HOUR) * HOUR
     insts = ["host-a"]
-    eng = _engine({"host-a": hour_end - 3 * HOUR})
+    eng = _engine({"host-a": _full(hour_end - 3 * HOUR, now)})
 
     first = eng._next_depth_backfill_window(insts, now)
     assert first is not None
@@ -96,7 +138,7 @@ def test_depth_walk_terminates_and_stays_quiet():
     now = time.time()
     hour_end = math.floor(now / HOUR) * HOUR
     insts = ["host-a"]
-    eng = _engine({"host-a": hour_end - 3 * HOUR})
+    eng = _engine({"host-a": _full(hour_end - 3 * HOUR, now)})
 
     _walk(eng, insts, now)
     assert eng._next_depth_backfill_window(insts, now) is None
@@ -107,7 +149,7 @@ def test_already_deep_fleet_does_no_work():
     now = time.time()
     hour_end = math.floor(now / HOUR) * HOUR
     insts = ["host-a", "host-b"]
-    eng = _engine({i: hour_end - DEPTH - DAY for i in insts})
+    eng = _engine({i: _full(hour_end - DEPTH - DAY, now) for i in insts})
     assert eng._next_depth_backfill_window(insts, now) is None
 
 
@@ -115,7 +157,7 @@ def test_new_target_restarts_the_walk():
     """A host added after the fleet was already deep still needs its history."""
     now = time.time()
     hour_end = math.floor(now / HOUR) * HOUR
-    eng = _engine({"host-a": hour_end - DEPTH - DAY})
+    eng = _engine({"host-a": _full(hour_end - DEPTH - DAY, now)})
 
     assert eng._next_depth_backfill_window(["host-a"], now) is None
     # host-new is monitored but has no buckets yet.
