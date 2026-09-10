@@ -41,7 +41,16 @@ Dashboard monitoring ketersediaan server, website, dan jaringan secara real-time
 
 ## Prasyarat
 
-1. **Docker & Docker Compose** (v2).
+1. **Docker Engine + Compose plugin v2**. Di Ubuntu Server 24.04 yang masih polos:
+
+   ```bash
+   sudo apt update
+   sudo apt install -y docker.io docker-compose-v2
+   sudo usermod -aG docker "$USER"   # logout/login (atau: newgrp docker) agar aktif
+   ```
+
+   Verifikasi: `docker compose version` harus mencetak v2.x. (Untuk engine yang
+   lebih baru, pasang dari repo APT resmi Docker.)
 2. **Prometheus & Blackbox Exporter** yang sudah aktif menjalankan probe target (`probe_success`, `probe_duration_seconds`, `probe_http_status_code`).
 
 ---
@@ -92,8 +101,8 @@ docker compose ps
 - **Role Administrator**: Memiliki hak penuh untuk konfigurasi operasional: menambah/menghapus target, membuat jadwal maintenance, mengubah endpoint Prometheus, mengatur bot Telegram, dan mengelola akun operator lain (`/api/auth/users`). Admin tidak dapat membuat atau memodifikasi akun Owner, serta dilindungi aturan anti-lockout (admin aktif terakhir tidak dapat dinonaktifkan).
 - **Role Viewer (Read-only)**: Hanya dapat melihat dashboard monitoring tanpa akses mengubah konfigurasi. Sangat cocok untuk browser yang dipasang di layar TV NOC wallboard.
 - **Machine API Key**: Digunakan untuk automasi skrip atau CI/CD.
-  - Key otomatis dibuat di `alarm/data/.api_key` dan `alarm/data/.webhook_secret`.
-  - Lihat key: `cat alarm/data/.api_key`
+  - Key otomatis dibuat di `/app/data/.api_key` dan `/app/data/.webhook_secret` (di dalam named volume `infrawatch-data`).
+  - Lihat key: `docker compose exec alarm cat /app/data/.api_key`
   - Atau tentukan key manual melalui variabel `INFRAWATCH_API_KEY` di file `.env`.
   - Gunakan header `X-API-Key: <key>` atau `Authorization: Bearer <key>` saat memanggil REST API.
 

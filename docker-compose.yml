@@ -24,7 +24,13 @@ services:
       # to 1 only when InfraWatch sits behind an HTTPS reverse proxy.
       - SESSION_COOKIE_SECURE=${SESSION_COOKIE_SECURE:-0}
     volumes:
-      - ./alarm/data:/app/data
+      # Named volume, not a host bind mount: Docker seeds an empty named volume
+      # from the image path, preserving its appuser:appgroup (uid/gid 10001)
+      # ownership. A bind mount of ./alarm/data would be owned by the host user
+      # who cloned the repo, and the container (USER appuser, non-root) cannot
+      # chown it — SQLite would fail with "unable to open database file" on boot.
+      # Inspect/back up the data at /var/lib/docker/volumes/*_infrawatch-data/.
+      - infrawatch-data:/app/data
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
       interval: 10s
@@ -50,6 +56,9 @@ services:
     read_only: true
     tmpfs:
       - /tmp
+
+volumes:
+  infrawatch-data:
 
 
 

@@ -1808,6 +1808,22 @@ def target_history_api():
 
 
 
+def _storage_writable():
+    """True if the runtime data dir and any existing state files are writable.
+
+    Checks DATA_DIR itself, not just the JSON files: on a fresh deploy those
+    files do not exist yet, so an `all(... if os.path.exists(p))` over them
+    alone is vacuously True and would report "ready" even when /app/data is
+    unwritable (wrong bind-mount ownership) and the app is actually crash-looping
+    on SQLite open.
+    """
+    if not os.access(DATA_DIR, os.W_OK):
+        return False
+    return all(
+        os.access(p, os.W_OK) for p in (json_store.STATUS_FILE, json_store.LOGS_FILE, json_store.HISTORY_FILE)
+        if os.path.exists(p)
+    )
+
 @app.route('/health/live')
 def health_live():
     """Liveness probe: returns 200 if the Flask process is running and able to handle HTTP requests."""
@@ -1816,10 +1832,7 @@ def health_live():
 @app.route('/health/ready')
 def health_ready():
     """Readiness probe: returns 200 if storage files are writable and application is ready."""
-    storage_ok = all(
-        os.access(p, os.W_OK) for p in (json_store.STATUS_FILE, json_store.LOGS_FILE, json_store.HISTORY_FILE)
-        if os.path.exists(p)
-    )
+    storage_ok = _storage_writable()
     if not storage_ok:
         return jsonify({"ok": False, "status": "storage_unwritable"}), 503
     return jsonify({"ok": True, "status": "ready"}), 200
@@ -1835,10 +1848,7 @@ def health():
     raw, prom_base = promclient.fetch_prometheus_json('/api/v1/targets', use_cache=True)
     prometheus_ok = raw is not None and raw.get('status') == 'success'
 
-    storage_ok = all(
-        os.access(p, os.W_OK) for p in (json_store.STATUS_FILE, json_store.LOGS_FILE, json_store.HISTORY_FILE)
-        if os.path.exists(p)
-    )
+    storage_ok = _storage_writable()
 
     components = {
         "prometheus":     {"ok": prometheus_ok, "url": prom_base},
