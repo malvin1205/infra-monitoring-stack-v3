@@ -6,17 +6,21 @@ Dashboard monitoring ketersediaan server, website, dan jaringan secara real-time
 
 ---
 
-<img width="1920" height="1080" alt="Dashboard Wallboard" src="https://github.com/user-attachments/assets/a79a7f51-4dbe-4b02-b68e-5b2a04212d24" />
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/e6e97e26-b230-41c5-ad9d-0c90aee830e7" />
 
-<img width="1920" height="1080" alt="Availability Metrics" src="https://github.com/user-attachments/assets/0ce42ca3-36e2-4d00-b3fe-3a9d8e3da3e8" />
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/36739564-8b7d-48ba-820a-14feb0683b28" />
 
-<img width="1920" height="1080" alt="Maintenance Window" src="https://github.com/user-attachments/assets/df0d3c5d-85a5-4493-b610-9a209139bf99" />
+<img width="1917" height="1078" alt="image" src="https://github.com/user-attachments/assets/eaf7a1e3-79f1-4e79-9057-b9047cc4c66a" />
 
-<img width="1920" height="1080" alt="Dependency Correlation" src="https://github.com/user-attachments/assets/4865a4ab-f06b-4b3d-9272-ab53a354bcf5" />
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/237ac261-f64c-4f8d-a1a5-d13366dc19a0" />
 
-<img width="1920" height="1080" alt="Telegram Notification Config" src="https://github.com/user-attachments/assets/ba7866d4-998c-4dc7-a69c-0d3cd6104ff3" />
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/883ae422-72b8-4c10-a5c7-c3459c569799" />
 
-<img width="1919" height="1079" alt="Target Management" src="https://github.com/user-attachments/assets/02c94b1e-5232-4cd1-9aa1-46294870a28d" />
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/a8026a37-1706-4c17-bc43-f04d9cb5c4ad" />
+
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/c972effa-d8d2-4f70-b8fb-c8d9b2cf74cc" />
+
+
 
 ---
 
