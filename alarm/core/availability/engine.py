@@ -3,6 +3,7 @@ hybrid TSDB/SQLite reconciliation, SLA error budgets, and bucket aggregation.
 """
 import logging
 import math
+import os
 import time
 from typing import Optional, Dict, Any, List, Tuple
 
@@ -77,6 +78,22 @@ except (ImportError, ValueError):
 
 logger = logging.getLogger("infrawatch.availability")
 
+# How deep materialized history should reach. Must track bucket retention: a
+# 30d dashboard window can only be served from buckets if the backfill actually
+# goes that far back, and the old hardcoded 7d meant 30d never could be.
+AVAIL_BACKFILL_SECONDS = float(
+    os.environ.get("AVAIL_BACKFILL_SECONDS", os.environ.get("AVAIL_BUCKET_RETENTION_SECONDS", str(35 * 86400)))
+)
+# Depth is filled by walking backwards one chunk per aggregation cycle rather
+# than in a single pass. A fleet-wide 30d Prometheus query has been measured at
+# ~50s here, so the whole span at once would stall the aggregator and hammer
+# Prometheus; one 6h chunk per 60s tick reaches 35d in a couple of hours.
+AVAIL_BACKFILL_CHUNK_SECONDS = float(os.environ.get("AVAIL_BACKFILL_CHUNK", str(6 * 3600)))
+# Forward repair (aggregator was down, process restarted) is capped so a long
+# outage can't emit hundreds of windows in one cycle — the backward walk above
+# picks up anything older.
+AVAIL_HEAD_REPAIR_SECONDS = float(os.environ.get("AVAIL_HEAD_REPAIR", str(6 * 3600)))
+
 
 class AvailabilityEngine:
     """Deep module consolidating availability calculation, in-flight caching,
@@ -96,6 +113,10 @@ class AvailabilityEngine:
         self.bucket_repo = bucket_repo or AvailabilityBucketRepository
         self.sla_repo = sla_repo or SlaTargetRepository
         self.cache = cache or AvailabilityCache()
+        # Backward-walk cursor for depth backfill: next chunk end to materialize,
+        # and the monitored-set signature it was planned for.
+        self._deep_cursor: Optional[float] = None
+        self._deep_cursor_key: Optional[Tuple[int, int]] = None
 
     def invalidate_cache(self, job: Optional[str] = None, instance: Optional[str] = None) -> int:
         """Evict matching cached availability queries."""
@@ -244,6 +265,9 @@ class AvailabilityEngine:
 
         latest_end = self.bucket_repo.get_latest_bucket_end("all")
         windows_to_aggregate = self._availability_aggregation_windows(curr_time, latest_end)
+        depth_window = self._next_depth_backfill_window(monitored, curr_time)
+        if depth_window is not None:
+            windows_to_aggregate = [depth_window] + windows_to_aggregate
         total_written = 0
 
         executor = getattr(self.prom_client, "_SHARED_EXECUTOR", None)
@@ -657,7 +681,12 @@ class AvailabilityEngine:
         t_req_start: float,
     ) -> Dict[str, Any]:
         at_suffix = f" @ {query.end_ts}" if query.end_ts is not None else ""
-        req_timeout = max(4.0, min(15.0, query.minutes / 1500.0))
+        # Measured fleet-wide against a real Prometheus: avg_over_time takes
+        # ~3s at 24h, ~21s at 7d, ~50s at 30d. The old max(4, min(15, m/1500))
+        # capped 7d at 6.7s and 30d at 15s, so every long-window query timed
+        # out, has_prom went False, and the merge silently fell back to
+        # whatever thin slice of SQLite existed.
+        req_timeout = max(5.0, min(30.0, query.minutes / 300.0))
         avail_cache_ttl = 15.0 if query.minutes_int >= 1440 else 5.0
 
         queries = {
@@ -915,20 +944,85 @@ class AvailabilityEngine:
             "source": "nodata",
         }
 
+    def _next_depth_backfill_window(
+        self, monitored: List[str], now: float
+    ) -> Optional[Tuple[float, float]]:
+        """One chunk of *backward* backfill, or None when depth is satisfied.
+
+        The incremental path only ever aggregates the trailing hour, so history
+        older than the aggregator's first run is never materialized — which is
+        why a fleet that Prometheus holds 30d of telemetry for rendered as "only
+        1.7% of this window observed". This walks backwards from the shallowest
+        monitored instance to the retention floor, one chunk per cycle.
+
+        Idempotent by construction (bucket writes are upserts), so re-walking a
+        span that is already materialized is wasted work but never wrong.
+        """
+        hour_end = math.floor(now / 3600.0) * 3600.0
+        floor_start = hour_end - AVAIL_BACKFILL_SECONDS
+
+        try:
+            starts = self.bucket_repo.get_instance_bucket_starts(monitored)
+        except Exception:
+            logger.exception("Availability depth backfill: bucket start lookup failed")
+            return None
+
+        # Restart the walk whenever the monitored set changes — a target added
+        # after the first pass has no old buckets even though the fleet does.
+        key = (len(monitored), len(starts))
+        if key != self._deep_cursor_key:
+            self._deep_cursor_key = key
+            # Shallowest = the *latest* earliest-bucket, i.e. the instance whose
+            # history is thinnest; an instance with no buckets at all is
+            # thinnest of all. Starting from the deepest instance instead would
+            # skip straight past the span the thin ones are actually missing.
+            if not starts or len(starts) < len(monitored):
+                shallowest = hour_end
+            else:
+                shallowest = max(starts.values())
+            self._deep_cursor = min(hour_end, shallowest)
+
+        cursor = self._deep_cursor
+        if cursor is None or cursor <= floor_start:
+            return None
+
+        chunk_start = max(floor_start, cursor - AVAIL_BACKFILL_CHUNK_SECONDS)
+        self._deep_cursor = chunk_start
+        logger.info(
+            "Availability depth backfill: [%.0f, %.0f], %.1fd remaining to floor",
+            chunk_start, cursor, max(0.0, chunk_start - floor_start) / 86400.0,
+        )
+        return (chunk_start, cursor)
+
     @staticmethod
-    def _availability_aggregation_windows(now: float, latest_end: Optional[float]) -> List[Tuple[float, float]]:
-        import math
-        if latest_end is None or latest_end < (now - 86400 * 7):
-            windows = []
-            cur_t = math.floor(now / 3600.0) * 3600.0 - 86400 * 7
-            while cur_t < now:
-                next_t = min(cur_t + 21600, now)
-                windows.append((cur_t, next_t))
-                cur_t = next_t
+    def _availability_aggregation_windows(
+        now: float,
+        latest_end: Optional[float],
+        max_lookback_sec: Optional[float] = None,
+    ) -> List[Tuple[float, float]]:
+        """Forward (head) aggregation windows: the recent span not yet rolled up.
+
+        Depth is not this function's job — _next_depth_backfill_window walks
+        backwards for that — so the lookback is capped rather than spanning the
+        full retention period in a single cycle.
+        """
+        lookback = float(max_lookback_sec if max_lookback_sec is not None else AVAIL_HEAD_REPAIR_SECONDS)
+        hour_end = math.floor(now / 3600.0) * 3600.0
+        floor_start = hour_end - lookback
+
+        # Steady state: already materialized through the last completed hour.
+        if latest_end is not None and latest_end >= (hour_end - 3600.0):
+            windows = [(hour_end - 3600.0, hour_end)]
+            if now - hour_end >= 30.0:
+                windows.append((hour_end, now))
             return windows
 
-        hour_end = math.floor(now / 3600.0) * 3600.0
-        windows = [(hour_end - 3600.0, hour_end)]
-        if now - hour_end >= 30.0:
-            windows.append((hour_end, now))
+        # Cold start or an aggregator outage: repair forward from the watermark,
+        # cost proportional to the gap, clamped to the lookback cap.
+        cur_t = floor_start if latest_end is None else max(floor_start, math.floor(latest_end / 3600.0) * 3600.0)
+        windows = []
+        while cur_t < now:
+            next_t = min(cur_t + 21600, now)
+            windows.append((cur_t, next_t))
+            cur_t = next_t
         return windows

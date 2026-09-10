@@ -122,6 +122,14 @@ def _build_fleet_trend(trend_end_ts, window_seconds, instances, max_points=180):
     if not instances:
         return [], slot
 
+    # query_range cost scales with the window: measured here at 0.4s (24h),
+    # 0.7s (7d), 4.9s (30d) against an *idle* Prometheus. A flat 6s left 30d
+    # with no margin, and this server runs several times slower under the app's
+    # own concurrent fan-out, so the 30d chart intermittently timed out and the
+    # caller's "[] on failure" contract rendered it as "No trend series for
+    # this range yet" rather than as an error.
+    trend_timeout = max(6.0, min(25.0, win / 120000.0))
+
     # 60s cache: the whole /api/availability payload is already cached, but on a
     # miss (and under the single-flight fan-out) this keeps the extra query_range
     # to at most once a minute regardless of request volume.
@@ -146,7 +154,7 @@ def _build_fleet_trend(trend_end_ts, window_seconds, instances, max_points=180):
             f"&start={start}&end={end}&step={slot}"
         )
         try:
-            raw, _ = promclient.fetch_prometheus_json(path, use_cache=True, cache_ttl=45.0, timeout=6.0)
+            raw, _ = promclient.fetch_prometheus_json(path, use_cache=True, cache_ttl=45.0, timeout=trend_timeout)
         except Exception:
             logger.warning("fleet trend: %s query_range failed", metric, exc_info=True)
             raw = None

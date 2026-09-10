@@ -221,6 +221,37 @@ class AvailabilityBucketRepository:
             return float(row["max_end"]) if row and row["max_end"] is not None else None
 
     @staticmethod
+    def get_instance_bucket_starts(
+        instances: Optional[List[str]] = None, db_path: Optional[str] = None
+    ) -> Dict[str, float]:
+        """Earliest bucket_start per instance — how deep that instance's
+        materialized history actually goes.
+
+        An instance absent from the returned map has no buckets at all. The
+        depth backfill walks back from the shallowest entry; a fleet-wide MIN
+        would let one long-lived target hide every newer target's missing
+        history.
+        """
+        # Past ~900 placeholders SQLite starts refusing the IN list, so filter
+        # in Python instead of binding one parameter per instance.
+        inline = bool(instances) and len(instances) <= 900
+        with db_read(db_path) as conn:
+            query = "SELECT instance, MIN(bucket_start) AS min_start FROM availability_buckets"
+            params: List[Any] = []
+            if inline:
+                query += " WHERE instance IN (%s)" % ",".join("?" for _ in instances)
+                params.extend(instances)
+            query += " GROUP BY instance"
+            rows = conn.execute(query, params).fetchall()
+
+        wanted = None if inline or not instances else set(instances)
+        return {
+            r["instance"]: float(r["min_start"])
+            for r in rows
+            if r["min_start"] is not None and (wanted is None or r["instance"] in wanted)
+        }
+
+    @staticmethod
     def get_bucket_count_in_range(job: str, start_time: float, end_time: float, db_path: Optional[str] = None) -> int:
         with db_read(db_path) as conn:
             if job == 'all':
