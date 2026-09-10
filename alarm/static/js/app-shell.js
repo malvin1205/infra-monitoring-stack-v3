@@ -35,10 +35,10 @@ export class ServerMonitor {
 
     if (enterBtn && splashOverlay) {
       enterBtn.addEventListener('click', () => {
+        // unlockAudio() records consent itself, and only if play() succeeded.
         this.unlockAudio();
         this.resetOutageAlarm();
         splashOverlay.classList.add('splash-hidden');
-        try { localStorage.setItem('iw-audio-unlocked', 'true'); } catch (e) { }
         const downCount = this.instancesPage?.data?.filter(t => t.health !== 'up' && !t.maintenance)?.length || 0;
         if (downCount > 0) {
           this.playAlarm();
@@ -470,17 +470,66 @@ export class ServerMonitor {
     }
   }
 
+  // Resuming the AudioContext does NOT unlock the <audio> element: browsers
+  // gate the two separately, and the alarm siren is the element. The only
+  // thing that lifts that gate is a play() issued from inside a user gesture,
+  // so prime the element here — muted, then immediately paused and rewound —
+  // and only claim success once that play() actually resolves. Previously this
+  // logged "unlocked cleanly" unconditionally while the element stayed locked,
+  // so the first real alarm (fired from a poll callback, not a gesture) died
+  // with NotAllowedError and the operator got no siren.
   unlockAudio() {
     const ctx = this._getAudioContext();
     if (ctx && ctx.state === 'suspended') {
       ctx.resume().catch(() => { });
     }
-    if (this.alarmAudio) {
-      this.alarmAudio.muted = false;
-      this.alarmAudio.volume = 1.0;
+
+    const el = this.alarmAudio;
+    if (!el) {
+      this.audioUnlocked = false;
+      console.warn('[InfraWatch] No alarm audio element to unlock');
+      return;
     }
-    try { localStorage.setItem('iw-audio-unlocked', 'true'); } catch (e) { }
-    console.log('[InfraWatch] Audio context & element unlocked cleanly');
+
+    const settle = () => {
+      try { el.pause(); } catch (e) { }
+      try { el.currentTime = 0; } catch (e) { }
+      el.muted = false;
+      el.volume = 1.0;
+    };
+
+    el.muted = true;
+    let p;
+    try {
+      p = el.play();
+    } catch (e) {
+      settle();
+      this.audioUnlocked = false;
+      console.warn('[InfraWatch] Alarm audio still locked (needs a user gesture):', e);
+      return;
+    }
+
+    if (p === undefined) {
+      // Pre-promise engine: nothing to await, assume the gesture took.
+      settle();
+      this.audioUnlocked = true;
+      try { localStorage.setItem('iw-audio-unlocked', 'true'); } catch (e) { }
+      return;
+    }
+
+    p.then(() => {
+      settle();
+      this.audioUnlocked = true;
+      // Persist consent only on a play() that actually succeeded — the flag
+      // bypasses the splash on later visits, so recording it after a failed
+      // unlock would hide the one button that can fix this.
+      try { localStorage.setItem('iw-audio-unlocked', 'true'); } catch (e) { }
+      console.log('[InfraWatch] Audio context & element unlocked cleanly');
+    }).catch((e) => {
+      settle();
+      this.audioUnlocked = false;
+      console.warn('[InfraWatch] Alarm audio still locked (needs a user gesture):', e);
+    });
   }
 
   // The configured MP3 on <audio id="alarmAudio"> is the ONLY sound this app
@@ -516,11 +565,17 @@ export class ServerMonitor {
           }).catch((e) => {
             if (token !== this._alarmPlayToken || !this.isPlayingAlarm || this.isMuted) return;
             this.isPlayingAlarm = false;
+            // Let this outage try again. A blocked play() is usually the
+            // autoplay gate, which the operator's next click lifts — leaving
+            // the "already played" latch set would silence the siren for the
+            // whole outage even after audio becomes available.
+            this.hasPlayedForCurrentOutage = false;
             this._reportAlarmAudioFailure(e);
           });
         }
       } catch (e) {
         this.isPlayingAlarm = false;
+        this.hasPlayedForCurrentOutage = false;
         this._reportAlarmAudioFailure(e);
       }
     }
