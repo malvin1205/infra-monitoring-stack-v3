@@ -34,14 +34,6 @@ try:
         AcknowledgmentRepository,
         IncidentRepository,
     )
-    from core.alerts import (
-        active_incident_list,
-        load_maintenance_windows,
-        get_active_maintenance,
-        load_dependencies,
-        apply_correlation_suppression,
-    )
-    from core.availability.fleet import classify_probe_failure, get_availability_settings
 except (ImportError, ValueError):
     from alarm.core.monitoring.models import FleetQuery, FleetSummary, FleetState
     from alarm.core.monitoring import client as promclient
@@ -66,16 +58,45 @@ except (ImportError, ValueError):
         AcknowledgmentRepository,
         IncidentRepository,
     )
-    from alarm.core.alerts import (
-        active_incident_list,
-        load_maintenance_windows,
-        get_active_maintenance,
-        load_dependencies,
-        apply_correlation_suppression,
-    )
-    from alarm.core.availability.fleet import classify_probe_failure, get_availability_settings
 
 logger = logging.getLogger("infrawatch.monitoring")
+
+
+def _get_alerts_helpers():
+    try:
+        from core.alerts import (
+            active_incident_list,
+            load_maintenance_windows,
+            get_active_maintenance,
+            load_dependencies,
+            apply_correlation_suppression,
+        )
+    except (ImportError, ValueError):
+        from alarm.core.alerts import (
+            active_incident_list,
+            load_maintenance_windows,
+            get_active_maintenance,
+            load_dependencies,
+            apply_correlation_suppression,
+        )
+    return {
+        "active_incident_list": active_incident_list,
+        "load_maintenance_windows": load_maintenance_windows,
+        "get_active_maintenance": get_active_maintenance,
+        "load_dependencies": load_dependencies,
+        "apply_correlation_suppression": apply_correlation_suppression,
+    }
+
+
+def _get_availability_helpers():
+    try:
+        from core.availability.fleet import classify_probe_failure, get_availability_settings
+    except (ImportError, ValueError):
+        from alarm.core.availability.fleet import classify_probe_failure, get_availability_settings
+    return {
+        "classify_probe_failure": classify_probe_failure,
+        "get_availability_settings": get_availability_settings,
+    }
 
 
 def _derive_probe_readings(
@@ -170,17 +191,73 @@ class FleetStateEngine:
         self.prom_client = prom_client or promclient
         self.prom_queries = prom_queries or globals().get("prom_queries")
         self.incident_repo = incident_repo or IncidentRepository
-        self.active_incident_provider = active_incident_provider or active_incident_list
-        self.maintenance_loader = maintenance_loader or load_maintenance_windows
-        self.maintenance_checker = maintenance_checker or get_active_maintenance
-        self.dependency_loader = dependency_loader or load_dependencies
-        self.correlation_suppressor = correlation_suppressor or apply_correlation_suppression
+        self._active_incident_provider = active_incident_provider
+        self._maintenance_loader = maintenance_loader
+        self._maintenance_checker = maintenance_checker
+        self._dependency_loader = dependency_loader
+        self._correlation_suppressor = correlation_suppressor
         self.ack_repo = ack_repo or AcknowledgmentRepository
         self.slow_threshold_repo = slow_threshold_repo or SlowThresholdRepository
         self.deleted_targets_loader = deleted_targets_loader or load_deleted_targets
-        self.availability_settings_loader = availability_settings_loader or get_availability_settings
-        self.probe_failure_classifier = probe_failure_classifier or classify_probe_failure
+        self._availability_settings_loader = availability_settings_loader
+        self._probe_failure_classifier = probe_failure_classifier
         self.executor = executor or promclient._SHARED_EXECUTOR
+
+    @property
+    def active_incident_provider(self):
+        return self._active_incident_provider or _get_alerts_helpers()["active_incident_list"]
+
+    @active_incident_provider.setter
+    def active_incident_provider(self, val):
+        self._active_incident_provider = val
+
+    @property
+    def maintenance_loader(self):
+        return self._maintenance_loader or _get_alerts_helpers()["load_maintenance_windows"]
+
+    @maintenance_loader.setter
+    def maintenance_loader(self, val):
+        self._maintenance_loader = val
+
+    @property
+    def maintenance_checker(self):
+        return self._maintenance_checker or _get_alerts_helpers()["get_active_maintenance"]
+
+    @maintenance_checker.setter
+    def maintenance_checker(self, val):
+        self._maintenance_checker = val
+
+    @property
+    def dependency_loader(self):
+        return self._dependency_loader or _get_alerts_helpers()["load_dependencies"]
+
+    @dependency_loader.setter
+    def dependency_loader(self, val):
+        self._dependency_loader = val
+
+    @property
+    def correlation_suppressor(self):
+        return self._correlation_suppressor or _get_alerts_helpers()["apply_correlation_suppression"]
+
+    @correlation_suppressor.setter
+    def correlation_suppressor(self, val):
+        self._correlation_suppressor = val
+
+    @property
+    def availability_settings_loader(self):
+        return self._availability_settings_loader or _get_availability_helpers()["get_availability_settings"]
+
+    @availability_settings_loader.setter
+    def availability_settings_loader(self, val):
+        self._availability_settings_loader = val
+
+    @property
+    def probe_failure_classifier(self):
+        return self._probe_failure_classifier or _get_availability_helpers()["classify_probe_failure"]
+
+    @probe_failure_classifier.setter
+    def probe_failure_classifier(self, val):
+        self._probe_failure_classifier = val
 
     def get_fleet_state(self, query: Optional[FleetQuery] = None) -> FleetState:
         """Main entry point: executes probe snapshot ingestion, target enrichment,
