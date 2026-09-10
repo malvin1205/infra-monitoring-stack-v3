@@ -109,6 +109,41 @@ def test_hole_in_the_middle_is_swept():
     assert quiet._next_depth_backfill_window(["host-a", "host-b"], now) is None
 
 
+def test_fleet_churn_does_not_restart_a_sweep_in_flight():
+    """Observed in production: with 63 hosts down, targets flap in and out of
+    Prometheus every cycle. Keying the cursor on fleet membership reset it to
+    the top on every flap, so the walk rewrote the newest 6h chunk for hours
+    and never tiled downward. A sweep in flight must ignore churn."""
+    now = time.time()
+    hour_end = math.floor(now / HOUR) * HOUR
+    eng = _engine({"host-a": _full(hour_end - 3 * HOUR, now)})
+
+    ends = []
+    for cycle in range(6):
+        # Fleet membership churns every single cycle.
+        insts = ["host-a"] + ([f"flap-{cycle}"] if cycle % 2 else [])
+        w = eng._next_depth_backfill_window(insts, now)
+        assert w is not None, "sweep must keep going while churn happens"
+        ends.append(w[1])
+
+    assert ends == sorted(ends, reverse=True), "cursor must move monotonically down"
+    assert len(set(ends)) == len(ends), "cursor must not revisit the same chunk"
+    assert ends[0] - ends[-1] >= 5 * AVAIL_BACKFILL_CHUNK_SECONDS - 1
+
+
+def test_permanently_stale_instance_does_not_loop_forever():
+    """An instance Prometheus has no history for stays under-materialized. Once
+    a sweep has covered it, it must not retrigger a fresh sweep every cycle."""
+    now = time.time()
+    hour_end = math.floor(now / HOUR) * HOUR
+    insts = ["ghost"]
+    eng = _engine({"ghost": (hour_end - HOUR, 1)})  # 1 hour of buckets, nothing else
+
+    _walk(eng, insts, now)  # drive the sweep to the floor
+    assert eng._next_depth_backfill_window(insts, now) is None
+    assert eng._next_depth_backfill_window(insts, now) is None
+
+
 def test_same_size_target_swap_restarts_the_walk():
     """One target removed, another added: every count is unchanged, so keying
     the restart on lengths left the incoming target's history unfilled."""

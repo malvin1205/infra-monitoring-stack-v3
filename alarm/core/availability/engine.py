@@ -114,9 +114,11 @@ class AvailabilityEngine:
         self.sla_repo = sla_repo or SlaTargetRepository
         self.cache = cache or AvailabilityCache()
         # Backward-walk cursor for depth backfill: next chunk end to materialize,
-        # and the monitored-set signature it was planned for.
+        # plus the under-materialized set left over by the last completed sweep
+        # (instances Prometheus simply has no history for — re-sweeping those
+        # forever would never terminate).
         self._deep_cursor: Optional[float] = None
-        self._deep_cursor_key: Optional[Tuple[int, int]] = None
+        self._deep_swept_stale: frozenset = frozenset()
 
     def invalidate_cache(self, job: Optional[str] = None, instance: Optional[str] = None) -> int:
         """Evict matching cached availability queries."""
@@ -993,24 +995,36 @@ class AvailabilityEngine:
             logger.exception("Availability depth backfill: bucket coverage lookup failed")
             return None
 
-        # Restart the walk whenever the set of under-materialized instances
-        # changes. Keyed on identity, not on counts: a same-size swap (one
-        # target removed, another added) leaves every count unchanged, and
-        # keying on lengths let the incoming target's history go unfilled.
         stale = frozenset(
             i for i in monitored
             if self._is_under_materialized(coverage.get(i), hour_end, floor_start)
         )
-        if stale != self._deep_cursor_key:
-            self._deep_cursor_key = stale
+
+        cursor = self._deep_cursor
+        if cursor is not None and cursor > floor_start:
+            # A sweep is in flight. Never restart it on fleet churn: targets
+            # flap constantly (a down host drops out of Prometheus and returns),
+            # and keying the cursor on fleet membership reset it to the top on
+            # every flap — so it rewrote the newest chunk forever and never
+            # tiled downward. Progress must be monotonic.
+            pass
+        else:
+            # Idle. Start a sweep only for work that is genuinely new: anything
+            # still stale after the last completed sweep is stale because
+            # Prometheus has nothing there, and re-sweeping it every cycle would
+            # never terminate. A newly monitored target is not a subset, so it
+            # does start one.
+            if not stale or stale <= self._deep_swept_stale:
+                return None
             # Sweep from the top of the window, not from the thinnest instance's
             # earliest bucket: a *hole* (aggregator down for a stretch) sits
             # above that point, so starting there would walk straight past it.
-            self._deep_cursor = hour_end if stale else None
-
-        cursor = self._deep_cursor
-        if cursor is None or cursor <= floor_start:
-            return None
+            self._deep_swept_stale = stale
+            cursor = hour_end
+            logger.info(
+                "Availability depth backfill: starting sweep, %d/%d instances under-materialized",
+                len(stale), len(monitored),
+            )
 
         chunk_start = max(floor_start, cursor - AVAIL_BACKFILL_CHUNK_SECONDS)
         self._deep_cursor = chunk_start
