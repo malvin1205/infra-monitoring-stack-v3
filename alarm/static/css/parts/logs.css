@@ -178,7 +178,7 @@
 }
 
 .hist-stat-critical .hist-stat-value { color: var(--critical); }
-.hist-stat-warning .hist-stat-value { color: #F59E0B; }
+.hist-stat-warning .hist-stat-value { color: var(--warning); }
 
 .history-meta-row {
   display: flex;
@@ -423,7 +423,7 @@
 
 .al-expand-icon {
   flex-shrink: 0;
-  color: #F59E0B;
+  color: var(--warning);
   transition: transform var(--t-fast);
 }
 
@@ -486,7 +486,7 @@
 }
 
 .al-badge-group {
-  color: #F59E0B;
+  color: var(--warning);
   background: var(--warning-bg);
 }
 
@@ -656,7 +656,7 @@
    (red ring vs green ring) and the row background (.history-row-active),
    not on the severity label. */
 .history-sev-critical { color: var(--critical); }
-.history-sev-warning { color: #F59E0B; }
+.history-sev-warning { color: var(--warning); }
 
 .history-occurrences {
   font-family: var(--font-mono);

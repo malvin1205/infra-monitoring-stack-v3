@@ -116,7 +116,7 @@
   background-size: 12px;
   border: 1px solid var(--border-strong, rgba(255, 255, 255, 0.12));
   border-radius: var(--r-sm, 8px);
-  color: var(--text-primary, #F8FAFC);
+  color: var(--text-primary, #F5F5F6);
   font-size: 12px;
   font-weight: 500;
   height: 32px;
@@ -134,8 +134,8 @@
 }
 
 .interval-select option {
-  background-color: #020408;
-  color: #F8FAFC;
+  background-color: #0A0A0B;
+  color: #F5F5F6;
   padding: 8px 12px;
 }
 
@@ -162,7 +162,7 @@
   background-size: 12px;
   border: 1px solid var(--border-strong, rgba(255, 255, 255, 0.15));
   border-radius: var(--r-sm, 8px);
-  color: var(--text-primary, #F8FAFC);
+  color: var(--text-primary, #F5F5F6);
   font-family: var(--font, 'Inter', sans-serif);
   font-size: 12px;
   font-weight: 500;
@@ -192,8 +192,8 @@
 
 .filter-select option,
 .interval-select option {
-  background-color: #020408 !important;
-  color: #F8FAFC !important;
+  background-color: #0A0A0B !important;
+  color: #F5F5F6 !important;
   padding: 10px 14px !important;
   font-size: 12px !important;
 }
@@ -240,7 +240,7 @@
 
 .custom-select-option:hover {
   background-color: var(--surface-hover, #2A3750);
-  color: var(--text-primary, #F8FAFC);
+  color: var(--text-primary, #F5F5F6);
 }
 
 .custom-select-option.selected {

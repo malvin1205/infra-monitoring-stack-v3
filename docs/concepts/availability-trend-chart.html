@@ -1,0 +1,329 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Availability Trend — concept mockup</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  /* Real app dark-mode tokens (alarm/static/css/parts/tokens.css :root) so the
+     mockup matches the running modal. .avb re-points local names at these. */
+  :root {
+    --bg: #020408; --surface: #060A12; --surface-raised: #0B101E;
+    --surface-hover: #11182B; --bg-elevated: #050810;
+    --border-strong: rgba(255,255,255,.14); --border-subtle: rgba(255,255,255,.04);
+    --text-primary: #F8FAFC; --text-secondary: #94A3B8; --text-muted: #7E8B9B;
+    --success: #22C55E; --warning: #ffd500; --critical: #EF4444; --accent: #38BDF8;
+    --font: 'Inter', -apple-system, system-ui, sans-serif;
+    --font-mono: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
+  }
+  .avb {
+    --bg-surface: var(--surface-raised); --border: var(--border-strong);
+    --text-hi: var(--text-primary); --text-mid: var(--text-secondary);
+    --text-low: var(--text-muted); --ok: var(--success); --warn: var(--warning);
+    --crit: var(--critical); --avb-font-mono: var(--font-mono);
+  }
+  body {
+    margin: 0; background: var(--bg); color: var(--text-primary);
+    font-family: var(--font); padding: 32px 20px; display: flex;
+    flex-direction: column; align-items: center; gap: 22px;
+  }
+  .frame { width: 100%; max-width: 680px; }
+  .note { font-size: 12px; color: var(--text-muted); max-width: 680px; line-height: 1.55; }
+  .note code { font-family: var(--avb-font-mono); color: var(--text-secondary); }
+
+  /* ── card ─────────────────────────────────────────────────────────── */
+  .avb-trend-section { margin: 0; }
+  .avb-sec-title {
+    margin: 0 0 9px; font-size: 13px; font-weight: 600; color: var(--text-hi);
+    display: flex; align-items: baseline; gap: 7px;
+  }
+  .avb-sec-title .sub { font-size: 10.5px; font-weight: 400; color: var(--text-low); }
+  .avb-sec-title .spacer { flex: 1; }
+  .slot-select {
+    font-family: var(--avb-font-mono); font-size: 10px; color: var(--text-mid);
+    background: var(--surface-hover); border: 1px solid var(--border);
+    border-radius: 5px; padding: 2px 7px;
+  }
+  .avb-trend-card {
+    background: var(--bg-surface); border: 1px solid var(--border);
+    border-radius: 8px; padding: 12px 14px 8px;
+  }
+
+  /* ── KPI strip (phase 2/3) ────────────────────────────────────────── */
+  .avb-trend-kpis {
+    display: flex; flex-wrap: wrap; gap: 6px 18px; align-items: baseline;
+    margin-bottom: 12px; font-size: 11px; color: var(--text-low);
+  }
+  .avb-trend-kpis b { color: var(--text-hi); font-size: 12.5px; font-weight: 600; }
+  .avb-trend-kpis .k { display: flex; align-items: baseline; gap: 5px; }
+  .delta { font-family: var(--avb-font-mono); font-size: 10px; font-weight: 600; }
+  .delta.up { color: var(--ok); }
+  .delta.down { color: var(--crit); }
+
+  /* ── plot ─────────────────────────────────────────────────────────── */
+  .avb-trend-plot {
+    position: relative; height: 132px; margin-left: 38px;
+    border-left: 1px solid var(--border); border-bottom: 1px solid var(--border);
+  }
+  .avb-trend-grid { position: absolute; inset: 0; }
+  .avb-trend-grid span {
+    position: absolute; left: 0; right: 0; top: var(--y);
+    border-top: 1px dashed rgba(255,255,255,.07);
+  }
+  .avb-trend-grid span i {
+    position: absolute; left: -38px; top: -6px; width: 32px; text-align: right;
+    font-family: var(--avb-font-mono); font-size: 9px; font-style: normal;
+    color: var(--text-low);
+  }
+  .avb-trend-svg-wrap { position: absolute; inset: 0; pointer-events: none; }
+  .avb-trend-svg { display: block; width: 100%; height: 100%; overflow: visible; }
+  .breach-zone { fill: var(--crit); opacity: .06; }
+  .sla-line { stroke: var(--text-low); stroke-width: 1; stroke-dasharray: 4 3; opacity: .8; }
+  .ghost-line { fill: none; stroke: var(--text-low); stroke-width: 1; opacity: .45; }
+  .trend-area { stroke: none; }
+  .seg { fill: none; stroke-width: 1.6px; stroke-linejoin: round; stroke-linecap: round; }
+  .seg.ok { stroke: var(--ok); }
+  .seg.crit { stroke: var(--crit); }
+  .gap-link { stroke: var(--text-low); stroke-width: 1; stroke-dasharray: 2 3; opacity: .7; fill: none; }
+  /* dip markers are HTML (a circle in a preserveAspectRatio=none SVG stretches
+     into an ellipse) — same reason the real chart's hover dot is a <div>. */
+  .dip-layer { position: absolute; inset: 0; pointer-events: none; }
+  .dip {
+    position: absolute; width: 6px; height: 6px; margin: -3px 0 0 -3px;
+    border-radius: 50%; background: var(--crit);
+    box-shadow: 0 0 0 2px var(--bg-surface);
+  }
+
+  .avb-trend-xaxis {
+    display: flex; justify-content: space-between; margin: 5px 0 0 38px;
+    font-family: var(--avb-font-mono); font-size: 9px; color: var(--text-low);
+  }
+
+  /* ── hover overlay ────────────────────────────────────────────────── */
+  .avb-trend-hover { position: absolute; inset: 0; cursor: crosshair; z-index: 2; }
+  .avb-trend-cross, .avb-trend-dot, .avb-trend-tip {
+    position: absolute; opacity: 0; transition: opacity .08s linear; pointer-events: none;
+  }
+  .avb-trend-hover.active .avb-trend-cross,
+  .avb-trend-hover.active .avb-trend-dot,
+  .avb-trend-hover.active .avb-trend-tip { opacity: 1; }
+  .avb-trend-cross { top: 0; bottom: 0; width: 1px; margin-left: -.5px; background: var(--text-low); opacity: .3; }
+  .avb-trend-dot {
+    width: 7px; height: 7px; margin: -3.5px 0 0 -3.5px; border-radius: 50%;
+    background: var(--ok); box-shadow: 0 0 0 3px rgba(34,197,94,.2);
+  }
+  .avb-trend-dot.below { background: var(--crit); box-shadow: 0 0 0 3px rgba(239,68,68,.2); }
+  .avb-trend-tip {
+    transform: translate(-50%, calc(-100% - 10px));
+    background: var(--bg-elevated); border: 1px solid var(--border);
+    border-radius: 5px; padding: 6px 8px; min-width: 140px;
+    font-family: var(--avb-font-mono); font-size: 9.5px; color: var(--text-hi);
+    white-space: nowrap; line-height: 1.5;
+  }
+  .avb-trend-tip .t-hd { color: var(--text-low); margin-bottom: 2px; }
+  .avb-trend-tip .t-big { font-size: 12px; font-weight: 600; }
+  .avb-trend-tip .t-big.below { color: var(--crit); }
+  .avb-trend-tip .t-row { color: var(--text-mid); }
+  .avb-trend-tip.flip-x { transform: translate(-100%, calc(-100% - 10px)); }
+  .avb-trend-tip.flip-y { transform: translate(-50%, 10px); }
+  .avb-trend-tip.flip-x.flip-y { transform: translate(-100%, 10px); }
+</style>
+
+<p class="note">
+  <strong>Availability Trend — concept mockup.</strong> Phase&nbsp;1–4 end state.
+  Real <code>.avb</code> dark-mode tokens, fake 30-slot fleet series
+  (<code>[{ts, availability_pct, incident_count, gap_before}]</code>) + a
+  <code>trend_prev</code> ghost. SLA target <code>99.9%</code>. Hover the plot.
+</p>
+
+<div class="frame avb">
+  <section class="avb-trend-section" aria-label="Availability trend">
+    <h4 class="avb-sec-title">
+      Availability Trend <span class="sub">· last 7d</span>
+      <span class="spacer"></span>
+      <span class="slot-select">slot 1h ▾</span>
+    </h4>
+    <div class="avb-trend-card">
+      <div class="avb-trend-kpis" id="kpis"></div>
+      <div class="avb-trend-plot" id="plot">
+        <div class="avb-trend-grid" id="grid">
+          <span style="--y:0%"><i>100%</i></span>
+          <span style="--y:50%"><i>—</i></span>
+          <span style="--y:100%"><i>—</i></span>
+        </div>
+      </div>
+      <div class="avb-trend-xaxis" id="xaxis"></div>
+    </div>
+  </section>
+</div>
+
+<p class="note">
+  Line is <span style="color:var(--success)">green at/above target</span>,
+  <span style="color:var(--critical)">red below</span>. Faint horizontal dashed
+  line = SLA target; the tinted band beneath it is the breach zone. The dim line
+  behind is the same fleet one window earlier. The dashed vertical break near
+  <code>-3d</code> is a telemetry gap (NaN slot), no longer connected through.
+</p>
+
+<script>
+(function () {
+  // ── fake data ────────────────────────────────────────────────────────
+  var SLA = 99.9;
+  var N = 30, slot = 3600, end = Math.floor(Date.now() / 1000);
+  var start = end - N * slot;
+  var base = [99.99,99.98,100,99.97,99.95,99.9,99.8,99.62,99.55,99.78,99.93,99.98,
+              99.99,100,99.96, null,null, 99.4,99.2,99.71,99.88,99.95,99.98,99.99,
+              100,99.97,99.94,99.9,99.85,99.97];
+  var incs = [0,0,0,0,0,0,1,2,2,1,0,0,0,0,0, 0,0, 3,4,1,0,0,0,0,0,0,0,0,1,0];
+  var pts = [];
+  for (var i = 0; i < N; i++) {
+    if (base[i] == null) continue;
+    pts.push({
+      ts: start + i * slot,
+      availability_pct: base[i],
+      incident_count: incs[i],
+      gap_before: i > 0 && base[i - 1] == null
+    });
+  }
+  // prior window: shift back, nudge down a touch so "improved" reads
+  var prev = pts.map(function (p) {
+    return { ts: p.ts, availability_pct: Math.max(99, Math.min(100, p.availability_pct - 0.12 - Math.random() * 0.15)) };
+  });
+
+  // ── geometry ─────────────────────────────────────────────────────────
+  var plot = document.getElementById('plot');
+  var W = 100, H = 100;
+  var worst = Math.min.apply(null, pts.map(function (p) { return p.availability_pct; }));
+  var yMax = 100;
+  var yMin = Math.max(0, Math.floor((worst - 0.2) * 10) / 10);
+  yMin = Math.min(yMin, SLA - 0.15);               // keep target line on screen
+  if (yMin >= yMax) yMin = yMax - 1;
+  var yMid = +( (yMin + yMax) / 2 ).toFixed(2);
+  var g = document.getElementById('grid').querySelectorAll('span i');
+  g[0].textContent = yMax + '%'; g[1].textContent = yMid + '%'; g[2].textContent = yMin + '%';
+
+  var winSec = Math.max(1, end - start);
+  var clamp = function (v, lo, hi) { return Math.max(lo, Math.min(hi, v)); };
+  var xOf = function (ts) { return clamp((ts - start) / winSec * W, 0, W); };
+  var yOf = function (v) { return clamp((yMax - v) / (yMax - yMin) * H, 0, H); };
+
+  // state-split polyline: emit one <path> per run of same-side points, plus a
+  // dashed connector across any gap_before break.
+  var segs = [], cur = null;
+  pts.forEach(function (p, idx) {
+    var x = xOf(p.ts), y = yOf(p.availability_pct);
+    var below = p.availability_pct < SLA;
+    if (p.gap_before && cur) { segs.push(cur); cur = null; }
+    if (!cur || cur.below !== below) {
+      if (cur) { // bridge colour change: start new seg at the crossing point
+        var prevPt = cur.pts[cur.pts.length - 1];
+        cur.pts.push([x, y]); segs.push(cur);
+      }
+      cur = { below: below, pts: [[x, y]] };
+    } else {
+      cur.pts.push([x, y]);
+    }
+  });
+  if (cur) segs.push(cur);
+
+  var d = function (pp) { return pp.map(function (c, i) { return (i ? 'L' : 'M') + c[0].toFixed(2) + ' ' + c[1].toFixed(2); }).join(' '); };
+  var allPts = pts.map(function (p) { return [xOf(p.ts), yOf(p.availability_pct)]; });
+  var areaD = d(allPts) + ' L' + allPts[allPts.length - 1][0].toFixed(2) + ' 100 L' + allPts[0][0].toFixed(2) + ' 100 Z';
+  var ghostD = d(prev.map(function (p) { return [xOf(p.ts), yOf(p.availability_pct)]; }));
+  var slaY = yOf(SLA).toFixed(2);
+
+  // gap connectors
+  var gapPaths = '';
+  pts.forEach(function (p, idx) {
+    if (p.gap_before && idx > 0) {
+      var a = allPts[idx - 1], b = allPts[idx];
+      gapPaths += '<path class="gap-link" d="M' + a[0].toFixed(2) + ' ' + a[1].toFixed(2) +
+                  ' L' + b[0].toFixed(2) + ' ' + b[1].toFixed(2) + '"/>';
+    }
+  });
+  var svg =
+    '<svg class="avb-trend-svg" viewBox="0 0 100 100" preserveAspectRatio="none">' +
+      '<defs><linearGradient id="fill" x1="0" y1="0" x2="0" y2="1">' +
+        '<stop offset="0" stop-color="var(--ok)" stop-opacity="0.22"/>' +
+        '<stop offset="1" stop-color="var(--ok)" stop-opacity="0"/>' +
+      '</linearGradient></defs>' +
+      '<path class="trend-area" fill="url(#fill)" d="' + areaD + '"/>' +
+      // breach zone painted OVER the area so the danger band still reads red
+      '<rect class="breach-zone" x="0" y="' + slaY + '" width="100" height="' + (100 - slaY).toFixed(2) + '"/>' +
+      '<path class="ghost-line" d="' + ghostD + '" vector-effect="non-scaling-stroke"/>' +
+      '<line class="sla-line" x1="0" y1="' + slaY + '" x2="100" y2="' + slaY + '" vector-effect="non-scaling-stroke"/>' +
+      gapPaths +
+      segs.map(function (s) { return '<path class="seg ' + (s.below ? 'crit' : 'ok') + '" d="' + d(s.pts) + '" vector-effect="non-scaling-stroke"/>'; }).join('') +
+    '</svg>';
+
+  var wrap = document.createElement('div');
+  wrap.className = 'avb-trend-svg-wrap';
+  wrap.innerHTML = svg;
+  plot.appendChild(wrap);
+
+  // dip markers (below target) as an HTML overlay
+  var dipLayer = document.createElement('div');
+  dipLayer.className = 'dip-layer';
+  pts.forEach(function (p, idx) {
+    if (p.availability_pct >= SLA) return;
+    var c = allPts[idx], el = document.createElement('div');
+    el.className = 'dip';
+    el.style.left = c[0] + '%'; el.style.top = c[1] + '%';
+    dipLayer.appendChild(el);
+  });
+  plot.appendChild(dipLayer);
+
+  // ── KPI strip ────────────────────────────────────────────────────────
+  var avg = pts.reduce(function (s, p) { return s + p.availability_pct; }, 0) / pts.length;
+  var prevAvg = prev.reduce(function (s, p) { return s + p.availability_pct; }, 0) / prev.length;
+  var deltaPts = avg - prevAvg;
+  var breaches = pts.filter(function (p) { return p.availability_pct < SLA; }).length;
+  var up = deltaPts >= 0;
+  document.getElementById('kpis').innerHTML =
+    '<span class="k">Fleet avg <b>' + avg.toFixed(2) + '%</b> ' +
+      '<span class="delta ' + (up ? 'up' : 'down') + '">' + (up ? '▲' : '▼') + ' ' +
+      Math.abs(deltaPts).toFixed(2) + ' pts vs prev 7d</span></span>' +
+    '<span class="k">Worst slot <b>' + worst.toFixed(2) + '%</b></span>' +
+    '<span class="k">Breaches <b>' + breaches + ' / ' + pts.length + ' slots</b></span>';
+
+  // ── x-axis ───────────────────────────────────────────────────────────
+  var xa = document.getElementById('xaxis');
+  for (var t = 0; t < 5; t++) {
+    var off = winSec * (1 - t / 4);
+    var s = document.createElement('span');
+    s.textContent = off < 3600 ? 'now' : '-' + Math.round(off / 86400 * 10) / 10 + 'd';
+    xa.appendChild(s);
+  }
+
+  // ── hover ────────────────────────────────────────────────────────────
+  var hover = document.createElement('div');
+  hover.className = 'avb-trend-hover';
+  hover.innerHTML = '<div class="avb-trend-cross"></div><div class="avb-trend-dot"></div><div class="avb-trend-tip"></div>';
+  plot.appendChild(hover);
+  var cross = hover.querySelector('.avb-trend-cross');
+  var dot = hover.querySelector('.avb-trend-dot');
+  var tip = hover.querySelector('.avb-trend-tip');
+  var fmt = function (ts) { var dte = new Date(ts * 1000); return dte.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' + dte.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); };
+
+  hover.addEventListener('pointermove', function (e) {
+    var r = hover.getBoundingClientRect();
+    if (!r.width) return;
+    var xp = clamp((e.clientX - r.left) / r.width * 100, 0, 100);
+    var best = 0, bd = Infinity;
+    allPts.forEach(function (c, i) { var dd = Math.abs(c[0] - xp); if (dd < bd) { bd = dd; best = i; } });
+    var c = allPts[best], p = pts[best], below = p.availability_pct < SLA;
+    var vsPrev = best > 0 ? p.availability_pct - pts[best - 1].availability_pct : 0;
+    cross.style.left = c[0] + '%';
+    dot.style.left = c[0] + '%'; dot.style.top = c[1] + '%';
+    dot.classList.toggle('below', below);
+    tip.className = 'avb-trend-tip' + (c[0] > 62 ? ' flip-x' : '') + (c[1] < 26 ? ' flip-y' : '');
+    tip.innerHTML =
+      '<div class="t-hd">' + fmt(p.ts) + ' – +1h</div>' +
+      '<div class="t-big' + (below ? ' below' : '') + '">' + p.availability_pct.toFixed(2) + '%' +
+        (below ? '  ▼ below SLA' : '') + '</div>' +
+      '<div class="t-row">' + p.incident_count + ' incident' + (p.incident_count === 1 ? '' : 's') + ' in slot</div>' +
+      '<div class="t-row">' + (vsPrev >= 0 ? '▲ +' : '▼ ') + vsPrev.toFixed(2) + ' pts vs prev slot</div>';
+    tip.style.left = c[0] + '%'; tip.style.top = c[1] + '%';
+    hover.classList.add('active');
+  });
+  hover.addEventListener('pointerleave', function () { hover.classList.remove('active'); });
+})();
+</script>

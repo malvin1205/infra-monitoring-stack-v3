@@ -19,11 +19,9 @@ from flask import g, has_request_context
 
 try:
     from storage import json_store, IncidentRepository, MaintenanceRepository, DependencyRepository
-    from core.monitoring.primitives import _parse_epoch_ts
     from .telegram import dispatch_alert_async
 except (ImportError, ValueError):
     from alarm.storage import json_store, IncidentRepository, MaintenanceRepository, DependencyRepository
-    from alarm.core.monitoring.primitives import _parse_epoch_ts
     from alarm.core.alerts.telegram import dispatch_alert_async
 
 logger = logging.getLogger("infrawatch")

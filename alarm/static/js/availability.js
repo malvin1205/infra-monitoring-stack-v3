@@ -195,7 +195,9 @@ class _AvailabilityMethods {
   _setActiveRangeChip(range) {
     if (!this.rangeChipsGroup) return;
     this.rangeChipsGroup.querySelectorAll('.chip').forEach(b => {
-      b.classList.toggle('chip-active', b.dataset.range === range);
+      const isActive = b.dataset.range === range;
+      b.classList.toggle('chip-active', isActive);
+      b.setAttribute('aria-pressed', isActive ? 'true' : 'false');
     });
   }
 
@@ -217,6 +219,9 @@ class _AvailabilityMethods {
     if (!this.customRangePopover) return;
     if (this.customRangeErrorEl) this.customRangeErrorEl.classList.add('hidden');
 
+    const customChip = document.getElementById('rangePresetCustom');
+    if (customChip) customChip.setAttribute('aria-expanded', 'true');
+
     // Pre-fill with the currently active window (or last 24h by default)
     if (this.customRangeFromEl && !this.customRangeFromEl.value) {
       const end = this.periodEnd ? new Date(this.periodEnd * 1000) : new Date();
@@ -230,6 +235,8 @@ class _AvailabilityMethods {
   _closeCustomRangePopover() {
     if (!this.customRangePopover) return;
     this.customRangePopover.classList.add('hidden');
+    const customChip = document.getElementById('rangePresetCustom');
+    if (customChip) customChip.setAttribute('aria-expanded', 'false');
     // Revert chip highlight to whatever range is actually active
     if (this.periodLabel !== 'custom') this._setActiveRangeChip(this.periodLabel);
   }
@@ -285,6 +292,8 @@ class _AvailabilityMethods {
 
     this._setActiveRangeChip('custom');
     this.customRangePopover.classList.add('hidden');
+    const customChip = document.getElementById('rangePresetCustom');
+    if (customChip) customChip.setAttribute('aria-expanded', 'false');
     this.loadAvailability();
     if (this.selectedTarget) {
       this.loadTargetHistory(this.selectedTarget.instance);

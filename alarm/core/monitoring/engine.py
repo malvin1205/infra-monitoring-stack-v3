@@ -41,7 +41,7 @@ try:
         load_dependencies,
         apply_correlation_suppression,
     )
-    from core.availability import classify_probe_failure, get_availability_settings
+    from core.availability.fleet import classify_probe_failure, get_availability_settings
 except (ImportError, ValueError):
     from alarm.core.monitoring.models import FleetQuery, FleetSummary, FleetState
     from alarm.core.monitoring import client as promclient
@@ -73,7 +73,7 @@ except (ImportError, ValueError):
         load_dependencies,
         apply_correlation_suppression,
     )
-    from alarm.core.availability import classify_probe_failure, get_availability_settings
+    from alarm.core.availability.fleet import classify_probe_failure, get_availability_settings
 
 logger = logging.getLogger("infrawatch.monitoring")
 

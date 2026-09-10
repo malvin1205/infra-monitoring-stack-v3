@@ -15,6 +15,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY --chown=appuser:appgroup . .
 
+RUN mkdir -p /app/data && chown -R appuser:appgroup /app/data
+
 USER appuser
 
 EXPOSE 5000

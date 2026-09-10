@@ -227,7 +227,7 @@
 
 .drawer-body::-webkit-scrollbar-thumb {
   background: var(--border-strong);
-  border-radius: 3px;
+  border-radius: var(--r-full);
 }
 
 /* Drawer tab panes */
@@ -498,7 +498,7 @@
 }
 
 .sp-stat-card-label {
-  font-size: 9px;
+  font-size: var(--fs-2xs);
   font-weight: 600;
   color: var(--text-secondary);
   text-transform: uppercase;
@@ -535,7 +535,7 @@
   display: flex;
   justify-content: center;
   gap: 16px;
-  font-size: 11px;
+  font-size: var(--fs-xs);
   color: var(--text-secondary);
   margin-top: 8px;
 }
@@ -566,7 +566,7 @@
   border: 1px solid var(--border-strong);
   border-radius: var(--r-sm);
   padding: 6px 10px;
-  font-size: 11px;
+  font-size: var(--fs-xs);
   color: var(--text-primary);
   white-space: nowrap;
   box-shadow: var(--shadow-md);
@@ -646,7 +646,7 @@
 .dil-link {
   color: var(--accent);
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   text-decoration: none;
   text-align: right;
   max-width: 150px;
@@ -675,7 +675,7 @@
 }
 
 .history-stat-label {
-  font-size: 10px;
+  font-size: var(--fs-2xs);
   font-weight: 600;
   color: var(--text-secondary);
   text-transform: uppercase;
@@ -737,7 +737,7 @@
 .de-time {
   color: var(--text-muted);
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   flex-shrink: 0;
 }
 

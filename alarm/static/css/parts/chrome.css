@@ -31,6 +31,27 @@
     padding: 0 16px;
   }
 
+  /* Mobile touch target hardening (min 40px tap envelopes) */
+  .icon-action {
+    min-width: 40px;
+    min-height: 40px;
+  }
+
+  .ack-alarm-btn {
+    min-height: 40px;
+    padding: 0 16px;
+  }
+
+  /* Prevent automatic iOS Safari viewport zoom on input focus */
+  .search-input,
+  .form-select,
+  .interval-select,
+  input[type="text"],
+  input[type="password"],
+  select {
+    font-size: 16px !important;
+  }
+
   .brand-sub,
   .brand-divider {
     display: none;
@@ -38,6 +59,14 @@
 
   .last-updated-text {
     display: none;
+  }
+
+  .nav-hide-sm {
+    display: none !important;
+  }
+
+  .topnav-actions {
+    gap: 8px;
   }
 
   .main-wrap {
@@ -104,6 +133,18 @@
 }
 
 @media (max-width: 480px) {
+  .nav-hide-xs {
+    display: none !important;
+  }
+
+  .topnav-actions {
+    gap: 6px;
+  }
+
+  .filter-select {
+    max-width: min(130px, 32vw);
+  }
+
   .summary-row {
     grid-template-columns: 1fr 1fr;
   }
@@ -205,14 +246,41 @@
 
 /* .host-card animation removed to prevent refresh flicker */
 
-/* ── Accessibility: reduced motion ───────────────────── */
+/* ── Accessibility: intentional reduced motion ───────────────── */
 @media (prefers-reduced-motion: reduce) {
+  /* Eliminate continuous disorienting spinning & pulsing */
+  .icon-action.spinning svg,
+  .spinner,
+  .pulse,
+  [data-animate] {
+    animation: none !important;
+  }
 
+  /* Eliminate motion translations while keeping instantaneous visual state changes */
   *,
   *::before,
   *::after {
-    animation-duration: 0.01ms !important;
-    transition-duration: 0.01ms !important;
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  /* Prevent translation jumps on interactive hover/focus */
+  .host-card,
+  .icon-action,
+  .btn,
+  .splash-btn,
+  .ack-alarm-btn,
+  .summary-card {
+    transform: none !important;
+    transition: background-color 0s, color 0s, border-color 0s !important;
+  }
+
+  /* Splash modal appears instantly without zoom distortion */
+  .splash-card {
+    animation: none !important;
+    transform: none !important;
   }
 }
 

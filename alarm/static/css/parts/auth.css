@@ -59,13 +59,13 @@
 
 .user-role-pill.role-owner {
   background: rgba(245, 158, 11, 0.18);
-  color: #fbbf24;
+  color: var(--warning);
   border: 1px solid rgba(245, 158, 11, 0.45);
 }
 
 .user-role-pill.role-admin {
   background: rgba(59, 130, 246, 0.2);
-  color: #60a5fa;
+  color: var(--accent);
   border: 1px solid rgba(59, 130, 246, 0.4);
 }
 
@@ -143,7 +143,7 @@ button:disabled.rbac-restricted {
   gap: 4px;
   font-size: 10px;
   font-weight: 600;
-  color: #38bdf8;
+  color: var(--accent);
   background: rgba(56, 189, 248, 0.15);
   border: 1px solid rgba(56, 189, 248, 0.35);
   padding: 1px 6px;
@@ -154,6 +154,6 @@ button:disabled.rbac-restricted {
 .ack-alarm-btn.is-acked {
   background: rgba(34, 197, 94, 0.15) !important;
   border-color: rgba(34, 197, 94, 0.4) !important;
-  color: #22c55e !important;
+  color: var(--success) !important;
 }
 

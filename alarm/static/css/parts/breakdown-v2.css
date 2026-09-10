@@ -491,7 +491,7 @@
 .avb .ara-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .avb .ara-severity-dot { border-radius: 2px; width: 6px; height: 6px; }
 .avb .ara-sev-critical { background: var(--crit); }
-.avb .ara-sev-orange   { background: #e08653; }
+.avb .ara-sev-orange   { background: var(--orange); }
 .avb .ara-sev-warning  { background: var(--warn); }
 .avb .ara-sev-good     { background: var(--ok); }
 .avb .ara-hostname { font-family: var(--avb-font-mono); font-size: 11.5px; font-weight: 500; color: var(--text-hi); }
@@ -516,13 +516,13 @@
 }
 .avb .ara-avail-pct { font-family: var(--avb-font-mono); font-size: 11.5px; font-weight: 500; }
 .avb .pct-critical { color: var(--crit); }
-.avb .pct-orange   { color: #e08653; }
+.avb .pct-orange   { color: var(--orange); }
 .avb .pct-warning  { color: var(--warn); }
 .avb .pct-good     { color: var(--ok); }
 .avb .pct-muted    { color: var(--text-low); }
 .avb .ara-bar-track { background: var(--border); height: 3px; }
 .avb .bar-fill-critical { background: var(--crit); }
-.avb .bar-fill-orange   { background: #e08653; }
+.avb .bar-fill-orange   { background: var(--orange); }
 .avb .bar-fill-warning  { background: var(--warn); }
 .avb .bar-fill-good     { background: var(--ok); }
 .avb .ara-incidents-text { font-family: var(--avb-font-mono); font-size: 10.5px; font-weight: 500; color: var(--text-hi); }

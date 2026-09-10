@@ -223,10 +223,22 @@ export class InstancesPage {
         if (!btn) return;
         this.activeStatus = btn.dataset.status;
         this.chipGroup.querySelectorAll('.chip').forEach(b => {
-          b.classList.toggle('chip-active', b.dataset.status === this.activeStatus);
+          const isActive = b.dataset.status === this.activeStatus;
+          b.classList.toggle('chip-active', isActive);
+          b.setAttribute('aria-pressed', isActive ? 'true' : 'false');
         });
         this._lastDataSignature = null;
         this._render();
+      });
+    }
+
+    // Error retry button
+    const retryBtn = document.getElementById('instancesRetryBtn');
+    if (retryBtn) {
+      retryBtn.addEventListener('click', () => {
+        this._clearRetry('instances');
+        this.load();
+        this.loadAvailability();
       });
     }
 
@@ -807,8 +819,8 @@ export class InstancesPage {
     if (this.pagesEl) {
       this.pagesEl.innerHTML = this._buildPageList(this._totalPages, this.currentPage).map(p =>
         p === '…'
-          ? `<span class="hp-ellipsis">…</span>`
-          : `<button class="hp-page-btn${p === this.currentPage ? ' hp-page-active' : ''}" data-page="${p}" type="button">${p}</button>`
+          ? `<span class="hp-ellipsis" aria-hidden="true">…</span>`
+          : `<button class="hp-page-btn${p === this.currentPage ? ' hp-page-active' : ''}" data-page="${p}" type="button" aria-label="Page ${p}" ${p === this.currentPage ? 'aria-current="page"' : ''}>${p}</button>`
       ).join('');
     }
   }

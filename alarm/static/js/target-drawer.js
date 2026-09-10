@@ -152,7 +152,7 @@ class _DrawerMethods {
       const slotDate = new Date(slotStart * 1000);
       const timeStr = slotDate.toLocaleTimeString(DATE_LOCALE, { hour: '2-digit', minute: '2-digit' });
 
-      barsHtml += `<div title="${timeStr} • ${statusText}" style="flex:1; height:${barHeight}; background:${barColor}; border-radius:2px; transition:all 0.2s ease;"></div>`;
+      barsHtml += `<div title="${timeStr} • ${statusText}" style="flex:1; height:${barHeight}; background:${barColor}; border-radius:var(--r-xs, 4px); transition:all 0.2s ease;"></div>`;
     }
 
     container.innerHTML = barsHtml;
@@ -190,17 +190,17 @@ class _DrawerMethods {
       const agoStr = this._relTime(ev.start_ts * 1000);
 
       return `
-        <div style="display:flex; align-items:flex-start; justify-content:space-between; padding:6px 8px; background:rgba(15,23,42,0.6); border:1px solid var(--border); border-radius:6px; font-size:11px;">
+        <div style="display:flex; align-items:flex-start; justify-content:space-between; padding:6px 8px; background:var(--surface-hover); border:1px solid var(--border); border-radius:var(--r-sm); font-size:var(--fs-xs, 11px);">
           <div style="display:flex; align-items:center; gap:8px;">
             ${iconSvg}
             <div>
               <div style="font-weight:700; color:var(--text-primary);">${title}</div>
-              <div style="color:var(--text-secondary); font-size:10px;">${desc}</div>
+              <div style="color:var(--text-secondary); font-size:var(--fs-2xs, 10px);">${desc}</div>
             </div>
           </div>
           <div style="text-align:right;">
             <div style="color:var(--text-primary); font-family:var(--font-mono);">${timeStr}</div>
-            <div style="color:var(--text-muted); font-size:10px;">${agoStr}</div>
+            <div style="color:var(--text-muted); font-size:var(--fs-2xs, 10px);">${agoStr}</div>
           </div>
         </div>`;
     }).join('');
@@ -806,8 +806,8 @@ class _DrawerMethods {
       const formattedVal = niceScale.formatTick(t);
 
       gridLines.push(`<line x1="0" y1="${tY.toFixed(1)}" x2="${width}" y2="${tY.toFixed(1)}" stroke="rgba(255,255,255,0.07)" stroke-dasharray="3,3" stroke-width="1"/>`);
-      leftLabels.push(`<span style="position:absolute; right:0; top:${topPct}%; transform:translateY(-50%); font-size:10.5px; font-family:var(--font-mono); color:var(--text-secondary); opacity:0.85; white-space:nowrap;">${formattedVal}</span>`);
-      rightLabels.push(`<span style="position:absolute; left:0; top:${topPct}%; transform:translateY(-50%); font-size:10.5px; font-family:var(--font-mono); color:var(--text-secondary); opacity:0.85; white-space:nowrap;">${formattedVal}</span>`);
+      leftLabels.push(`<span style="position:absolute; right:0; top:${topPct}%; transform:translateY(-50%); font-size:var(--fs-xs, 11px); font-family:var(--font-mono); color:var(--text-secondary); opacity:0.85; white-space:nowrap;">${formattedVal}</span>`);
+      rightLabels.push(`<span style="position:absolute; left:0; top:${topPct}%; transform:translateY(-50%); font-size:var(--fs-xs, 11px); font-family:var(--font-mono); color:var(--text-secondary); opacity:0.85; white-space:nowrap;">${formattedVal}</span>`);
     });
 
     // Time axis label formatting helper
@@ -828,7 +828,7 @@ class _DrawerMethods {
 
     // Build SVG & Adaptive ms Meter Overlay HTML
     wrap.innerHTML = `
-      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px; font-size:11px; font-weight:600; color:var(--text-secondary); opacity:0.8; padding:0 2px;">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px; font-size:var(--fs-xs, 11px); font-weight:600; color:var(--text-secondary); opacity:0.8; padding:0 2px;">
         <span>ms</span>
         <span>ms</span>
       </div>
@@ -852,7 +852,7 @@ class _DrawerMethods {
           ${rightLabels.join('')}
         </div>
       </div>
-      <div class="sparkline-x-axis" style="display:flex; justify-content:space-between; font-size:10px; font-family:var(--font-mono); color:var(--text-secondary); margin-top:8px; padding:6px 54px 0 54px; border-top:1px dashed rgba(255,255,255,0.08);">
+      <div class="sparkline-x-axis" style="display:flex; justify-content:space-between; font-size:var(--fs-2xs, 10px); font-family:var(--font-mono); color:var(--text-secondary); margin-top:8px; padding:6px 54px 0 54px; border-top:1px dashed var(--border);">
         <span>${t0Str}</span>
         <span>${tMidStr}</span>
         <span>${tNStr}</span>
@@ -947,9 +947,9 @@ class _DrawerMethods {
       const statusText = closest.val > 500 ? 'SLOW' : (closest.val === 0 ? 'DOWN' : 'UP');
 
       tooltip.innerHTML = `
-        <div style="font-weight:600; color:var(--text-secondary); margin-bottom:2px; font-size:10px;">Time: <span style="color:#fff;">${timeLabel}</span></div>
-        <div style="font-weight:600; color:var(--text-secondary); margin-bottom:2px; font-size:10px;">Response Time: <span style="color:${valColor}; font-weight:700;">${closest.val.toFixed(1)} ms</span></div>
-        <div style="font-weight:600; color:var(--text-secondary); font-size:10px;">Status: <span style="color:${valColor}; font-weight:700;">${statusText}</span></div>
+        <div style="font-weight:600; color:var(--text-secondary); margin-bottom:2px; font-size:var(--fs-2xs, 10px);">Time: <span style="color:var(--text-primary);">${timeLabel}</span></div>
+        <div style="font-weight:600; color:var(--text-secondary); margin-bottom:2px; font-size:var(--fs-2xs, 10px);">Response Time: <span style="color:${valColor}; font-weight:700;">${closest.val.toFixed(1)} ms</span></div>
+        <div style="font-weight:600; color:var(--text-secondary); font-size:var(--fs-2xs, 10px);">Status: <span style="color:${valColor}; font-weight:700;">${statusText}</span></div>
       `;
       
       const clampX = Math.max(45, Math.min(rect.width - 45, pointX));
@@ -1050,7 +1050,7 @@ class _DrawerMethods {
         const isSlow = latVal > 500;
         const color = isSlow ? '#F59E0B' : '#22C55E';
         return `
-          <div style="display:flex; justify-content:space-between; align-items:center; padding:4px 8px; background:rgba(15,23,42,0.6); border:1px solid var(--border); border-radius:4px; font-size:11px; font-family:var(--font-mono);">
+          <div style="display:flex; justify-content:space-between; align-items:center; padding:4px 8px; background:var(--surface-hover); border:1px solid var(--border); border-radius:var(--r-sm); font-size:var(--fs-xs, 11px); font-family:var(--font-mono);">
             <span style="color:var(--text-secondary);">${dateStr} ${timeStr}</span>
             <span style="font-weight:700; color:${color};">${latVal.toFixed(1)} ms</span>
           </div>`;
@@ -1096,8 +1096,8 @@ class _DrawerMethods {
       const formattedVal = niceScale.formatTick(t);
 
       gridLines.push(`<line x1="0" y1="${tY.toFixed(1)}" x2="${width}" y2="${tY.toFixed(1)}" stroke="rgba(255,255,255,0.07)" stroke-dasharray="3,3" stroke-width="1"/>`);
-      leftLabels.push(`<span style="position:absolute; right:0; top:${topPct}%; transform:translateY(-50%); font-size:10.5px; font-family:var(--font-mono); color:var(--text-secondary); opacity:0.85; white-space:nowrap;">${formattedVal}</span>`);
-      rightLabels.push(`<span style="position:absolute; left:0; top:${topPct}%; transform:translateY(-50%); font-size:10.5px; font-family:var(--font-mono); color:var(--text-secondary); opacity:0.85; white-space:nowrap;">${formattedVal}</span>`);
+      leftLabels.push(`<span style="position:absolute; right:0; top:${topPct}%; transform:translateY(-50%); font-size:var(--fs-xs, 11px); font-family:var(--font-mono); color:var(--text-secondary); opacity:0.85; white-space:nowrap;">${formattedVal}</span>`);
+      rightLabels.push(`<span style="position:absolute; left:0; top:${topPct}%; transform:translateY(-50%); font-size:var(--fs-xs, 11px); font-family:var(--font-mono); color:var(--text-secondary); opacity:0.85; white-space:nowrap;">${formattedVal}</span>`);
     });
 
     // Time axis label formatting helper
@@ -1117,7 +1117,7 @@ class _DrawerMethods {
     const defsHistHtml = buildMSGradientDefs(rangeMin, rangeMax, 'sgHistLineGrad', 'sgHistGrad');
 
     wrap.innerHTML = `
-      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px; font-size:11px; font-weight:600; color:var(--text-secondary); opacity:0.8; padding:0 2px;">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px; font-size:var(--fs-xs, 11px); font-weight:600; color:var(--text-secondary); opacity:0.8; padding:0 2px;">
         <span>ms</span>
         <span>ms</span>
       </div>
@@ -1140,7 +1140,7 @@ class _DrawerMethods {
           ${rightLabels.join('')}
         </div>
       </div>
-      <div class="sparkline-x-axis" style="display:flex; justify-content:space-between; font-size:10px; font-family:var(--font-mono); color:var(--text-secondary); margin-top:8px; padding:6px 54px 0 54px; border-top:1px dashed rgba(255,255,255,0.08);">
+      <div class="sparkline-x-axis" style="display:flex; justify-content:space-between; font-size:var(--fs-2xs, 10px); font-family:var(--font-mono); color:var(--text-secondary); margin-top:8px; padding:6px 54px 0 54px; border-top:1px dashed var(--border);">
         <span>${t0Str}</span>
         <span>${tMidStr}</span>
         <span>${tNStr}</span>
@@ -1201,9 +1201,9 @@ class _DrawerMethods {
       const statusText = closest.val > 500 ? 'SLOW' : (closest.val === 0 ? 'DOWN' : 'UP');
 
       tooltip.innerHTML = `
-        <div style="font-weight:600; color:var(--text-secondary); margin-bottom:2px; font-size:10px;">Time: <span style="color:#fff;">${timeLabel}</span></div>
-        <div style="font-weight:600; color:var(--text-secondary); margin-bottom:2px; font-size:10px;">Response Time: <span style="color:${valColor}; font-weight:700;">${closest.val.toFixed(1)} ms</span></div>
-        <div style="font-weight:600; color:var(--text-secondary); font-size:10px;">Status: <span style="color:${valColor}; font-weight:700;">${statusText}</span></div>
+        <div style="font-weight:600; color:var(--text-secondary); margin-bottom:2px; font-size:var(--fs-2xs, 10px);">Time: <span style="color:var(--text-primary);">${timeLabel}</span></div>
+        <div style="font-weight:600; color:var(--text-secondary); margin-bottom:2px; font-size:var(--fs-2xs, 10px);">Response Time: <span style="color:${valColor}; font-weight:700;">${closest.val.toFixed(1)} ms</span></div>
+        <div style="font-weight:600; color:var(--text-secondary); font-size:var(--fs-2xs, 10px);">Status: <span style="color:${valColor}; font-weight:700;">${statusText}</span></div>
       `;
       const clampX = Math.max(50, Math.min(rect.width - 50, pointX));
       tooltip.style.left = `${clampX}px`;
@@ -1300,10 +1300,10 @@ class _DrawerMethods {
         const dateObj = new Date(ev.start_ts * 1000);
         const dateStr = dateObj.toLocaleDateString(undefined, { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', second: '2-digit' });
         const durationStr = this._fmtDownAging(ev.duration_seconds * 1000);
-        const ongoingBadge = ev.ongoing ? '<span style="font-size:10px; background:rgba(56,189,248,0.15); color:#38BDF8; padding:1px 5px; border-radius:3px; margin-left:6px; font-weight:500;">Ongoing</span>' : '';
+        const ongoingBadge = ev.ongoing ? '<span style="font-size:var(--fs-2xs, 10px); background:var(--accent-bg); color:var(--accent); padding:1px 5px; border-radius:var(--r-sm); margin-left:6px; font-weight:500;">Ongoing</span>' : '';
 
         const summaryText = ev.summary && !ev.summary.startsWith('Target ONLINE') && !ev.summary.startsWith('Target OFFLINE')
-          ? `<div style="font-size:10px; color:var(--text-muted); margin-top:1px;">${ev.summary}</div>`
+          ? `<div style="font-size:var(--fs-2xs, 10px); color:var(--text-muted); margin-top:1px;">${ev.summary}</div>`
           : '';
 
         return `
@@ -1314,13 +1314,13 @@ class _DrawerMethods {
                 <div style="font-weight:600; color:${statusColor}; display:flex; align-items:center; gap:6px;">
                   ${statusText} ${ongoingBadge}
                 </div>
-                <div style="font-size:11px; color:var(--text-secondary); margin-top:2px;">${dateStr}</div>
+                <div style="font-size:var(--fs-xs, 11px); color:var(--text-secondary); margin-top:2px;">${dateStr}</div>
                 ${summaryText}
               </div>
             </div>
             <div style="text-align:right;">
               <span class="ongoing-duration-val" data-start-ts="${ev.start_ts}" data-ongoing="${ev.ongoing ? 'true' : 'false'}" style="font-family:var(--font-mono); font-weight:600; color:var(--text-primary); font-size:12px;">${durationStr}</span>
-              <div style="font-size:10px; color:var(--text-muted);">Status Duration</div>
+              <div style="font-size:var(--fs-2xs, 10px); color:var(--text-muted);">Status Duration</div>
             </div>
           </div>
         `;

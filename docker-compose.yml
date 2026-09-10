@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   alarm:
     build: ./alarm
@@ -26,7 +24,7 @@ services:
       # to 1 only when InfraWatch sits behind an HTTPS reverse proxy.
       - SESSION_COOKIE_SECURE=${SESSION_COOKIE_SECURE:-0}
     volumes:
-      - ./alarm:/app
+      - ./alarm/data:/app/data
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
       interval: 10s
@@ -44,13 +42,11 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
-    # read_only pins the image's own filesystem layer read-only; it does NOT
-    # affect the bind mount above (./alarm:/app), which is exactly what's
-    # needed here — the app's actual writes (status.json, infrawatch.db + WAL,
-    # .api_key/.webhook_secret, …) all land inside /app, already writable via
-    # that bind mount. /tmp is given a small tmpfs since gunicorn/Python may
-    # still want a writable scratch dir there even though the app itself never
-    # uses it directly.
+    # read_only pins the image's root filesystem read-only to protect application
+    # code (/app) against runtime tampering. Mutable state (SQLite infrawatch.db +
+    # WAL, .api_key, .webhook_secret, .session_secret, caches) is isolated to
+    # /app/data, mounted as a persistent volume above. /tmp is mounted as a small
+    # tmpfs for scratch operations.
     read_only: true
     tmpfs:
       - /tmp
